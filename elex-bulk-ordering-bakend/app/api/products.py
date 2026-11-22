@@ -24,12 +24,15 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from sqlalchemy.orm import Session as DbSession
+
 from app.automation.product import ProductPreview, add_screener_details, fetch_product_preview
 from app.automation.search import MAX_QUERY_CHARS, MIN_QUERY_CHARS, NoResultsInTime, query_text, read_search_results
 from app.automation.sellers import read_seller_offers
-from app.config import get_settings
+from app.core import app_settings
 from app.core.browser import browser_page
 from app.core.security import require_user
+from app.db.base import get_db
 
 log = logging.getLogger("ordering.api.products")
 
@@ -104,7 +107,7 @@ def is_flipkart_link(url: str) -> bool:
 
 
 @router.post("/preview")
-async def preview_product(payload: PreviewRequest) -> dict:
+async def preview_product(payload: PreviewRequest, db: DbSession = Depends(get_db)) -> dict:
     """Read a product's name, image, price and stock for the order form, and
     who sells it: ``default_seller`` and ``sellers`` (name, price, rating,
     cash on delivery, BUY NOW), or ``sellers_error`` when they could not be
@@ -122,14 +125,14 @@ async def preview_product(payload: PreviewRequest) -> dict:
     if cached is not None:
         return cached
 
-    settings = get_settings()
+    effective = app_settings.get_effective(db)
     try:
         # A few previews at a time: each is a browser launch, and a page that
         # fires one per keystroke must not start fifty of them.
         async with _PREVIEWS_AT_ONCE:
             async with browser_page(
-                headless=settings.browser_headless,
-                proxy=settings.proxy_server or None,
+                headless=bool(effective.get("browser_headless", True)),
+                proxy=str(effective.get("proxy_server") or "") or None,
             ) as (_context, page):
                 preview: ProductPreview = await fetch_product_preview(page, url)
                 if not preview.error:
@@ -185,7 +188,7 @@ def _search_remember(key: str, payload: dict) -> None:
 
 
 @router.get("/search")
-async def search_products(q: str = Query(..., max_length=1000)) -> dict:
+async def search_products(q: str = Query(..., max_length=1000), db: DbSession = Depends(get_db)) -> dict:
     """Flipkart's search results for ``q``, for the order form to pick from.
 
     Up to 12 results, each ``title`` (the exact variant), ``link`` (canonical:
@@ -207,12 +210,12 @@ async def search_products(q: str = Query(..., max_length=1000)) -> dict:
     if cached is not None:
         return cached
 
-    settings = get_settings()
+    effective = app_settings.get_effective(db)
     try:
         async with _PREVIEWS_AT_ONCE:
             async with browser_page(
-                headless=settings.browser_headless,
-                proxy=settings.proxy_server or None,
+                headless=bool(effective.get("browser_headless", True)),
+                proxy=str(effective.get("proxy_server") or "") or None,
             ) as (_context, page):
                 results = await asyncio.wait_for(read_search_results(page, query), timeout=_SEARCH_SECONDS)
     except NoResultsInTime:

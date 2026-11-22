@@ -285,9 +285,9 @@ def tracking_due(db: DbSession, now: datetime | None = None) -> tuple[list[int],
     """The accounts whose orders should be read back now, and why — in the
     words the log uses. Empty while any read-back or order run is going, so
     two browsers never work one account at once."""
-    settings = get_settings()
-    every = max(0, int(getattr(settings, "track_every_minutes", 0) or 0))
-    ofd_every = max(0, int(getattr(settings, "out_for_delivery_minutes", 0) or 0))
+    effective = app_settings.get_effective(db)
+    every = max(0, int(effective.get("track_every_minutes") or 0))
+    ofd_every = max(0, int(effective.get("out_for_delivery_minutes") or 0))
     if not every and not ofd_every:
         return [], "order tracking is off"
     out_for_delivery, open_accounts = tracked_accounts(db, now)
