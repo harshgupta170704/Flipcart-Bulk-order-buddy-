@@ -737,7 +737,15 @@ export function startOrderJob(input: OrderJobInput): Promise<Job> {
     form.append("ai_max_interval_minutes", String(input.ai.max_interval_minutes));
     form.append("ai_min_attempts", String(input.ai.min_attempts));
     form.append("ai_scale_up_pct", String(input.ai.scale_up_pct));
+    if (input.ai.scale_up_mode && input.ai.scale_up_mode !== "percent") {
+      form.append("ai_scale_up_mode", input.ai.scale_up_mode);
+    }
+    if (input.ai.scale_up_count !== undefined && input.ai.scale_up_count !== null) {
+      form.append("ai_scale_up_count", String(input.ai.scale_up_count));
+    }
     form.append("ai_run_duration", input.ai.run_duration);
+    if (input.ai.single_probe) form.append("ai_single_probe", "true");
+    if (input.ai.recycle_accounts) form.append("ai_recycle_accounts", "true");
     if (input.ai.rehearsal) form.append("ai_rehearsal", "true");
   }
   if (input.qty_mode && input.qty_mode !== "upto") form.append("qty_mode", input.qty_mode);

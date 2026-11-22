@@ -1,7 +1,7 @@
 """Orders: processing stage and error code per attempt (``processing_stage``, ``error_code``)
 
-Revision ID: 0015
-Revises: 0014
+Revision ID: 0017
+Revises: 0016
 Create Date: 2026-11-22
 
 Every order attempt records which of the 25 checkout stages it reached and its
@@ -14,8 +14,8 @@ from alembic import context, op
 import sqlalchemy as sa
 
 
-revision: str = '0015'
-down_revision: Union[str, Sequence[str], None] = '0014'
+revision: str = '0017'
+down_revision: Union[str, Sequence[str], None] = '0016'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

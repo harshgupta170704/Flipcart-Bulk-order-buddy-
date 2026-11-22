@@ -215,6 +215,8 @@ export interface QuantityFieldsProps {
   footer?: ReactNode;
   /** Drawn between the two cart/delivery limits: the order form's Final Amount Limit. */
   middle?: ReactNode;
+  /** Hide Total Attempts (BOB hides it in AI mode where Run Duration governs the run). */
+  hideAttempts?: boolean;
   className?: string;
 }
 
@@ -237,6 +239,7 @@ export function QuantityFields({
   onQtyModeChange,
   footer,
   middle,
+  hideAttempts = false,
   className = "",
 }: QuantityFieldsProps) {
   const plan = orderPlan(draft, accountCount);
@@ -249,7 +252,7 @@ export function QuantityFields({
     <div className={`flex flex-col gap-3 ${className}`}>
       {show("quantity") ? (
         <>
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className={`grid gap-3 sm:grid-cols-2 ${hideAttempts ? "lg:grid-cols-3" : "lg:grid-cols-4"}`}>
             <Field
               label="Total Quantity"
               error={errors.totalQuantity}
@@ -308,23 +311,25 @@ export function QuantityFields({
               </Field>
             ) : null}
 
-            <Field
-              label="Total Attempts"
-              error={errors.totalAttempts}
-              hint={least !== null ? `Min: ${formatCount(least)}` : "Accounts to try"}
-              help="A ceiling on how many ACCOUNTS this run will try at all — not on units. Each account places one order, so buying a total needs at least total ÷ per order attempts. Blank means every selected account is fair game."
-            >
-              <NumberInput
-                name="total_attempts"
-                min={least ?? 1}
-                step={1}
-                inputMode="numeric"
-                placeholder="No ceiling"
-                value={draft.totalAttempts}
-                disabled={disabled}
-                onChange={(event) => onChange("totalAttempts", event.target.value)}
-              />
-            </Field>
+            {!hideAttempts ? (
+              <Field
+                label="Total Attempts"
+                error={errors.totalAttempts}
+                hint={least !== null ? `Min: ${formatCount(least)}` : "Accounts to try"}
+                help="A ceiling on how many ACCOUNTS this run will try at all — not on units. Each account places one order, so buying a total needs at least total ÷ per order attempts. Blank means every selected account is fair game."
+              >
+                <NumberInput
+                  name="total_attempts"
+                  min={least ?? 1}
+                  step={1}
+                  inputMode="numeric"
+                  placeholder="No ceiling"
+                  value={draft.totalAttempts}
+                  disabled={disabled}
+                  onChange={(event) => onChange("totalAttempts", event.target.value)}
+                />
+              </Field>
+            ) : null}
           </div>
 
           {/* The mode, in words, every time either number changes. */}

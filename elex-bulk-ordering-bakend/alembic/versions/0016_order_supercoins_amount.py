@@ -1,14 +1,14 @@
 """Orders: the rupees of SuperCoins a checkout took off (``supercoins_amount``)
 
-Revision ID: 0014
-Revises: 0013
+Revision ID: 0016
+Revises: 0015
 Create Date: 2026-11-19
 
 The dashboard's "SuperCoins applied" counted orders, not rupees (audit of
 19 Nov 2026). The ordering flow now reads the total before and after the
 SuperCoins toggle and keeps the difference on the order.
 
-As in revisions 0003–0013, the column is added only where it is missing:
+As in revisions 0003–0015, the column is added only where it is missing:
 ``init_db`` adds a model's new nullable columns at start-up.
 """
 from typing import Sequence, Union
@@ -17,8 +17,8 @@ from alembic import context, op
 import sqlalchemy as sa
 
 
-revision: str = '0014'
-down_revision: Union[str, Sequence[str], None] = '0013'
+revision: str = '0016'
+down_revision: Union[str, Sequence[str], None] = '0015'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

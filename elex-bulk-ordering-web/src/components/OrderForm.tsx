@@ -143,7 +143,25 @@ const RUN_MODES: { value: RunMode; label: string; help: string }[] = [
   },
 ];
 
-const DEFAULT_AI = { interval: "1", minAttempts: "10", scaleUp: "20", duration: "12h", rehearsal: false };
+const DEFAULT_AI: {
+  interval: string;
+  minAttempts: string;
+  scaleUpMode: "percent" | "count";
+  scaleUp: string;
+  scaleUpCount: string;
+  duration: string;
+  priceTracker: boolean;
+  rehearsal: boolean;
+} = {
+  interval: "1",
+  minAttempts: "10",
+  scaleUpMode: "percent",
+  scaleUp: "20",
+  scaleUpCount: "2",
+  duration: "12h",
+  priceTracker: false,
+  rehearsal: false,
+};
 const DURATION_RE = /^\s*\d+(\.\d+)?\s*[mhd]\s*$/i;
 
 /** Real or Mock, as one row of buttons: the choice that decides whether money is spent. */
@@ -439,10 +457,13 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
       const interval = Number(aiDraft.interval);
       const minAttempts = Number(aiDraft.minAttempts);
       const scaleUp = Number(aiDraft.scaleUp);
+      const scaleUpCount = Number(aiDraft.scaleUpCount);
       if (!(interval >= 1 && interval <= 60)) next.ai = "Max interval is 1 to 60 minutes.";
       else if (!Number.isInteger(minAttempts) || minAttempts < 1 || minAttempts > 30)
         next.ai = "Minimum attempts per interval is a whole number from 1 to 30.";
-      else if (!Number.isInteger(scaleUp) || scaleUp < 1 || scaleUp > 90)
+      else if (aiDraft.scaleUpMode === "count" && (!Number.isInteger(scaleUpCount) || scaleUpCount < 1 || scaleUpCount > 30))
+        next.ai = "Scale-up fixed count is a whole number from 1 to 30 orders.";
+      else if (aiDraft.scaleUpMode !== "count" && (!Number.isInteger(scaleUp) || scaleUp < 1 || scaleUp > 90))
         next.ai = "Scale-up threshold is a whole number from 1 to 90 %.";
       else if (!DURATION_RE.test(aiDraft.duration))
         next.ai = "Write the run duration like 12h, 90m or 2d (between 1h and 2d).";
@@ -769,7 +790,11 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
               max_interval_minutes: Number(aiDraft.interval),
               min_attempts: Number(aiDraft.minAttempts),
               scale_up_pct: Number(aiDraft.scaleUp),
+              ...(aiDraft.scaleUpMode === "count"
+                ? { scale_up_mode: "count" as const, scale_up_count: Number(aiDraft.scaleUpCount) }
+                : {}),
               run_duration: aiDraft.duration.trim(),
+              ...(aiDraft.priceTracker ? { single_probe: true, recycle_accounts: true } : {}),
               rehearsal: aiDraft.rehearsal,
             }
           : undefined,
@@ -1112,6 +1137,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                 accountCount={accountsTried}
                 onChange={setQuantityField}
                 qtyMode={qtyMode}
+                hideAttempts={ai}
                 onQtyModeChange={(next) => {
                   setQtyMode(next);
                   setSubmitError(null);
@@ -1125,28 +1151,47 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                     <Field label="Max Interval (minutes)" hint="Max wait before the next batch" help="The longest wait before the next batch when orders are not placing. 1 to 60.">
                       <NumberInput name="ai_max_interval_minutes" min={1} max={60} step={1} value={aiDraft.interval} onChange={(e) => setAi("interval", e.target.value)} />
                     </Field>
-                    <Field label="Minimum attempts per interval" hint="Range 1 to 30" help="The first batch's size, and what a slow batch goes back to. 1 to 30.">
+                    <Field label="Minimum attempts per interval" hint="Range 1 to 30" help="Baseline / reset batch size when orders are not scaling up. 1 to 30.">
                       <NumberInput name="ai_min_attempts" min={1} max={30} step={1} value={aiDraft.minAttempts} onChange={(e) => setAi("minAttempts", e.target.value)} />
                     </Field>
-                    <Field label="Scale-Up Threshold Mode" hint="Of the last batch">
-                      <Select name="ai_scale_up_mode" value="percent" onChange={() => undefined}>
+                    <Field label="Scale-Up Threshold Mode" hint={aiDraft.scaleUpMode === "count" ? "Fixed placed count" : "Of the last batch"}>
+                      <Select
+                        name="ai_scale_up_mode"
+                        value={aiDraft.scaleUpMode}
+                        onChange={(e) => setAi("scaleUpMode", e.target.value as "percent" | "count")}
+                      >
                         <option value="percent">Percentage of last batch</option>
+                        <option value="count">Fixed count</option>
                       </Select>
                     </Field>
-                    <Field label="Scale-Up Threshold (%)" hint="Range 1 to 90" help="When this share of a batch places, the next batch starts at once and is twice as big. 1 to 90.">
-                      <NumberInput name="ai_scale_up_pct" min={1} max={90} step={1} value={aiDraft.scaleUp} onChange={(e) => setAi("scaleUp", e.target.value)} />
-                    </Field>
-                    <Field label="Run duration" hint="1h to 2d" help="The run stops after this long: 12h, 90m, 2d (1h to 2d).">
+                    {aiDraft.scaleUpMode === "count" ? (
+                      <Field label="Scale-Up Threshold (orders)" hint="Range 1 to 30" help="When at least this many orders place in a batch, the next batch starts at once and doubles. 1 to 30.">
+                        <NumberInput name="ai_scale_up_count" min={1} max={30} step={1} value={aiDraft.scaleUpCount} onChange={(e) => setAi("scaleUpCount", e.target.value)} />
+                      </Field>
+                    ) : (
+                      <Field label="Scale-Up Threshold (%)" hint="Range 1 to 90" help="When this share of a batch places (ceil), the next batch starts at once and doubles. 1 to 90.">
+                        <NumberInput name="ai_scale_up_pct" min={1} max={90} step={1} value={aiDraft.scaleUp} onChange={(e) => setAi("scaleUp", e.target.value)} />
+                      </Field>
+                    )}
+                    <Field label="Run duration" hint="1h to 2d" help="The run tracks and paces for this long: 12h, 90m, 2d (1h to 2d).">
                       <TextInput name="ai_run_duration" value={aiDraft.duration} onChange={(e) => setAi("duration", e.target.value)} />
                     </Field>
-                    <Checkbox
-                      name="ai_rehearsal"
-                      label="Rehearsal: pace for real, buy nothing"
-                      help="Each order's outcome is made up, as in Mock, so the batches can be watched safely."
-                      checked={aiDraft.rehearsal}
-                      onChange={(e) => setAi("rehearsal", e.target.checked)}
-                      className="self-start"
-                    />
+                    <div className="flex flex-col gap-2 self-start pt-1">
+                      <Checkbox
+                        name="ai_price_tracker"
+                        label="Price tracker mode (1-probe watch & recycle)"
+                        help="Probes 1 account per interval while price is above Final Amount Limit or out of stock, recycles non-buying accounts for the full Run Duration, and bursts to buy immediately when price drops."
+                        checked={aiDraft.priceTracker}
+                        onChange={(e) => setAi("priceTracker", e.target.checked)}
+                      />
+                      <Checkbox
+                        name="ai_rehearsal"
+                        label="Rehearsal: pace for real, buy nothing"
+                        help="Each order's outcome is made up, as in Mock, so the batches can be watched safely."
+                        checked={aiDraft.rehearsal}
+                        onChange={(e) => setAi("rehearsal", e.target.checked)}
+                      />
+                    </div>
                   </div>
                   {shown.ai ?? errors.ai ? <p className="text-[12px] text-critical">{shown.ai ?? errors.ai}</p> : null}
                 </fieldset>
@@ -1870,7 +1915,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
             runMode={runMode}
             aiSummary={
               ai
-                ? `${aiDraft.minAttempts} per batch, scale up at ${aiDraft.scaleUp}%, wait up to ${aiDraft.interval} min, for ${aiDraft.duration}${aiDraft.rehearsal ? " (rehearsal)" : ""}`
+                ? `${aiDraft.minAttempts} per batch, scale up at ${aiDraft.scaleUpMode === "count" ? `${aiDraft.scaleUpCount} order(s)` : `${aiDraft.scaleUp}%`}, wait up to ${aiDraft.interval} min, for ${aiDraft.duration}${aiDraft.priceTracker ? " · price tracker" : ""}${aiDraft.rehearsal ? " (rehearsal)" : ""}`
                 : null
             }
             preview={preview}

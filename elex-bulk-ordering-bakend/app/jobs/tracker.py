@@ -288,6 +288,56 @@ class JobTracker:
         event.setdefault("progress", 0)
         await self._publish(event)
 
+    # --- AI price-tracker helpers -------------------------------------------
+    def add_attempt(self, account_id: int) -> None:
+        """Append a fresh JobItem row when an AI price-tracker run recycles an
+        account for a new probe interval, keeping total_items accurate."""
+        if account_id in self._missing:
+            return
+        with self._session() as db:
+            job = db.get(Job, self.job_id)
+            if job is None:
+                return
+            db.add(
+                JobItem(
+                    job_id=self.job_id,
+                    account_id=account_id,
+                    status=JobItemStatus.pending,
+                )
+            )
+            job.total_items = (job.total_items or 0) + 1
+            job.progress = _progress(job.done_items or 0, job.total_items)
+            db.commit()
+
+    async def update_ai_tracker(self, snapshot: dict) -> None:
+        """Persist the live AI price-tracker snapshot on Job.payload and push a
+        WebSocket event so the UI shows current/lowest price and next probe."""
+        price = snapshot.get("last_seen_price")
+        target = snapshot.get("target_price")
+        status = snapshot.get("status") or "watching"
+        parts = [f"AI {status.replace('_', ' ')}"]
+        if price is not None:
+            parts.append(f"price ₹{price:,.2f}")
+        if target is not None:
+            parts.append(f"cap ₹{target:,.2f}")
+        if snapshot.get("placed_orders"):
+            parts.append(f"{snapshot['placed_orders']} placed")
+        msg = " · ".join(parts)
+        with self._session() as db:
+            job = db.get(Job, self.job_id)
+            if job is not None:
+                # Reassign dict so SQLAlchemy flushes the JSON column cleanly.
+                job.payload = {**(job.payload or {}), "ai_tracker": snapshot}
+                db.commit()
+        await self._publish(
+            {
+                "type": "ai_tracker_update",
+                "job_id": self.job_id,
+                "ai_tracker": snapshot,
+                "message": msg,
+            }
+        )
+
     # --- cancellation -------------------------------------------------------
     def is_cancel_requested(self) -> bool:
         """Re-read the flag from the DB so the API can cancel mid-run."""

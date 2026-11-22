@@ -62,11 +62,11 @@ from app.automation.coupons import ERROR as COUPON_ERROR
 from app.automation.coupons import apply_coupon
 from app.automation.login import LoginRefused, NotRegistered, run_login
 from app.automation.mock_ordering import mock_message, mock_order
-from app.jobs.pacing import accounts_at_once
+from app.jobs.pacing import BatchOutcome, Pacing, accounts_at_once, run_paced
 from app.automation.ordering import CARD_MODES, GIFT_CARD_MODES
 from app.core.account_picking import least_recently_ordered_first, recently_ordered
 from app.core.card_pool import CapCounter, CardRules, is_payment_failure
-from app.jobs.pacing import Pacing, run_paced
+from app.core.order_outcomes import ErrorCode, classify as classify_order_outcome
 from app.core.step_timer import timing
 from app.core.card_pool import plan as plan_cards
 from app.core.card_pool import record_failure as record_card_failure
@@ -125,6 +125,48 @@ log = logging.getLogger("ordering.jobs.tasks")
 _LONG_DIGITS = re.compile(r"\d{12,}")
 _MAX_MESSAGE_CHARS = 500
 
+#: Classified error codes where no payment was sent and market conditions
+#: (price cap, stock, seller, SLA, transient throttle) may change later —
+#: safe to recycle the account in AI price-tracker mode.
+_AI_RETRYABLE_ERRORS: frozenset[ErrorCode] = frozenset(
+    {
+        ErrorCode.PRICE_OVER_LIMIT,
+        ErrorCode.CART_OVER_LIMIT,
+        ErrorCode.PRODUCT_UNAVAILABLE,
+        ErrorCode.SIZE_UNAVAILABLE,
+        ErrorCode.SELLER_MISMATCH,
+        ErrorCode.DELIVERY_SLA_NOT_MET,
+        ErrorCode.DELIVERY_ESTIMATE_UNREADABLE,
+        ErrorCode.ORDER_TOTAL_UNREADABLE,
+        ErrorCode.CART_AMOUNT_UNREADABLE,
+        ErrorCode.PLATFORM_TRANSIENT,
+    }
+)
+
+
+def _ai_outcome_meta(status: OrderStatus, result: dict) -> dict:
+    """Extract live price, stock signal, and AI-retryability from a run result."""
+    raw_amount = result.get("amount")
+    seen_price = float(raw_amount) if isinstance(raw_amount, (int, float)) and raw_amount > 0 else None
+    if status == OrderStatus.placed:
+        return {"seen_price": seen_price, "in_stock": True, "retryable": False, "market_blocked": False}
+    if status == OrderStatus.unconfirmed:
+        return {"seen_price": seen_price, "in_stock": True, "retryable": False, "market_blocked": False}
+    if status == OrderStatus.over_target:
+        return {"seen_price": seen_price, "in_stock": True, "retryable": True, "market_blocked": True}
+    error_text = str(result.get("error") or "")
+    _stage, code = classify_order_outcome(getattr(status, "value", str(status)), error_text)
+    if code in (ErrorCode.PRODUCT_UNAVAILABLE, ErrorCode.SIZE_UNAVAILABLE):
+        return {"seen_price": seen_price, "in_stock": False, "retryable": True, "market_blocked": True}
+    if code in _AI_RETRYABLE_ERRORS:
+        return {
+            "seen_price": seen_price,
+            "in_stock": True if seen_price is not None else None,
+            "retryable": True,
+            "market_blocked": True,
+        }
+    return {"seen_price": seen_price, "in_stock": None, "retryable": False, "market_blocked": False}
+
 
 @dataclass
 class _Outcome:
@@ -136,6 +178,14 @@ class _Outcome:
     #: The order was sent but never confirmed, so it may exist. Neither a
     #: success nor a failure: the tracker keeps it apart from both.
     unconfirmed: bool = False
+    #: Live checkout price read during this attempt (for AI price tracking).
+    seen_price: float | None = None
+    #: Stock signal observed during this attempt.
+    in_stock: bool | None = None
+    #: Whether this account stopped before payment due to market conditions
+    #: (price > target, OOS, seller unavailable) and can be recycled in AI mode.
+    retryable: bool = False
+    market_blocked: bool = False
 
 
 # --- login -------------------------------------------------------------------
@@ -800,7 +850,7 @@ async def run_order_job(
             )
             status = result["status"]
             _settle_claim(budget, claimed, result["qty"] if status == OrderStatus.placed else 0)
-            return _Outcome(status == OrderStatus.placed, mock_message(result))
+            return _Outcome(status == OrderStatus.placed, mock_message(result), **_ai_outcome_meta(status, result))
 
         #: The row written before the order was sent, if the run got that far.
         reserved: list[dict] = []
@@ -963,6 +1013,7 @@ async def run_order_job(
             ok,
             _with_steps(_order_message(status, result, target), steps),
             unconfirmed=status == OrderStatus.unconfirmed,
+            **_ai_outcome_meta(status, result),
         )
 
     async with pool:
@@ -973,7 +1024,7 @@ async def run_order_job(
             await _run_batch(tracker, account_ids, worker, at_once)
         else:
             await _run_paced_order_batches(
-                tracker, account_ids, worker, at_once, pacing, budget, job_id
+                tracker, account_ids, worker, at_once, pacing, budget, job_id, target=target
             )
     if budget is not None:
         _log_quantity_summary(job_id, budget, skips, unconfirmed["units"])
@@ -999,13 +1050,63 @@ async def _run_paced_order_batches(
     pacing: Pacing,
     budget: UnitBudget | None,
     job_id: int,
+    *,
+    target: float | None = None,
 ) -> None:
-    """An AI run: the accounts in paced batches (app.jobs.pacing). Accounts
-    the run never reached are closed as skipped, with the reason."""
+    """An AI run: adaptive pacing & BOB-style price/stock tracker (app.jobs.pacing).
 
-    async def run_batch(batch: list[int], offset: int) -> int:
+    Records live checkout prices onto ``Job.payload["ai_tracker"]``, recycles
+    over-target / out-of-stock accounts when ``pacing.recycle_accounts`` is on,
+    and closes any never-attempted accounts as skipped when the run stops.
+    """
+    seen_before: set[int] = set()
+
+    async def run_batch(batch: list[int], offset: int) -> BatchOutcome:
+        # When an account is recycled for a repeat probe interval, append a fresh
+        # JobItem so every probe is tracked accurately without clobbering round 1.
+        for account_id in batch:
+            if account_id in seen_before:
+                tracker.add_attempt(account_id)
+            else:
+                seen_before.add(account_id)
+
         results = await _run_batch(tracker, batch, lambda account_id, i: worker(account_id, offset + i), at_once)
-        return sum(1 for r in results if r.ok and getattr(r.value, "ok", False))
+        placed = 0
+        retryable_ids: list[int] = []
+        seen_prices: list[float] = []
+        stock_signal: bool | None = None
+        market_blocked_count = 0
+        non_skipped = 0
+        last_reason: str | None = None
+
+        for account_id, res in zip(batch, results):
+            val = res.value if res.ok else None
+            if val is None:
+                continue
+            if getattr(val, "skipped", False):
+                continue
+            non_skipped += 1
+            if getattr(val, "ok", False):
+                placed += 1
+            if getattr(val, "seen_price", None) is not None:
+                seen_prices.append(float(val.seen_price))
+            if getattr(val, "in_stock", None) is not None:
+                stock_signal = bool(val.in_stock)
+            if getattr(val, "retryable", False):
+                retryable_ids.append(account_id)
+            if getattr(val, "market_blocked", False):
+                market_blocked_count += 1
+            if getattr(val, "message", None):
+                last_reason = str(val.message)
+
+        return BatchOutcome(
+            placed=placed,
+            retryable_ids=retryable_ids,
+            seen_prices=seen_prices,
+            in_stock=stock_signal,
+            market_blocked=non_skipped > 0 and market_blocked_count > 0 and placed == 0,
+            last_reason=last_reason,
+        )
 
     def should_stop() -> str | None:
         if tracker.is_cancel_requested():
@@ -1016,20 +1117,51 @@ async def _run_paced_order_batches(
             return "the target quantity was reached"
         return None
 
+    def remaining_needed() -> int | None:
+        if budget is None:
+            return None
+        per_order = max(1, int(getattr(budget, "per_order", 1) or 1))
+        return max(0, (budget.remaining + per_order - 1) // per_order)
+
+    threshold_desc = (
+        f"{pacing.scale_up_count} order(s) in a batch place"
+        if pacing.scale_up_mode == "count" and pacing.scale_up_count is not None
+        else f"{pacing.scale_up_pct}% of a batch places"
+    )
+    tracker_desc = ""
+    if pacing.single_probe or pacing.recycle_accounts:
+        flags = []
+        if pacing.single_probe:
+            flags.append("1-probe watch")
+        if pacing.recycle_accounts:
+            flags.append("recycle over-target/OOS accounts")
+        tracker_desc = f" [{', '.join(flags)}]"
     _note_on_job(
         job_id,
         f"AI pacing: batches of {pacing.min_batch} to start, scaling up when "
-        f"{pacing.scale_up_pct}% of a batch places, at most {pacing.max_interval_s / 60:g} min "
-        f"between batches, for up to {pacing.run_seconds / 3600:g} h.",
+        f"{threshold_desc}, at most {pacing.max_interval_s / 60:g} min "
+        f"between batches, for up to {pacing.run_seconds / 3600:g} h.{tracker_desc}",
     )
-    outcome = await run_paced(account_ids, run_batch, pacing, should_stop=should_stop)
-    _note_on_job(job_id, f"AI batches: {', '.join(str(n) for n in outcome.batches) or 'none'}")
-    if outcome.started < len(account_ids):
+    outcome = await run_paced(
+        account_ids,
+        run_batch,
+        pacing,
+        should_stop=should_stop,
+        target_price=target,
+        remaining_needed=remaining_needed,
+        on_state=tracker.update_ai_tracker,
+    )
+    _note_on_job(
+        job_id,
+        f"AI batches: {', '.join(str(n) for n in outcome.batches) or 'none'}"
+        + (f" ({outcome.recycled_attempts} recycled probe(s))" if outcome.recycled_attempts else ""),
+    )
+    if outcome.untried_ids:
         reason = outcome.stopped_because or "stopped"
-        for account_id in account_ids[outcome.started :]:
+        for account_id in outcome.untried_ids:
             await tracker.item_finished(account_id, ok=False, message=f"not tried: {reason}", skipped=True)
         _note_on_job(
-            job_id, f"AI run stopped ({reason}); {len(account_ids) - outcome.started} account(s) not tried."
+            job_id, f"AI run stopped ({reason}); {len(outcome.untried_ids)} account(s) not tried."
         )
 
 

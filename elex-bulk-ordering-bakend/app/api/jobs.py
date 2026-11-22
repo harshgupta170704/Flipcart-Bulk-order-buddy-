@@ -110,7 +110,7 @@ from app.automation.ordering import (
 from app.automation.sellers import MAX_SELLER_CHARS
 from app.core.card_pool import FAILURE_CODE_NAMES, CardRules
 from app.core.fleet import place_order_run
-from app.jobs.pacing import DEFAULT_EXECUTION_VERSION, EXECUTION_VERSIONS, Pacing, parse_duration
+from app.jobs.pacing import DEFAULT_EXECUTION_VERSION, EXECUTION_VERSIONS, SCALE_UP_MODES, Pacing, parse_duration
 from app.io.cards import map_cards_to_accounts, parse_cards
 from app.jobs.tasks import run_balances_job, run_coupon_job, run_login_job, run_order_job
 from app.schemas.account import MAX_ID, MAX_LISTED_IDS
@@ -612,18 +612,41 @@ def _mode_params(mode: str | None, by_hand: bool) -> dict:
 
 
 def _pacing_params(
-    max_interval_minutes: float, min_attempts: int, scale_up_pct: int, run_duration: str
+    max_interval_minutes: float,
+    min_attempts: int,
+    scale_up_pct: int,
+    run_duration: str,
+    *,
+    scale_up_mode: str = "percent",
+    scale_up_count: int | None = None,
+    single_probe: bool = False,
+    recycle_accounts: bool = False,
 ) -> Pacing:
     """The AI run's pacing; a 422 naming the field when one is out of range."""
     try:
         seconds = parse_duration(run_duration)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"ai_run_duration: {exc}.") from None
+    mode = (scale_up_mode or "percent").strip().lower()
+    if mode not in SCALE_UP_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"ai_scale_up_mode: unknown mode {scale_up_mode!r} — expected one of {', '.join(SCALE_UP_MODES)}.",
+        )
+    if mode == "count" and scale_up_count is None:
+        raise HTTPException(
+            status_code=422,
+            detail="ai_scale_up_count: enter a fixed order count (1 to 30) when Scale-Up Threshold Mode is Fixed count.",
+        )
     return Pacing(
         max_interval_s=float(max_interval_minutes) * 60,
         min_batch=int(min_attempts),
         scale_up_pct=int(scale_up_pct),
         run_seconds=seconds,
+        scale_up_mode=mode,
+        scale_up_count=int(scale_up_count) if (mode == "count" and scale_up_count is not None) else None,
+        single_probe=bool(single_probe),
+        recycle_accounts=bool(recycle_accounts),
     )
 
 
@@ -1337,11 +1360,15 @@ async def start_order_job(
     coupon_codes: str | None = Form(None, max_length=2000),
     reward_ids: str | None = Form(None, max_length=2000),
     flipkart_minutes: bool = Form(False),
-    # AI mode pacing (app.jobs.pacing); read only when mode is "ai".
+    # AI mode pacing & price tracker (app.jobs.pacing); read only when mode is "ai".
     ai_max_interval_minutes: float = Form(1, ge=1, le=60, allow_inf_nan=False),
     ai_min_attempts: int = Form(10, ge=1, le=30),
+    ai_scale_up_mode: str = Form("percent", max_length=16),
     ai_scale_up_pct: int = Form(20, ge=1, le=90),
+    ai_scale_up_count: int | None = Form(None, ge=1, le=30),
     ai_run_duration: str = Form("12h", max_length=16),
+    ai_single_probe: bool = Form(False),
+    ai_recycle_accounts: bool = Form(False),
     # An AI run with made-up outcomes: the pacing is real, nothing is bought.
     ai_rehearsal: bool = Form(False),
     cards_file: UploadFile | None = File(None),
@@ -1457,7 +1484,16 @@ async def start_order_job(
     }
     pacing = None
     if mode_params.get("mode") == MODE_AI:
-        pacing = _pacing_params(ai_max_interval_minutes, ai_min_attempts, ai_scale_up_pct, ai_run_duration)
+        pacing = _pacing_params(
+            ai_max_interval_minutes,
+            ai_min_attempts,
+            ai_scale_up_pct,
+            ai_run_duration,
+            scale_up_mode=ai_scale_up_mode,
+            scale_up_count=ai_scale_up_count,
+            single_probe=ai_single_probe,
+            recycle_accounts=ai_recycle_accounts,
+        )
         if ai_rehearsal and bank_step_by_hand:
             raise HTTPException(
                 status_code=422,
@@ -1473,7 +1509,7 @@ async def start_order_job(
     quantity = _quantity_params(
         total_quantity=total_quantity,
         qty_per_order=qty_per_order,
-        total_attempts=total_attempts,
+        total_attempts=None if (pacing is not None and pacing.recycle_accounts) else total_attempts,
         cart_amount_limit=cart_amount_limit,
         max_delivery_days=max_delivery_days,
         brand=brand,

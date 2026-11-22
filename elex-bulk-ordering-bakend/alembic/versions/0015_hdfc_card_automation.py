@@ -1,7 +1,7 @@
 """HDFC card automation: card batches, the parent card's Aan, and the SMS relay phones
 
-Revision ID: 0017
-Revises: 0016
+Revision ID: 0015
+Revises: 0014
 Create Date: 2026-11-22
 
 * hdfc_user_ids: ``aan`` (the parent card's Alternate A/c No., the first
@@ -23,8 +23,8 @@ from alembic import context, op
 import sqlalchemy as sa
 
 
-revision: str = '0017'
-down_revision: Union[str, Sequence[str], None] = '0016'
+revision: str = '0015'
+down_revision: Union[str, Sequence[str], None] = '0014'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

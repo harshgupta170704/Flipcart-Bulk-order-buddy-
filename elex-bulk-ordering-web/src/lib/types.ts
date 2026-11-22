@@ -836,7 +836,9 @@ export interface CardPreview {
  *  up each order's outcome — no browser, nothing bought, no order rows. */
 export type RunMode = "real" | "mock" | "ai";
 
-/** AI mode's pacing, as sent to the server. */
+export type AiScaleUpMode = "percent" | "count";
+
+/** AI mode's pacing & price-tracker config, as sent to the server. */
 export interface AiPacingInput {
   /** Minutes, 1-60: the longest wait before the next batch. */
   max_interval_minutes: number;
@@ -844,10 +846,53 @@ export interface AiPacingInput {
   min_attempts: number;
   /** 1-90: % of a batch that must place for the next to start at once, doubled. */
   scale_up_pct: number;
+  /** "percent" (default) or "count" (fixed placed count per batch). */
+  scale_up_mode?: AiScaleUpMode;
+  /** 1-30: fixed placed orders needed when scale_up_mode === "count". */
+  scale_up_count?: number;
   /** "12h", "90m", "2d": between 1h and 2d. */
   run_duration: string;
+  /** Probe 1 account while watching (price > target / OOS), then burst on drop. */
+  single_probe?: boolean;
+  /** Recycle non-buying over-target / OOS accounts across Run Duration. */
+  recycle_accounts?: boolean;
   /** Pace for real but make up each outcome: nothing is bought. */
   rehearsal: boolean;
+}
+
+export interface AiPricePoint {
+  at: string;
+  price: number | null;
+  in_stock: boolean | null;
+  batch_size: number;
+  placed: number;
+  failed: number;
+  status: string;
+  reason?: string | null;
+}
+
+export interface AiTrackerState {
+  status: string;
+  target_price: number | null;
+  last_seen_price: number | null;
+  lowest_seen_price: number | null;
+  highest_seen_price: number | null;
+  in_stock: boolean | null;
+  batches_run: number;
+  total_attempts: number;
+  placed_orders: number;
+  recycled_attempts: number;
+  eligible_accounts: number;
+  current_batch_size: number;
+  watching: boolean;
+  single_probe: boolean;
+  recycle_accounts: boolean;
+  scale_up_mode: string;
+  last_probe_at: string | null;
+  next_probe_at: string | null;
+  last_reason: string | null;
+  stopped_because: string | null;
+  history: AiPricePoint[];
 }
 /** "upto": an order may carry fewer units when Flipkart caps the quantity per
  *  order. "minimum": all of them, or that order is refused before payment. */
@@ -1630,6 +1675,7 @@ export type JobStreamMessageType =
   | "job_started"
   | "item_started"
   | "item_finished"
+  | "ai_tracker_update"
   | "job_finished";
 
 export interface JobStreamMessage {
@@ -1639,6 +1685,8 @@ export interface JobStreamMessage {
   job?: Job;
   /** present on "snapshot" */
   items?: JobItem[];
+  /** present on "ai_tracker_update" */
+  ai_tracker?: AiTrackerState;
   account_id?: number;
   ok?: boolean;
   /** present on "item_finished": the account was passed over, not failed. */

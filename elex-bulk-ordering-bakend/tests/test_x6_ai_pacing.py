@@ -172,3 +172,101 @@ def test_pacing_out_of_range_starts_nothing(api, db, recorder, field, value):
 def test_a_real_or_mock_run_has_no_pacing(api, db, recorder):
     _post(api, mode="mock")
     assert recorder.calls[0]["pacing"] is None
+
+
+# --- BOB AI Price Tracker: 1-probe watch, account recycling, fixed threshold ---
+def test_price_tracker_probes_one_account_recycles_over_target_then_bursts_on_drop():
+    from app.jobs.pacing import BatchOutcome
+
+    clock = FakeClock()
+    states: list[dict] = []
+    # Only 2 accounts, but price stays above target (26905) for 3 intervals,
+    # then drops to 26899 on probe 4 and stays low!
+    calls: list[tuple[list[int], float]] = []
+
+    async def run_batch(batch: list[int], _offset: int) -> BatchOutcome:
+        calls.append((list(batch), clock.now))
+        clock.now += 5.0
+        n = len(calls)
+        if n <= 3:
+            # Price still high: over target -> recycle every account in batch
+            seen = 27249.0 - (n - 1) * 50.0  # 27249, 27199, 27149
+            return BatchOutcome(
+                placed=0,
+                retryable_ids=list(batch),
+                seen_prices=[seen],
+                in_stock=True,
+                market_blocked=True,
+                last_reason=f"₹{seen:,.2f} is over cap ₹26,905.00",
+            )
+        # Price dropped! Every account in batch places at ₹26,899!
+        return BatchOutcome(
+            placed=len(batch),
+            retryable_ids=[],
+            seen_prices=[26899.0] * len(batch),
+            in_stock=True,
+            market_blocked=False,
+            last_reason="placed at ₹26,899.00",
+        )
+
+    pacing = Pacing(
+        max_interval_s=60,
+        min_batch=4,
+        scale_up_pct=20,
+        run_seconds=12 * 3600,
+        single_probe=True,
+        recycle_accounts=True,
+    )
+    result = asyncio.run(
+        run_paced(
+            [101, 102, 103, 104, 105],
+            run_batch,
+            pacing,
+            should_stop=lambda: None,
+            clock=clock,
+            sleep=clock.sleep,
+            target_price=26905.0,
+            on_state=lambda snap: states.append(snap),
+        )
+    )
+    # Probes 1..3 used 1 account each at t=0, 60, 120 (recycling 101,102,103)
+    # Probe 4 (t=180) hit the drop and placed 1 -> IMMEDIATELY (t=185, 0s wait!) launched min_batch=4
+    assert [len(b) for b, _t in calls] == [1, 1, 1, 1, 4]
+    assert [t for _b, t in calls] == [0.0, 60.0, 120.0, 180.0, 185.0]
+    assert result.total_placed == 5
+    assert result.recycled_attempts == 3
+    assert result.tracker is not None
+    assert result.tracker["lowest_seen_price"] == 26899.0
+    assert result.tracker["highest_seen_price"] == 27249.0
+    assert any(s["status"] == "watching" for s in states)
+    assert any(s["status"] == "scaling_up" for s in states)
+
+
+def test_fixed_count_scale_up_mode_and_api_wire(api, db, recorder):
+    p = Pacing(min_batch=10, scale_up_mode="count", scale_up_count=2)
+    assert p.threshold(10) == 2
+    assert p.threshold(1) == 1
+
+    response = _post(
+        api,
+        mode="ai",
+        ai_max_interval_minutes="1",
+        ai_min_attempts="10",
+        ai_scale_up_mode="count",
+        ai_scale_up_count="3",
+        ai_run_duration="12h",
+        ai_single_probe="true",
+        ai_recycle_accounts="true",
+    )
+    assert response.status_code == 201, response.text
+    pacing = recorder.calls[0]["pacing"]
+    assert pacing.scale_up_mode == "count"
+    assert pacing.scale_up_count == 3
+    assert pacing.single_probe is True
+    assert pacing.recycle_accounts is True
+
+    bad = _post(api, mode="ai", ai_scale_up_mode="count")
+    assert bad.status_code == 422
+    bad_mode = _post(api, mode="ai", ai_scale_up_mode="magic")
+    assert bad_mode.status_code == 422
+

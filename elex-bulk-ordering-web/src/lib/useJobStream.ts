@@ -133,6 +133,19 @@ export function useJobStream(jobId: number | null): JobStream {
         return;
       }
 
+      if (msg.type === "ai_tracker_update" && msg.ai_tracker) {
+        const snap = msg.ai_tracker;
+        setJob((prev) =>
+          prev
+            ? {
+                ...prev,
+                payload: { ...(prev.payload ?? {}), ai_tracker: snap },
+              }
+            : prev,
+        );
+        return;
+      }
+
       if (msg.type === "item_started" && typeof accountId === "number") {
         // The clock for this account starts now; a stale end from an earlier
         // attempt goes with it so the duration is never read off two runs.

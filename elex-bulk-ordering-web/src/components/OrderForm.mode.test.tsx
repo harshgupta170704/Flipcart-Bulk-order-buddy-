@@ -285,6 +285,30 @@ describe("AI mode (step E)", () => {
     expect(mocks.startOrderJob).not.toHaveBeenCalled();
     expect(screen.getByText(/like 12h, 90m or 2d/)).toBeTruthy();
   });
+
+  it("hides Total Attempts in AI mode and sends price tracker + fixed count options", async () => {
+    await renderForm();
+    fireEvent.click(screen.getByRole("radio", { name: "AI" }));
+    expect(screen.queryByLabelText(/Total Attempts/)).toBeNull();
+    fireEvent.change(screen.getByLabelText(/Scale-Up Threshold Mode/), { target: { value: "count" } });
+    fireEvent.change(screen.getByLabelText(/Scale-Up Threshold \(orders\)/), { target: { value: "3" } });
+    fireEvent.click(screen.getByLabelText(/Price tracker mode/));
+    start(/Submit AI Order/);
+    await waitFor(() => expect(mocks.startOrderJob).toHaveBeenCalledTimes(1));
+    const sent = mocks.startOrderJob.mock.calls[0][0];
+    expect(sent.mode).toBe("ai");
+    expect(sent.ai).toEqual({
+      max_interval_minutes: 1,
+      min_attempts: 10,
+      scale_up_pct: 20,
+      scale_up_mode: "count",
+      scale_up_count: 3,
+      run_duration: "12h",
+      single_probe: true,
+      recycle_accounts: true,
+      rehearsal: false,
+    });
+  });
 });
 
 describe("Mock without payment, and Ref Code", () => {
