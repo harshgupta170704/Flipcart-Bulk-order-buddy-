@@ -61,9 +61,9 @@ export function BatchRequestsView() {
     {
       key: "progress",
       header: "Progress",
-      render: (j) => `${j.succeeded + j.failed}/${j.total} (${j.succeeded} ok, ${j.failed} fail)`,
+      render: (j) => `${j.done_items + j.failed_items}/${j.total_items} (${j.done_items} ok, ${j.failed_items} fail)`,
     },
-    { key: "total", header: "Tasks", numeric: true },
+    { key: "total_items", header: "Tasks", numeric: true },
     { key: "started_at", header: "Started", render: (j) => (j.started_at ? formatDateTime(j.started_at) : "—") },
     { key: "finished_at", header: "Finished", render: (j) => (j.finished_at ? formatDateTime(j.finished_at) : "—") },
     { key: "duration", header: "Duration", render: (j) => durationText(j.started_at, j.finished_at) },

@@ -14,6 +14,9 @@ import {
   listHdfcChildCards,
   listHdfcUserIds,
   retryHdfcBatch,
+  startHdfcCaptcha,
+  submitHdfcCaptcha,
+  submitHdfcOtp,
   syncHdfcPortalUsers,
   pointHdfcUserEmail,
   testHdfcPortalLogin,
@@ -460,6 +463,63 @@ function distinct(values: number[], show: (value: number) => string): string {
 function PortalLine({ portal, error }: { portal: HdfcPortalStatus | null; error: string | null }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<HdfcPortalTestResult | null>(null);
+  // The captcha sign-in: HDFC's captcha is shown to a person, never solved by code.
+  const [captcha, setCaptcha] = useState<{ image: string } | null>(null);
+  const [step, setStep] = useState<"captcha" | "otp">("captcha");
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [dialogError, setDialogError] = useState<string | null>(null);
+
+  const openCaptcha = async () => {
+    setBusy(true);
+    setDialogError(null);
+    setTyped("");
+    setStep("captcha");
+    try {
+      setCaptcha(await startHdfcCaptcha());
+    } catch (err) {
+      setResult({ ok: false, detail: errorMessage(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const closeCaptcha = () => {
+    setCaptcha(null);
+    setTyped("");
+    setDialogError(null);
+  };
+
+  const submitTyped = async () => {
+    setBusy(true);
+    setDialogError(null);
+    try {
+      if (step === "captcha") {
+        const answer = await submitHdfcCaptcha(typed.trim());
+        if (answer.needs_otp) {
+          setStep("otp");
+          setTyped("");
+        } else if (answer.ok) {
+          setResult(answer);
+          closeCaptcha();
+        } else {
+          setDialogError(answer.detail);
+        }
+      } else {
+        const answer = await submitHdfcOtp(typed.trim());
+        if (answer.ok) {
+          setResult(answer);
+          closeCaptcha();
+        } else {
+          setDialogError(answer.detail);
+        }
+      }
+    } catch (err) {
+      setDialogError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   if (error) return <Alert tone="error">{error}</Alert>;
   if (!portal) return null;
@@ -498,12 +558,65 @@ function PortalLine({ portal, error }: { portal: HdfcPortalStatus | null; error:
             </Alert>
           )}
         </div>
+        <Button size="sm" variant="secondary" loading={busy && !captcha} onClick={() => void openCaptcha()}>
+          Sign in with captcha
+        </Button>
         <Button size="sm" loading={testing} onClick={() => void test()}>
           Test sign-in
         </Button>
       </div>
       {portal.last_error ? <p className="text-[12px] text-ink-2">Last portal error: {portal.last_error}</p> : null}
       {result ? <Alert tone={result.ok ? "success" : "error"}>{result.detail}</Alert> : null}
+      <Dialog
+        open={captcha !== null}
+        title={step === "captcha" ? "Sign in to HDFC CorpAssist" : "Enter HDFC's OTP"}
+        description={
+          step === "captcha"
+            ? "HDFC asks for this captcha on every sign-in. Type the 6 characters shown; your user and password are already filled."
+            : "HDFC sent an OTP to the number or email on the portal user. Type it here."
+        }
+        onClose={closeCaptcha}
+        width="420px"
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeCaptcha}>
+              Cancel
+            </Button>
+            <Button
+              loading={busy}
+              disabled={typed.trim().length < (step === "captcha" ? 6 : 4)}
+              onClick={() => void submitTyped()}
+            >
+              {step === "captcha" ? "Sign in" : "Submit OTP"}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          {step === "captcha" && captcha ? (
+            <img src={captcha.image} alt="HDFC captcha" className="h-12 self-start rounded border border-line bg-white" />
+          ) : null}
+          <Field label={step === "captcha" ? "Captcha" : "OTP"}>
+            <TextInput
+              value={typed}
+              autoFocus
+              autoComplete="off"
+              maxLength={step === "captcha" ? 6 : 8}
+              inputMode={step === "captcha" ? "text" : "numeric"}
+              onChange={(e) => setTyped(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && typed.trim().length >= (step === "captcha" ? 6 : 4)) void submitTyped();
+              }}
+            />
+          </Field>
+          {dialogError ? <Alert tone="error">{dialogError}</Alert> : null}
+          {dialogError && step === "captcha" ? (
+            <Button size="sm" variant="secondary" onClick={() => void openCaptcha()}>
+              Get a new captcha
+            </Button>
+          ) : null}
+        </div>
+      </Dialog>
     </div>
   );
 }

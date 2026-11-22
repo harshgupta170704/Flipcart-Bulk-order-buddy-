@@ -1035,6 +1035,33 @@ export function testHdfcPortalLogin(): Promise<HdfcPortalTestResult> {
   return request<HdfcPortalTestResult>("/hdfc/portal/test-login", { method: "POST" });
 }
 
+export interface HdfcCaptcha {
+  /** `data:image/png;base64,...` of HDFC's captcha. */
+  image: string;
+  expires_in: number;
+}
+
+/** Open HDFC's sign-in page (user and password filled) and get its captcha to read. */
+export function startHdfcCaptcha(): Promise<HdfcCaptcha> {
+  return request<HdfcCaptcha>("/hdfc/portal/captcha", { method: "POST" });
+}
+
+/** Sign in with the captcha a person typed; `needs_otp` when HDFC then wants an OTP typed. */
+export function submitHdfcCaptcha(text: string): Promise<HdfcPortalTestResult & { needs_otp: boolean }> {
+  return request<HdfcPortalTestResult & { needs_otp: boolean }>("/hdfc/portal/captcha/submit", {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+}
+
+/** Finish the captcha sign-in with the OTP read from HDFC's message. */
+export function submitHdfcOtp(code: string): Promise<HdfcPortalTestResult> {
+  return request<HdfcPortalTestResult>("/hdfc/portal/otp/submit", {
+    method: "POST",
+    body: JSON.stringify({ code }),
+  });
+}
+
 /** Set this user's email on the HDFC portal to the one saved here (the shared inbox). */
 export function pointHdfcUserEmail(id: number): Promise<HdfcUserId> {
   return request<HdfcUserId>(`/hdfc/user-ids/${id}/point-email`, { method: "POST" });

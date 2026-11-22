@@ -247,17 +247,17 @@ export function ScreenerWatchlist() {
           <div className="flex flex-col justify-end gap-2">
             <Checkbox
               checked={config.supercoin_offers}
-              onChange={(checked) => setConfig({ ...config, supercoin_offers: checked })}
+              onChange={(e) => setConfig({ ...config, supercoin_offers: e.target.checked })}
               label="SuperCoin offers"
             />
             <Checkbox
               checked={config.coupon_offers}
-              onChange={(checked) => setConfig({ ...config, coupon_offers: checked })}
+              onChange={(e) => setConfig({ ...config, coupon_offers: e.target.checked })}
               label="Coupon / deal offers"
             />
             <Checkbox
               checked={config.enabled}
-              onChange={(checked) => setConfig({ ...config, enabled: checked })}
+              onChange={(e) => setConfig({ ...config, enabled: e.target.checked })}
               label="Screener on"
             />
           </div>

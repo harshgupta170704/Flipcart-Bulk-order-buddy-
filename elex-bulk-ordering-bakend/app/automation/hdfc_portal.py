@@ -25,6 +25,8 @@ never a card number, a password or an OTP.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import csv
 import io
 import logging
@@ -42,10 +44,29 @@ USERS = "/all-beneficiary-users"
 BULK_CREATE = "/create-virtual-card-bulk-new"
 CARD_DETAILS = "/virtual-card-details"
 #: How long a signed-in browser state is reused.
-SESSION_MINUTES = 10
+SESSION_MINUTES = 20
+#: How long the captcha sign-in waits for a person to type the captcha.
+CAPTCHA_WAIT_SECONDS = 180
 
 _LOCK = asyncio.Lock()
 _STATE: dict = {"storage": None, "at": 0.0}
+#: The browser waiting at the captcha (one at a time).
+_PENDING: dict = {}
+
+
+async def _close_pending() -> None:
+    """Close the browser waiting at the captcha, if any."""
+    handle = _PENDING.pop("expiry", None)
+    if handle is not None:
+        handle.cancel()
+    browser, pw = _PENDING.pop("browser", None), _PENDING.pop("pw", None)
+    _PENDING.clear()
+    with contextlib.suppress(Exception):
+        if browser is not None:
+            await browser.close()
+    with contextlib.suppress(Exception):
+        if pw is not None:
+            await pw.stop()
 
 
 class PortalError(RuntimeError):
@@ -54,6 +75,11 @@ class PortalError(RuntimeError):
 
 class PortalNotConfigured(PortalError):
     pass
+
+
+class PortalNeedsOtp(PortalError):
+    """The captcha sign-in reached HDFC's OTP box and no OTP source is set: a
+    person types the code (the browser stays open, see finish_otp_login)."""
 
 
 @dataclass(frozen=True)
@@ -220,7 +246,10 @@ class PlaywrightPortal:
         if await _signed_in(page):
             return
         if await page.locator("img[src*='captcha' i], [id*='captcha' i], [class*='captcha' i]").count():
-            raise PortalError("the portal's sign-in asks for a captcha, which is not automated: sign in by hand")
+            raise PortalError(
+                "the portal's sign-in asks for a captcha: press 'Sign in with captcha' on the "
+                "CorpAssist Create cards tab and type the characters shown"
+            )
 
         password = page.locator("input[type='password']").first
         try:
@@ -235,6 +264,15 @@ class PlaywrightPortal:
         asked_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=5)
         if not await _click_button(page, _SUBMIT_WORDS):
             await password.press("Enter")
+        await self._finish_sign_in(page, asked_at)
+
+    async def _finish_sign_in(self, page, asked_at: datetime, *, ask_person: bool = False) -> None:
+        """After the sign-in form is submitted: wait for the dashboard or an OTP
+        box, enter the OTP when asked, and confirm the dashboard opened.
+
+        With ``ask_person`` and no OTP source set, raises :class:`PortalNeedsOtp`
+        at the OTP box so a person can type the code (see finish_otp_login)."""
+        step = self.config.step_seconds * 1000
 
         # Either the dashboard (no OTP asked) or an OTP field.
         deadline = time.monotonic() + self.config.step_seconds
@@ -254,7 +292,14 @@ class PlaywrightPortal:
         else:
             raise PortalError("after the password, the portal showed neither the dashboard nor an OTP field")
 
-        code = await self._otp(asked_at)
+        if ask_person and self.config.otp_via is None:
+            raise PortalNeedsOtp("HDFC sent an OTP: type it below")
+        await self._enter_otp(page, await self._otp(asked_at))
+
+    async def _enter_otp(self, page, code: str) -> None:
+        step = self.config.step_seconds * 1000
+        otp_box = page.locator(_OTP_INPUT)
+        boxes = page.locator("input[maxlength='1']")
         if await otp_box.count():
             await otp_box.first.fill(code)
         else:
@@ -308,6 +353,97 @@ class PlaywrightPortal:
             return "signed in to the HDFC portal"
 
         return await self._with_page(work)
+
+    # -- sign in with a captcha typed by a person ------------------------------
+    async def start_captcha_login(self) -> str:
+        """Open the portal's sign-in page, fill the user and password, and
+        return the captcha picture (a ``data:image/png`` URL) for a person to
+        read. The captcha is HDFC's bot check, so it is never solved by code:
+        :meth:`finish_captcha_login` takes what the person typed."""
+        from playwright.async_api import async_playwright
+
+        if not self.config.configured:
+            raise PortalNotConfigured("the HDFC portal user and password are not set (Settings)")
+        if _LOCK.locked():
+            raise PortalError("another portal action is running: try again in a moment")
+        await _close_pending()
+        pw = await async_playwright().start()
+        try:
+            # Visible on purpose: HDFC's captcha service refuses headless browsers
+            # (its CORS check fails), and a person is at the machine anyway. The
+            # window closes as soon as the sign-in is done; later jobs reuse the
+            # saved session headlessly.
+            browser = await pw.chromium.launch(headless=False)
+            context = await browser.new_context(accept_downloads=True, viewport={"width": 1280, "height": 820})
+            page = await context.new_page()
+            page.set_default_timeout(self.config.step_seconds * 1000)
+            await page.goto(self.config.url + "/", wait_until="domcontentloaded")
+            await page.wait_for_function(
+                "() => { const i = document.querySelector('#captchaImage'); return i && i.complete && i.naturalWidth > 0; }",
+                timeout=self.config.step_seconds * 1000,
+            )
+            await page.locator("#username").fill(self.config.user)
+            await page.locator("#password").fill(self.config.password)
+            png = await page.locator("#captchaImage").screenshot()
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                await pw.stop()
+            log.warning("HDFC portal: captcha page failed (%s)", type(exc).__name__)
+            raise PortalError(f"the portal's sign-in page did not show a captcha ({type(exc).__name__})") from None
+        _PENDING.update(pw=pw, browser=browser, page=page, context=context, config=self.config)
+        _PENDING["expiry"] = asyncio.get_running_loop().call_later(
+            CAPTCHA_WAIT_SECONDS, lambda: asyncio.ensure_future(_close_pending())
+        )
+        return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+    async def finish_captcha_login(self, text: str) -> str:
+        """Type the person's captcha, sign in (reading the OTP as usual) and keep
+        the signed-in state for the next jobs. Raises :class:`PortalNeedsOtp`,
+        with the browser kept open, when HDFC wants an OTP and none can be read."""
+        page = _PENDING.get("page")
+        if page is None:
+            raise PortalError("the captcha sign-in expired: press 'Sign in with captcha' again")
+        text = (text or "").strip()
+        if len(text) != 6:
+            raise PortalError("the captcha is 6 characters")
+        keep_open = False
+        try:
+            await page.locator("#captcha").fill(text)
+            asked_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=5)
+            login = page.locator("#login")
+            await login.wait_for(state="visible")
+            if not await login.is_enabled():
+                raise PortalError("the portal's Login button stayed disabled after the captcha was typed")
+            await login.click()
+            try:
+                await self._finish_sign_in(page, asked_at, ask_person=True)
+            except PortalNeedsOtp:
+                keep_open = True
+                raise
+            await self._keep_session()
+            return "signed in to the HDFC portal (session kept for the next jobs)"
+        finally:
+            if not keep_open:
+                await _close_pending()
+
+    async def finish_otp_login(self, code: str) -> str:
+        """Type the OTP a person read from HDFC's message and finish signing in."""
+        page = _PENDING.get("page")
+        if page is None:
+            raise PortalError("the sign-in expired: press 'Sign in with captcha' again")
+        code = re.sub(r"\D", "", code or "")
+        if not 4 <= len(code) <= 8:
+            raise PortalError("type the OTP digits from HDFC's message")
+        try:
+            await self._enter_otp(page, code)
+            await self._keep_session()
+            return "signed in to the HDFC portal (session kept for the next jobs)"
+        finally:
+            await _close_pending()
+
+    async def _keep_session(self) -> None:
+        _STATE["storage"] = await _PENDING["context"].storage_state()
+        _STATE["at"] = time.monotonic()
 
     async def bulk_create(self, sheet: bytes, file_name: str) -> BulkResult:
         async def work(page) -> BulkResult:

@@ -410,7 +410,7 @@ export default function EmployeePhones() {
           <div className="flex flex-wrap items-center gap-3">
             <Checkbox
               checked={assumeOnline}
-              onChange={(checked) => void toggleAssumeOnline(checked)}
+              onChange={(e) => void toggleAssumeOnline(e.target.checked)}
               label="Assume all numbers online"
             />
             <Button

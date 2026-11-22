@@ -718,6 +718,8 @@ class PortalOut(BaseModel):
 class PortalTestOut(BaseModel):
     ok: bool
     detail: str
+    #: The captcha sign-in reached HDFC's OTP box: a person types the code.
+    needs_otp: bool | None = None
 
 
 class SyncOut(BaseModel):
@@ -768,11 +770,66 @@ def portal_status(db: DbSession = Depends(get_db)) -> PortalOut:
     )
 
 
-@router.post("/portal/test-login", response_model=PortalTestOut)
+@router.post("/portal/test-login", response_model=PortalTestOut, response_model_exclude_none=True)
 async def portal_test_login(db: DbSession = Depends(get_db)) -> PortalTestOut:
     _portal_ready(db)
     try:
         detail = await _portal().test_login()
+    except hdfc_portal.PortalError as exc:
+        return PortalTestOut(ok=False, detail=str(exc))
+    return PortalTestOut(ok=True, detail=detail)
+
+
+class CaptchaOut(BaseModel):
+    #: ``data:image/png;base64,...`` of HDFC's captcha.
+    image: str
+    expires_in: int
+
+
+class CaptchaIn(BaseModel):
+    text: str
+
+
+@router.post("/portal/captcha", response_model=CaptchaOut)
+async def portal_captcha(db: DbSession = Depends(get_db)) -> CaptchaOut:
+    """Open HDFC's sign-in page and return its captcha for a person to read.
+    The captcha is HDFC's bot check: it is shown, never solved by code."""
+    config = hdfc_portal.config_from(_effective_settings(db))
+    if not config.configured:
+        raise HTTPException(status_code=409, detail="Set the HDFC portal user and password in Settings first.")
+    try:
+        image = await hdfc_portal.PlaywrightPortal(config, _session_factory()).start_captcha_login()
+    except hdfc_portal.PortalError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    return CaptchaOut(image=image, expires_in=hdfc_portal.CAPTCHA_WAIT_SECONDS)
+
+
+@router.post("/portal/captcha/submit", response_model=PortalTestOut, response_model_exclude_none=True)
+async def portal_captcha_submit(payload: CaptchaIn, db: DbSession = Depends(get_db)) -> PortalTestOut:
+    """Sign in with the captcha a person typed; the signed-in session is then
+    reused by Test sign-in, Sync from HDFC and Create on HDFC. When HDFC asks
+    for an OTP and none can be read, ``needs_otp`` is set and the OTP goes to
+    ``/portal/otp/submit``."""
+    config = hdfc_portal.config_from(_effective_settings(db))
+    try:
+        detail = await hdfc_portal.PlaywrightPortal(config, _session_factory()).finish_captcha_login(payload.text)
+    except hdfc_portal.PortalNeedsOtp as exc:
+        return PortalTestOut(ok=False, detail=str(exc), needs_otp=True)
+    except hdfc_portal.PortalError as exc:
+        return PortalTestOut(ok=False, detail=str(exc))
+    return PortalTestOut(ok=True, detail=detail)
+
+
+class OtpIn(BaseModel):
+    code: str
+
+
+@router.post("/portal/otp/submit", response_model=PortalTestOut, response_model_exclude_none=True)
+async def portal_otp_submit(payload: OtpIn, db: DbSession = Depends(get_db)) -> PortalTestOut:
+    """Finish the captcha sign-in with the OTP a person read from HDFC's message."""
+    config = hdfc_portal.config_from(_effective_settings(db))
+    try:
+        detail = await hdfc_portal.PlaywrightPortal(config, _session_factory()).finish_otp_login(payload.code)
     except hdfc_portal.PortalError as exc:
         return PortalTestOut(ok=False, detail=str(exc))
     return PortalTestOut(ok=True, detail=detail)
