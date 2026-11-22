@@ -161,7 +161,7 @@ def test_the_endpoint_answers_up_to_twelve_canonical_results(api, browser) -> No
 
     assert body["query"] == "vivo t5 lite" and body["error"] is None
     assert len(body["results"]) == MAX_RESULTS
-    assert set(body["results"][0]) == {"title", "link", "pid", "price", "rating", "image"}
+    assert set(body["results"][0]) == {"title", "link", "pid", "price", "rating", "image", "mrp", "discount_pct", "highlights"}
     assert all(products_api.is_flipkart_link(result["link"]) for result in body["results"])
     assert browser.searched == ["vivo t5 lite"]
 

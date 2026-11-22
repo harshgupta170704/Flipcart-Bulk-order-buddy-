@@ -56,12 +56,13 @@ function IconFrame({ children, className }: { children: ReactNode; className?: s
 }
 
 /** The setup pages gathered under "Platform Accounts & Configs" (see ConfigsTabs). */
-export const CONFIG_PATHS = ["/accounts", "/gift-vouchers", "/hdfc-corpassist", "/sessions", "/coupons", "/order-phones", "/addresses", "/limits"];
+export const CONFIG_PATHS = ["/accounts", "/platform-accounts", "/gift-vouchers", "/sessions", "/coupons", "/order-phones", "/addresses", "/limits"];
 
 const NAV_ITEMS: NavItem[] = [
   {
     to: "/",
     label: "Dashboard",
+    match: ["/", "/dashboard"],
     icon: ({ className }) => (
       <IconFrame className={className}>
         <rect x="2" y="2.5" width="5" height="5" rx="1" {...strokeProps} />
@@ -75,6 +76,7 @@ const NAV_ITEMS: NavItem[] = [
   {
     to: "/ordering",
     label: "Smart Bulk Order",
+    match: ["/ordering", "/smart-bulk-order"],
     icon: ({ className }) => (
       <IconFrame className={className}>
         <path d="M9 1.8 3.5 9h4l-1 5.2L12.5 7h-4z" {...strokeProps} />
@@ -114,36 +116,34 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   {
-    to: "/alerts",
-    label: "Alerts",
+    to: "/employee-phones",
+    label: "Employee Phones",
     icon: ({ className }) => (
       <IconFrame className={className}>
-        <path d="M8 2.2c-2.4 0-4 1.8-4 4.2v2.5L2.8 11h10.4L12 8.9V6.4c0-2.4-1.6-4.2-4-4.2z" {...strokeProps} />
-        <path d="M6.6 13.2a1.5 1.5 0 0 0 2.8 0" {...strokeProps} />
-      </IconFrame>
-    ),
-    badge: () => <OpenAlertsBadge />,
-  },
-  {
-    to: "/requests",
-    label: "Requests",
-    icon: ({ className }) => (
-      <IconFrame className={className}>
-        <rect x="3" y="2" width="10" height="12" rx="1.5" {...strokeProps} />
-        <path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" {...strokeProps} />
+        <rect x="4.5" y="1.8" width="7" height="12.4" rx="1.4" {...strokeProps} />
+        <circle cx="8" cy="11.8" r="0.6" {...strokeProps} />
       </IconFrame>
     ),
   },
   {
-    to: "/agents",
-    label: "Agents",
+    to: "/hdfc-corpassist",
+    label: "CorpAssist",
+    match: ["/hdfc-corpassist", "/corpassist"],
     icon: ({ className }) => (
       <IconFrame className={className}>
-        <rect x="2" y="3" width="12" height="8" rx="1.2" {...strokeProps} />
-        <path d="M6 14h4M8 11v3" {...strokeProps} />
+        <rect x="1.8" y="3.5" width="12.4" height="9" rx="1.4" {...strokeProps} />
+        <path d="M1.8 6.5h12.4" {...strokeProps} />
       </IconFrame>
     ),
   },
+];
+
+const TOOLS_ITEMS: { to: string; label: string; badge?: () => ReactNode }[] = [
+  { to: "/screener", label: "Product Screener" },
+  { to: "/inventory", label: "Inventory" },
+  { to: "/alerts", label: "Alerts", badge: () => <OpenAlertsBadge /> },
+  { to: "/requests", label: "Requests" },
+  { to: "/agents", label: "Agents" },
 ];
 
 const ADMIN_ITEMS: { to: string; label: string }[] = [
@@ -238,6 +238,14 @@ function TopNav({ isAdmin }: { isAdmin: boolean }) {
           </Link>
         );
       })}
+      <Menu label="Tools and More">
+        {TOOLS_ITEMS.map((item) => (
+          <Link key={item.to} role="menuitem" to={item.to} className={`${menuItemClass} justify-between gap-2`}>
+            <span>{item.label}</span>
+            {item.badge ? item.badge() : null}
+          </Link>
+        ))}
+      </Menu>
       {isAdmin ? (
         <Menu label="Admin">
           {ADMIN_ITEMS.map((item) => (
@@ -263,6 +271,18 @@ function MobileNav({ onNavigate, isAdmin }: { onNavigate?: () => void; isAdmin: 
           className={mobileNavClass(isItemActive(item, pathname))}
         >
           <item.icon className="size-4 shrink-0 text-muted" />
+          <span>{item.label}</span>
+          {item.badge ? item.badge() : null}
+        </Link>
+      ))}
+      {TOOLS_ITEMS.map((item) => (
+        <Link
+          key={item.to}
+          to={item.to}
+          onClick={onNavigate}
+          className={mobileNavClass(isItemActive(item, pathname))}
+        >
+          <span className="size-4 shrink-0" />
           <span>{item.label}</span>
           {item.badge ? item.badge() : null}
         </Link>

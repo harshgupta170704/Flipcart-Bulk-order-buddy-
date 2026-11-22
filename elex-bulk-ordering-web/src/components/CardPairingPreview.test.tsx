@@ -51,6 +51,18 @@ describe("CardPairingPreview", () => {
     expect(mocks.previewOrderCards).toHaveBeenCalledWith({ cards_file: FILE, account_ids: [1, 2, 3], account_filter: undefined });
   });
 
+  it("sends the run's minimum remaining and says when HDFC child cards were paired by balance", async () => {
+    mocks.previewOrderCards.mockResolvedValue({ ...PREVIEW, paired_by: "balance" });
+    render(<CardPairingPreview file={FILE} selection={IDS} minRemaining={500} />);
+    expect(await screen.findByText(/matched by what each HDFC child card has left in CorpAssist/)).toBeTruthy();
+    expect(mocks.previewOrderCards).toHaveBeenCalledWith({
+      cards_file: FILE,
+      account_ids: [1, 2, 3],
+      account_filter: undefined,
+      card_min_remaining: 500,
+    });
+  });
+
   it("sends a filter selection as the filter", async () => {
     mocks.previewOrderCards.mockResolvedValue({ ...PREVIEW, without_card: 0, rows_set_aside: [] });
     const filter: AccountSelection = { mode: "filter", filter: { statuses: ["session_valid"] }, count: 3 };

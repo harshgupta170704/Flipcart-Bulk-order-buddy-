@@ -44,11 +44,14 @@ export function CardPairingPreview({
   file,
   selection,
   cardType = "",
+  minRemaining = null,
 }: {
   file: File;
   selection: AccountSelection;
   /** Only the sheet's rows of this Card Type, as the run will use. */
   cardType?: string;
+  /** The run's "minimum remaining" rule, so HDFC child cards pair as the run pairs them. */
+  minRemaining?: number | null;
 }) {
   const [preview, setPreview] = useState<CardPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -78,6 +81,7 @@ export function CardPairingPreview({
         account_ids: selection.mode === "ids" ? selection.ids : null,
         account_filter: selection.mode === "filter" ? selection.filter : undefined,
         ...(cardType.trim() ? { card_type: cardType } : {}),
+        ...(minRemaining ? { card_min_remaining: minRemaining } : {}),
       }).then(
         (answer) => {
           if (request.current !== mine) return;
@@ -95,7 +99,7 @@ export function CardPairingPreview({
     return () => window.clearTimeout(timer);
     // The selection is compared by its contents, not its identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, selectionKey, cardType]);
+  }, [file, selectionKey, cardType, minRemaining]);
 
   /* The answer on screen is for an earlier selection of this same sheet. */
   const outOfDate = loading && preview !== null;
@@ -119,7 +123,13 @@ export function CardPairingPreview({
           {outOfDate ? null : (
             <p className="text-[12px] text-ink-2">
               {formatCount(preview.paired)} of {countLabel(preview.accounts.length, "selected account")} have a card
-              in this sheet{preview.paired_by === "email" ? ", matched by email" : ""}. Only each card&rsquo;s last
+              in this sheet
+              {preview.paired_by === "email"
+                ? ", matched by email"
+                : preview.paired_by === "balance"
+                  ? ", matched by what each HDFC child card has left in CorpAssist (most first)"
+                  : ""}
+              . Only each card&rsquo;s last
               four digits are shown.
             </p>
           )}

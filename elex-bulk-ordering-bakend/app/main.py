@@ -29,6 +29,7 @@ from starlette.datastructures import MutableHeaders
 from app import __version__
 from app.api import (
     accounts,
+    phones,
     agents,
     master_lists,
     addresses,
@@ -37,6 +38,7 @@ from app.api import (
     changes,
     corpassist,
     health,
+    inventory,
     jobs,
     gsts,
     invoices,
@@ -44,6 +46,7 @@ from app.api import (
     orders,
     products,
     requests,
+    screener,
     settings as settings_api,
     stats,
     sync,
@@ -60,7 +63,8 @@ from app.jobs.schedule import run_read_back_scheduler
 from app.core.logging_setup import configure_logging
 from app.core.security import check_security_config, refuse_default_secret, require_user
 from app.core.alerts import evaluate_in_own_session
-from app.db.base import init_db
+from app.core import hdfc_batches
+from app.db.base import SessionLocal, init_db
 from app.jobs.recovery import recover_orphaned_jobs
 from app.core.session_store import drop_invalid_in_own_session
 from app.core.unit_requests import backfill_history_in_own_session
@@ -132,7 +136,11 @@ async def _agent_heartbeat() -> None:
         await asyncio.sleep(fleet.HEARTBEAT_SECONDS)
 
 
-@asynccontextmanager
+def hdfc_recover_in_own_session() -> None:
+    with SessionLocal() as db:
+        hdfc_batches.recover(db)
+
+
 async def lifespan(app: FastAPI):
     # Before anything else: outside dev mode the shipped signing key stops the
     # start (audit F-31). First, so a refused start leaves the database and the
@@ -174,6 +182,11 @@ async def lifespan(app: FastAPI):
     # This process is an agent of the fleet (app.core.fleet): registered now,
     # heard from every half minute.
     heart = asyncio.create_task(_agent_heartbeat())
+    # HDFC card batches: one left "sending" by the last process is failed with
+    # a reason (never resent), then every minute the inbox is read for the
+    # cards of the batches still waiting (app.core.hdfc_batches).
+    hdfc_recover_in_own_session()
+    hdfc_loop = asyncio.create_task(hdfc_batches.run_forever())
     # Shout at startup if this deployment is still on the default signing key
     # (only dev mode gets this far with it) or a plaintext admin password,
     # rather than quietly accepting them.
@@ -185,6 +198,7 @@ async def lifespan(app: FastAPI):
     begin_shutdown()
     scheduler.cancel()
     heart.cancel()
+    hdfc_loop.cancel()
     await drain_background_tasks()
     # The refusal was for the drain window only. A real process is gone a
     # moment later; the test suite stops one application and starts the next
@@ -259,11 +273,16 @@ def create_app() -> FastAPI:
     # The archive download: authorised by its own short-lived token (see
     # app.core.archives), because a browser navigation cannot carry the bearer.
     app.include_router(invoices.public_router)
+    # What an Employee Phone's SMS forwarder posts, authorised by its own token.
+    app.include_router(phones.public_router)
     app.include_router(stats.router)
     app.include_router(changes.router)
     app.include_router(agents.router)
     app.include_router(master_lists.gift_router)
     app.include_router(corpassist.router)
+    app.include_router(phones.router)
+    app.include_router(screener.router)
+    app.include_router(inventory.router)
     app.include_router(master_lists.phone_router)
 
     # --- websocket (authenticates via the "bearer" subprotocol) ---

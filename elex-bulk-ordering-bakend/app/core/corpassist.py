@@ -140,7 +140,7 @@ class FetchResult:
 def fetch(db: DbSession, users: Sequence[HdfcUserId], source: MailSource) -> list[FetchResult]:
     """Read each user id's child-card emails and keep the new cards."""
     results: list[FetchResult] = []
-    since_days = getattr(get_settings(), "hdfc_since_days", 30)
+    since_days = getattr(effective_settings(db), "hdfc_since_days", 30)
     try:
         for user in users:
             result = FetchResult(user_id=user.id, username=user.username)
@@ -234,3 +234,41 @@ def balances(db: DbSession, numbers: Iterable[str]) -> dict[str, Balance]:
         c.card_number: Balance(opening=c.opening_amount, used=used.get(c.card_number, 0.0), status=c.status)
         for c in cards
     }
+
+
+def pair_by_balance(
+    db: DbSession, cards: Sequence, accounts: Sequence, *, min_remaining: float | None = None
+) -> dict[int, object] | None:
+    """Pair a sheet of CorpAssist child cards with accounts by balance.
+
+    Used when the sheet has no email column (HDFC's virtual cards are not tied
+    to a Flipkart account): when every card in it is a child card CorpAssist
+    knows, each account gets a card of its own, the ones with the most left
+    first. Cancelled cards, cards with nothing left and cards under
+    ``min_remaining`` are passed over; a card with no opening amount on record
+    comes last. None when any card in the sheet is not a known child card, so
+    the caller keeps its own rule for such a sheet.
+    """
+    numbers = [digits(getattr(c, "number", "")) for c in cards]
+    if not numbers or not all(numbers):
+        return None
+    known = balances(db, numbers)
+    if any(n not in known for n in numbers):
+        return None
+    usable: list[tuple[float, int, object]] = []
+    seen: set[str] = set()
+    for order, (card, number) in enumerate(zip(cards, numbers)):
+        if number in seen:
+            continue
+        seen.add(number)
+        balance = known[number]
+        if balance.status == CANCELLED:
+            continue
+        left = balance.remaining
+        if left is not None and (left <= 0 or (min_remaining and left < min_remaining)):
+            continue
+        usable.append((left if left is not None else float("-inf"), order, card))
+    usable.sort(key=lambda item: (-item[0], item[1]))
+    pairs = {account.id: card for account, (_, _, card) in zip(accounts, usable)}
+    log.info("CorpAssist pairing: %d of %d account(s) got a child card by balance", len(pairs), len(accounts))
+    return pairs

@@ -1026,7 +1026,42 @@ class HdfcUserId(Base):
     last_fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     #: Why the last fetch found nothing usable; None when it went through.
     last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: The parent card's "Alternate A/c No." on HDFC's Card Relationship page,
+    #: digits only: the ``Aan`` column of HDFC's bulk virtual-card sheet.
+    aan: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: HDFC's own "Virtual Card User ID" for this user (the portal's table).
+    portal_user_id: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class HdfcCardBatch(Base):
+    """A request for HDFC virtual child cards (app.core.hdfc_batches).
+
+    ``rows`` is what was asked for, one entry per user id:
+    ``{"user_id", "username", "amount", "count", "valid_days"}``. Sent to the
+    CorpAssist portal (``send="portal"``) or downloaded as HDFC's bulk sheet to
+    upload by hand (``send="download"``); either way Fetch then watches the
+    inbox for the cards, and ``cards_received`` counts those that arrived.
+    No card number is ever on a batch.
+    """
+
+    __tablename__ = "hdfc_card_batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: sending, waiting, done, failed or cancelled.
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="waiting")
+    #: portal or download.
+    send: Mapped[str] = mapped_column(String(16), nullable=False, default="portal")
+    rows: Mapped[list] = mapped_column(JSON, nullable=False)
+    card_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cards_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    #: The portal's own words on rows it refused (its output file), no card numbers.
+    portal_report: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class HdfcChildCard(Base):
@@ -1054,7 +1089,54 @@ class HdfcChildCard(Base):
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
     #: When the email that carried it was sent.
     issued_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    #: The card batch it was asked for in, when one matched it.
+    batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("hdfc_card_batches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class OtpPhone(Base):
+    """A phone running an SMS forwarder app (app.core.sms_relay): it posts
+    each text it receives to ``/sms/inbound`` with its own token, so a flow
+    that sends an OTP to ``phone_number`` can read it (Employee Phones).
+
+    Only the token's SHA-256 is kept; ``token_hint`` is its last four
+    characters, to tell tokens apart on the page.
+    """
+
+    __tablename__ = "otp_phones"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: 10 digits, no country code.
+    phone_number: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    employee_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    corporate_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    token_hint: Mapped[str] = mapped_column(String(8), nullable=False)
+    active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    last_ping_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sms_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sender: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_otp: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    last_otp_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow)
+
+
+class SmsMessage(Base):
+    """A text an OTP phone relayed. Kept for a day (``sms_relay.KEEP_HOURS``)
+    so an OTP can be read and a phone's setup checked; then deleted."""
+
+    __tablename__ = "sms_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone_id: Mapped[int] = mapped_column(ForeignKey("otp_phones.id", ondelete="CASCADE"), index=True)
+    sender: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    body: Mapped[str] = mapped_column(String(1000), nullable=False)
+    otp: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    #: When this server received it (naive UTC), which is what an OTP wait compares.
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, index=True)
 
 
 class Setting(Base):
@@ -1108,3 +1190,63 @@ class User(Base):
     #: seen. Per user, so one operator clearing the list does not clear it for
     #: another (app.api.changes).
     changes_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ScreenerItem(Base):
+    """One watchlist slot in the Product Screener (up to 20 slots, BOB parity)."""
+
+    __tablename__ = "screener_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    platform: Mapped[str] = mapped_column(String(32), default="flipkart", nullable=False)
+    product_url: Mapped[str] = mapped_column(Text, nullable=False)
+    product_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    listed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mrp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_offer: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    offer_applied: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    offer_combos: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    net_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    in_stock: Mapped[bool | None] = mapped_column(nullable=True)
+    stock_text: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, onupdate=naive_utcnow)
+
+
+class InventoryBatch(Base):
+    """Warehouse receiving / stock-count batch per platform + product (BOB Inventory)."""
+
+    __tablename__ = "inventory_batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), default="flipkart", nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    opening_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    received_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    approved_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, onupdate=naive_utcnow)
+
+
+class InventoryTransfer(Base):
+    """Stock transfer note moving approved units out of warehouse (BOB Inventory)."""
+
+    __tablename__ = "inventory_transfers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reference: Mapped[str] = mapped_column(String(120), nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), default="flipkart", nullable=False, index=True)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    destination: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow)
+

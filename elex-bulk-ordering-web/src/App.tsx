@@ -8,6 +8,7 @@ import AddressBook from "./pages/AddressBook";
 import Sessions from "./pages/Sessions";
 import Coupons from "./pages/Coupons";
 import Ordering from "./pages/Ordering";
+import ProductScreener from "./pages/ProductScreener";
 import OrderUnits from "./pages/OrderUnits";
 import Alerts from "./pages/Alerts";
 import Requests from "./pages/Requests";
@@ -18,6 +19,8 @@ import Agents from "./pages/Agents";
 import Orders from "./pages/Orders";
 import GiftVouchers from "./pages/GiftVouchers";
 import CorpAssist from "./pages/CorpAssist";
+import EmployeePhones from "./pages/EmployeePhones";
+import Inventory from "./pages/Inventory";
 import OrderPhones from "./pages/OrderPhones";
 import { ConfigsTabs } from "./components/ConfigsTabs";
 import ChangePassword from "./pages/ChangePassword";
@@ -62,18 +65,25 @@ export default function App() {
           <Route element={<RequireAuth />}>
             <Route element={<Layout />}>
               <Route index element={<Dashboard />} />
+              <Route path="dashboard" element={<Dashboard />} />
               <Route element={<ConfigsTabs />}>
                 <Route path="accounts" element={<Accounts />} />
+                <Route path="platform-accounts" element={<Accounts />} />
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="coupons" element={<Coupons />} />
                 <Route path="addresses" element={<AddressBook />} />
                 <Route path="limits" element={<UnitLimits />} />
                 <Route path="gift-vouchers" element={<GiftVouchers />} />
-                <Route path="hdfc-corpassist" element={<CorpAssist />} />
-                <Route path="corpassist" element={<CorpAssist />} />
                 <Route path="order-phones" element={<OrderPhones />} />
               </Route>
+              <Route path="hdfc-corpassist" element={<CorpAssist />} />
+              <Route path="corpassist" element={<CorpAssist />} />
+              <Route path="employee-phones" element={<EmployeePhones />} />
               <Route path="ordering" element={<Ordering />} />
+              <Route path="smart-bulk-order" element={<Ordering />} />
+              <Route path="products" element={<ProductScreener />} />
+              <Route path="screener" element={<ProductScreener />} />
+              <Route path="inventory" element={<Inventory />} />
               <Route path="orders" element={<Orders />} />
               <Route path="order-units" element={<OrderUnits />} />
               <Route path="alerts" element={<Alerts />} />

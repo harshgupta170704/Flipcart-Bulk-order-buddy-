@@ -66,7 +66,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.orm import selectinload
@@ -1154,10 +1154,42 @@ def card_failure_codes() -> list[dict]:
     return [{"code": code, "name": name} for code, name in FAILURE_CODE_NAMES.items()]
 
 
-def _pair_cards(sheet: card_sheets.CardSheet, accounts: list) -> dict[int, card_sheets.CardRecord]:
+def _pair_by_corpassist(
+    db: DbSession | None, sheet: card_sheets.CardSheet, accounts: list, min_remaining: float | None
+) -> dict[int, card_sheets.CardRecord] | None:
+    """A sheet with no email column whose cards are all CorpAssist child cards
+    is paired by what each card has left (app.core.corpassist.pair_by_balance);
+    None for any other sheet."""
+    if db is None or any(record.email for record in sheet.records):
+        return None
+    from app.core.corpassist import pair_by_balance
+
+    pairs = pair_by_balance(db, sheet.records, accounts, min_remaining=min_remaining)
+    if pairs is not None and not pairs:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Every card in the file is an HDFC child card, but none has money left"
+                + (f" over the ₹{min_remaining:,.0f} minimum" if min_remaining else "")
+                + " or all are cancelled in CorpAssist."
+            ),
+        )
+    return pairs
+
+
+def _pair_cards(
+    sheet: card_sheets.CardSheet,
+    accounts: list,
+    db: DbSession | None = None,
+    min_remaining: float | None = None,
+) -> dict[int, card_sheets.CardRecord]:
     """Which card pays for which account (``map_cards_to_accounts``), refusing
-    what the run refuses: the one pairing a run and its preview both use."""
+    what the run refuses: the one pairing a run and its preview both use.
+    HDFC child cards that CorpAssist knows are paired by balance instead."""
     cards = sheet.records
+    by_balance = _pair_by_corpassist(db, sheet, accounts, min_remaining)
+    if by_balance is not None:
+        return by_balance
     if len(accounts) > 1 and not any(record.email for record in cards):
         # Pairing by position is only safe when there is nothing to pair: with
         # several accounts and no email on any card, the wrong card would pay
@@ -1189,6 +1221,8 @@ async def preview_order_cards(
     account_filter: str | None = Form(None),
     cards_file: UploadFile | None = File(None),
     card_type: str | None = Form(None, max_length=64),
+    # As the run: HDFC child cards with less than this left are not paired.
+    card_min_remaining: float | None = Form(None, ge=1, le=10_000_000),
     db: DbSession = Depends(get_db),
 ) -> CardPreviewOut:
     """Which card would pay for which account, before a card run starts.
@@ -1206,7 +1240,7 @@ async def preview_order_cards(
     )
     sheet = _only_card_type(await _read_card_sheet(cards_file), (card_type or "").strip())
     accounts = _selected_accounts(db, selection)
-    pairs = _pair_cards(sheet, accounts)
+    pairs = _pair_cards(sheet, accounts, db, card_min_remaining)
     rows = []
     for account in accounts:
         record = pairs.get(account.id)
@@ -1222,7 +1256,13 @@ async def preview_order_cards(
         accounts=rows,
         paired=len(pairs),
         without_card=len(accounts) - len(pairs),
-        paired_by="email" if any(record.email for record in sheet.records) else "position",
+        paired_by=(
+            "email"
+            if any(record.email for record in sheet.records)
+            else "balance"
+            if _pair_by_corpassist(db, sheet, accounts, card_min_remaining) is not None
+            else "position"
+        ),
         rows_set_aside=[{"row": item["row"], "reason": item["reason"]} for item in sheet.rejected],
     )
 
@@ -1578,7 +1618,9 @@ async def start_order_job(
             cvv=record.cvv,
             password=record.password,
         )
-        for account_id, record in _pair_cards(sheet, _selected_accounts(db, selection)).items()
+        for account_id, record in _pair_cards(
+            sheet, _selected_accounts(db, selection), db, card_rules.min_remaining
+        ).items()
     }
 
     job = _create_job(
@@ -1805,6 +1847,76 @@ def bulk_order_creators(db: DbSession = Depends(get_db)) -> list[str]:
         for payload in db.scalars(select(Job.payload).where(Job.type == JobType.order))
     }
     return sorted(name for name in names if name)
+
+
+class JobTaskOut(BaseModel):
+    id: int
+    job_id: int
+    job_type: str
+    source: str
+    email: str | None
+    order_id: str | None
+    status: str
+    message: str | None
+    created_at: datetime | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    triggered_by: str | None
+
+
+class JobTaskPage(BaseModel):
+    items: list[JobTaskOut]
+    total: int
+    page: int
+    size: int
+
+
+@router.get("/tasks", response_model=JobTaskPage)
+def list_job_tasks(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    email: str = Query("", max_length=255),
+    job_type: str = Query("", max_length=32),
+    status: str = Query("", max_length=32),
+    error_q: str = Query("", max_length=120),
+    db: DbSession = Depends(get_db),
+) -> JobTaskPage:
+    """Paginated per-account job items for the Order Units -> All tasks view."""
+    stmt = select(JobItem, Job, Account.email).join(Job, Job.id == JobItem.job_id).outerjoin(Account, Account.id == JobItem.account_id)
+    if email.strip():
+        stmt = stmt.where(Account.email.ilike(f"%{email.strip()}%"))
+    if job_type.strip():
+        try:
+            stmt = stmt.where(Job.type == JobType(job_type.strip()))
+        except ValueError:
+            return JobTaskPage(items=[], total=0, page=page, size=size)
+    if status.strip():
+        stmt = stmt.where(JobItem.status == status.strip())
+    if error_q.strip():
+        stmt = stmt.where(JobItem.message.ilike(f"%{error_q.strip()}%"))
+
+    total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    rows = db.execute(stmt.order_by(JobItem.id.desc()).offset((page - 1) * size).limit(size)).all()
+    items: list[JobTaskOut] = []
+    for item, job, acct_email in rows:
+        payload = job.payload if isinstance(job.payload, dict) else {}
+        items.append(
+            JobTaskOut(
+                id=item.id,
+                job_id=job.id,
+                job_type=job.type.value if hasattr(job.type, "value") else str(job.type),
+                source=str(payload.get("mode") or payload.get("source") or "manual"),
+                email=acct_email,
+                order_id=None,
+                status=item.status.value if hasattr(item.status, "value") else str(item.status),
+                message=item.message,
+                created_at=job.started_at,
+                started_at=job.started_at,
+                finished_at=item.updated_at if str(getattr(item.status, "value", item.status)) in ("done", "failed") else None,
+                triggered_by=payload.get("started_by"),
+            )
+        )
+    return JobTaskPage(items=items, total=total, page=page, size=size)
 
 
 @router.get("", response_model=list[JobOut])

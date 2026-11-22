@@ -4,7 +4,6 @@ import { NavLink, Outlet } from "react-router-dom";
 export const CONFIG_TABS: { to: string; label: string }[] = [
   { to: "/accounts", label: "Accounts" },
   { to: "/gift-vouchers", label: "Gift Vouchers" },
-  { to: "/hdfc-corpassist", label: "CorpAssist (HDFC)" },
   { to: "/sessions", label: "Account Sessions" },
   { to: "/coupons", label: "Coupons" },
   { to: "/order-phones", label: "Order Phone Numbers" },

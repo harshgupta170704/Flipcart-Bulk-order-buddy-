@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.automation.product import ProductPreview, fetch_product_preview
+from app.automation.product import ProductPreview, add_screener_details, fetch_product_preview
 from app.automation.search import MAX_QUERY_CHARS, MIN_QUERY_CHARS, NoResultsInTime, query_text, read_search_results
 from app.automation.sellers import read_seller_offers
 from app.config import get_settings
@@ -133,6 +133,7 @@ async def preview_product(payload: PreviewRequest) -> dict:
             ) as (_context, page):
                 preview: ProductPreview = await fetch_product_preview(page, url)
                 if not preview.error:
+                    await add_screener_details(page, preview)
                     await _add_sellers(page, preview)
     except Exception as exc:  # noqa: BLE001 — a preview must never 500 the form
         log.error("preview failed for %s: %s", url[:60], exc)

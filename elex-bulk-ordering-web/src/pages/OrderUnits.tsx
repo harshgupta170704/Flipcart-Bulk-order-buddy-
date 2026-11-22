@@ -41,6 +41,7 @@ import { UnitRequestDialog, type UnitRequestDraft } from "../components/UnitRequ
 import { UploadInvoices } from "../components/UploadInvoices";
 import { UploadOrderIds } from "../components/UploadOrderIds";
 import { UploadOrderReport } from "../components/UploadOrderReport";
+import { AllTasksView, BatchRequestsView } from "../components/OrderUnitsSubViews";
 import { useDismiss } from "../components/useDismiss";
 
 const PAGE_SIZE = 100;
@@ -332,9 +333,26 @@ function ColumnsMenu({
   );
 }
 
-export default function OrderUnits() {
-  const [view, setView] = useState<"units" | "csv">("units");
+type OrderUnitsView = "units" | "batches" | "tasks" | "csv";
+
+function viewFromParams(params: URLSearchParams): OrderUnitsView {
+  const v = params.get("view");
+  if (v === "batches" || v === "tasks" || v === "csv") return v;
+  return "units";
+}
+
+export default function OrderUnits({ embedded = false }: { embedded?: boolean } = {}) {
   const [searchParams, setSearchParams] = useSearchParams();
+  const [view, setViewState] = useState<OrderUnitsView>(() => (embedded ? "units" : viewFromParams(searchParams)));
+  const setView = (next: OrderUnitsView) => {
+    setViewState(next);
+    if (!embedded) {
+      const updated = new URLSearchParams(searchParams);
+      if (next === "units") updated.delete("view");
+      else updated.set("view", next);
+      setSearchParams(updated, { replace: true });
+    }
+  };
   const jobParam = jobFromParams(searchParams);
   const orderParam = orderFromParams(searchParams);
   const outcomeParam = outcomeFromParams(searchParams);
@@ -718,29 +736,35 @@ export default function OrderUnits() {
 
   return (
     <div className="flex flex-col gap-5">
-      <div role="tablist" aria-label="Order Units views" className="grid grid-cols-2 rounded-control border border-line bg-page p-1">
-        {(
-          [
-            ["units", "Order Units"],
-            ["csv", "CSV Downloads"],
-          ] as const
-        ).map(([value, label]) => (
-          <button
-            key={value}
-            role="tab"
-            type="button"
-            aria-selected={view === value}
-            onClick={() => setView(value)}
-            className={`rounded-[6px] px-3 py-2 text-[13px] font-medium ${
-              view === value ? "bg-surface text-ink shadow-sm" : "text-ink-2 hover:text-ink"
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      {!embedded ? (
+        <div role="tablist" aria-label="Order Units views" className="grid grid-cols-2 sm:grid-cols-4 rounded-control border border-line bg-page p-1">
+          {(
+            [
+              ["units", "Order Units"],
+              ["batches", "Batch requests"],
+              ["tasks", "All tasks"],
+              ["csv", "CSV Downloads"],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              role="tab"
+              type="button"
+              aria-selected={view === value}
+              onClick={() => setView(value)}
+              className={`rounded-[6px] px-3 py-2 text-[13px] font-medium ${
+                view === value ? "bg-surface text-ink shadow-sm" : "text-ink-2 hover:text-ink"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      ) : null}
       {view === "csv" ? <CsvDownloads /> : null}
-      <div hidden={view === "csv"} className="flex flex-col gap-5">
+      {view === "batches" ? <BatchRequestsView /> : null}
+      {view === "tasks" ? <AllTasksView /> : null}
+      <div hidden={view !== "units"} className="flex flex-col gap-5">
       <RunPageHeader
         title="Order Units History"
         lead="Every order this tool attempted, with what Flipkart later said about it. Filter, pick your columns, export the rows you can see."

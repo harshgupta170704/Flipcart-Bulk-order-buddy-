@@ -49,13 +49,31 @@ import type {
   DashboardScope,
   FleetStatus,
   GiftVoucher,
+  HdfcBatch,
+  HdfcBatchRowInput,
+  HdfcBatchSend,
   HdfcCardFilters,
   HdfcChildCard,
   HdfcFetchResult,
+  HdfcPortalStatus,
+  HdfcPortalSyncResult,
+  HdfcPortalTestResult,
   HdfcUserId,
+  OtpPhone,
+  OtpPhoneBulkResult,
+  OtpPhoneCreated,
+  OtpPhoneMessage,
+  OtpPhoneSettings,
   OrderPhoneNumber,
+  ScreenerConfig,
+  ScreenerItem,
+  InventoryBatch,
+  InventoryStockRow,
+  InventoryTransfer,
+  CodCardsUpdateResult,
   Job,
   JobDetail,
+  JobTaskPage,
   LimitCheckInput,
   LimitUsage,
   LoginJobInput,
@@ -818,9 +836,12 @@ export function previewOrderCards(input: {
   account_ids: number[] | null;
   account_filter?: AccountFilterInput;
   card_type?: string;
+  /** As the run: HDFC child cards with less than this left are not paired. */
+  card_min_remaining?: number | null;
 }): Promise<CardPreview> {
   const form = new FormData();
   if (input.card_type && input.card_type.trim()) form.append("card_type", input.card_type.trim());
+  appendIfSet(form, "card_min_remaining", input.card_min_remaining);
   form.append("account_ids", input.account_ids === null ? "" : input.account_ids.join(","));
   if (input.account_filter !== undefined) {
     form.append("account_filter", JSON.stringify(input.account_filter));
@@ -928,6 +949,10 @@ export interface HdfcUserIdInput {
   mobile?: string | null;
   /** Only its last four digits are kept. */
   parent_card?: string | null;
+  /** The parent card's Alternate A/c No.; the API keeps its digits (8 to 32). */
+  aan?: string | null;
+  /** HDFC's own Virtual Card User ID. */
+  portal_user_id?: string | null;
   active?: boolean;
 }
 
@@ -974,6 +999,88 @@ export function downloadHdfcChildCards(filters: HdfcCardFilters = {}): Promise<v
 
 export function actOnHdfcChildCards(ids: number[], action: "cancel" | "activate" | "delete"): Promise<{ changed: number }> {
   return request<{ changed: number }>("/hdfc/child-cards/action", { method: "POST", body: JSON.stringify({ ids, action }) });
+}
+
+/** Ask HDFC for new virtual cards: on the portal, or as a bulk sheet to upload by hand. */
+export function createHdfcBatch(rows: HdfcBatchRowInput[], send: HdfcBatchSend): Promise<HdfcBatch> {
+  return request<HdfcBatch>("/hdfc/batches", { method: "POST", body: JSON.stringify({ rows, send }) });
+}
+
+export function listHdfcBatches(): Promise<HdfcBatch[]> {
+  return request<HdfcBatch[]>("/hdfc/batches");
+}
+
+export function getHdfcBatch(id: number): Promise<HdfcBatch> {
+  return request<HdfcBatch>(`/hdfc/batches/${id}`);
+}
+
+/** HDFC's bulk sheet for this batch, as a CSV. */
+export function downloadHdfcBatchSheet(id: number): Promise<void> {
+  return downloadFile(`/hdfc/batches/${id}.csv`, `hdfc_batch_${id}.csv`);
+}
+
+export function retryHdfcBatch(id: number): Promise<HdfcBatch> {
+  return request<HdfcBatch>(`/hdfc/batches/${id}/retry`, { method: "POST" });
+}
+
+export function cancelHdfcBatch(id: number): Promise<HdfcBatch> {
+  return request<HdfcBatch>(`/hdfc/batches/${id}/cancel`, { method: "POST" });
+}
+
+export function getHdfcPortal(): Promise<HdfcPortalStatus> {
+  return request<HdfcPortalStatus>("/hdfc/portal");
+}
+
+export function testHdfcPortalLogin(): Promise<HdfcPortalTestResult> {
+  return request<HdfcPortalTestResult>("/hdfc/portal/test-login", { method: "POST" });
+}
+
+/** Set this user's email on the HDFC portal to the one saved here (the shared inbox). */
+export function pointHdfcUserEmail(id: number): Promise<HdfcUserId> {
+  return request<HdfcUserId>(`/hdfc/user-ids/${id}/point-email`, { method: "POST" });
+}
+
+/** Import HDFC's Virtual Card Users as user ids. */
+export function syncHdfcPortalUsers(): Promise<HdfcPortalSyncResult> {
+  return request<HdfcPortalSyncResult>("/hdfc/portal/sync-users", { method: "POST" });
+}
+
+/* --- employee phones (SMS relay) ------------------------------------------ */
+
+export interface OtpPhoneInput {
+  label: string;
+  phone_number: string;
+  employee_id?: string | null;
+  corporate_id?: string | null;
+  active?: boolean;
+}
+
+export type OtpPhonePatch = Partial<Pick<OtpPhoneInput, "label" | "employee_id" | "corporate_id" | "active">>;
+
+export function listOtpPhones(): Promise<OtpPhone[]> {
+  return request<OtpPhone[]>("/otp-phones");
+}
+
+export function addOtpPhone(input: OtpPhoneInput): Promise<OtpPhoneCreated> {
+  return request<OtpPhoneCreated>("/otp-phones", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function updateOtpPhone(id: number, patch: OtpPhonePatch): Promise<OtpPhone> {
+  return request<OtpPhone>(`/otp-phones/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+}
+
+/** A new token for this phone; the old one stops working. */
+export function newOtpPhoneToken(id: number): Promise<OtpPhoneCreated> {
+  return request<OtpPhoneCreated>(`/otp-phones/${id}/token`, { method: "POST" });
+}
+
+export function deleteOtpPhone(id: number): Promise<void> {
+  return request<void>(`/otp-phones/${id}`, { method: "DELETE" });
+}
+
+/** The last day's texts this phone forwarded, newest first. */
+export function listOtpPhoneMessages(id: number): Promise<OtpPhoneMessage[]> {
+  return request<OtpPhoneMessage[]>(`/otp-phones/${id}/messages`);
 }
 
 /* --- gift vouchers and order phone numbers --------------------------------- */
@@ -1540,3 +1647,170 @@ export function markChangesSeen(through?: string | null): Promise<ChangesSeen> {
     body: through ? JSON.stringify({ through }) : undefined,
   });
 }
+
+/* --- Employee Phones settings & bulk CSV (BOB parity) --------------------- */
+
+export function getOtpPhoneSettings(): Promise<OtpPhoneSettings> {
+  return request<OtpPhoneSettings>("/otp-phones/settings");
+}
+
+export function setOtpPhoneSettings(assume_online: boolean): Promise<OtpPhoneSettings> {
+  return request<OtpPhoneSettings>("/otp-phones/settings", {
+    method: "PUT",
+    body: JSON.stringify({ assume_online }),
+  });
+}
+
+export function bulkImportOtpPhones(input: { corporate_id?: string | null; csv_text: string }): Promise<OtpPhoneBulkResult> {
+  return request<OtpPhoneBulkResult>("/otp-phones/bulk", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/* --- Product Screener 20-slot Watchlist (BOB parity) ---------------------- */
+
+export function getScreenerConfig(): Promise<ScreenerConfig> {
+  return request<ScreenerConfig>("/screener/config");
+}
+
+export function updateScreenerConfig(patch: Partial<ScreenerConfig>): Promise<ScreenerConfig> {
+  return request<ScreenerConfig>("/screener/config", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function listScreenerItems(): Promise<ScreenerItem[]> {
+  return request<ScreenerItem[]>("/screener/items");
+}
+
+export function addScreenerItem(input: {
+  product_url: string;
+  product_title?: string | null;
+  target_price?: number | null;
+  platform?: string;
+}): Promise<ScreenerItem> {
+  return request<ScreenerItem>("/screener/items", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateScreenerItem(
+  id: number,
+  patch: { product_title?: string | null; target_price?: number | null; offer_applied?: string | null; net_price?: number | null },
+): Promise<ScreenerItem> {
+  return request<ScreenerItem>(`/screener/items/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteScreenerItem(id: number): Promise<void> {
+  return request<void>(`/screener/items/${id}`, { method: "DELETE" });
+}
+
+export function checkScreenerItem(id: number): Promise<ScreenerItem> {
+  return request<ScreenerItem>(`/screener/items/${id}/check`, { method: "POST" });
+}
+
+export function checkAllScreenerItems(): Promise<ScreenerItem[]> {
+  return request<ScreenerItem[]>("/screener/check-all", { method: "POST" });
+}
+
+/* --- Inventory (BOB parity) ----------------------------------------------- */
+
+export function listInventoryStock(tab: "active" | "completed" | "all" = "active", q = ""): Promise<InventoryStockRow[]> {
+  const qs = new URLSearchParams({ tab });
+  if (q.trim()) qs.set("q", q.trim());
+  return request<InventoryStockRow[]>(`/inventory/stock?${qs.toString()}`);
+}
+
+export function downloadInventoryMismatchReport(): Promise<void> {
+  return downloadFile("/inventory/mismatch-report.csv", "inventory_mismatch_report.csv");
+}
+
+export function updateCodCards(csv_text: string): Promise<CodCardsUpdateResult> {
+  return request<CodCardsUpdateResult>("/inventory/cod-cards", {
+    method: "POST",
+    body: JSON.stringify({ csv_text }),
+  });
+}
+
+export function listInventoryBatches(): Promise<InventoryBatch[]> {
+  return request<InventoryBatch[]>("/inventory/batches");
+}
+
+export function createInventoryBatch(input: {
+  name: string;
+  platform?: string;
+  product_name: string;
+  opening_qty: number;
+  received_qty: number;
+  approved_qty: number;
+  status?: "active" | "completed";
+  notes?: string | null;
+}): Promise<InventoryBatch> {
+  return request<InventoryBatch>("/inventory/batches", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateInventoryBatch(
+  id: number,
+  patch: Partial<{ name: string; opening_qty: number; received_qty: number; approved_qty: number; status: "active" | "completed"; notes: string | null }>,
+): Promise<InventoryBatch> {
+  return request<InventoryBatch>(`/inventory/batches/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function deleteInventoryBatch(id: number): Promise<void> {
+  return request<void>(`/inventory/batches/${id}`, { method: "DELETE" });
+}
+
+export function listInventoryTransfers(): Promise<InventoryTransfer[]> {
+  return request<InventoryTransfer[]>("/inventory/transfers");
+}
+
+export function createInventoryTransfer(input: {
+  reference: string;
+  platform?: string;
+  product_name: string;
+  quantity: number;
+  destination?: string | null;
+  notes?: string | null;
+}): Promise<InventoryTransfer> {
+  return request<InventoryTransfer>("/inventory/transfers", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteInventoryTransfer(id: number): Promise<void> {
+  return request<void>(`/inventory/transfers/${id}`, { method: "DELETE" });
+}
+
+/* --- Order Units All Tasks (BOB parity) ----------------------------------- */
+
+export function listJobTasks(params: {
+  page?: number;
+  size?: number;
+  email?: string;
+  job_type?: string;
+  status?: string;
+  error_q?: string;
+} = {}): Promise<JobTaskPage> {
+  const qs = new URLSearchParams();
+  qs.set("page", String(params.page ?? 1));
+  qs.set("size", String(params.size ?? 50));
+  if (params.email?.trim()) qs.set("email", params.email.trim());
+  if (params.job_type?.trim()) qs.set("job_type", params.job_type.trim());
+  if (params.status?.trim()) qs.set("status", params.status.trim());
+  if (params.error_q?.trim()) qs.set("error_q", params.error_q.trim());
+  return request<JobTaskPage>(`/jobs/tasks?${qs.toString()}`);
+}
+

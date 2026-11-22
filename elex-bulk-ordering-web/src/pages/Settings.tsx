@@ -712,6 +712,157 @@ function OtpGroup({
 }
 
 /* ===========================================================================
+   Group 3 — HDFC CorpAssist Portal & Cards (stored in DB, no .env editing)
+   =========================================================================== */
+
+interface HdfcDraft {
+  hdfc_portal_url: string;
+  hdfc_portal_user: string;
+  hdfc_portal_password: string;
+  hdfc_portal_otp_mobile: string;
+  hdfc_portal_otp_email: string;
+  hdfc_portal_otp_sender: string;
+  hdfc_portal_step_seconds: string;
+  hdfc_sender_filter: string;
+  hdfc_since_days: string;
+  hdfc_auto_fetch_minutes: string;
+  hdfc_batch_wait_minutes: string;
+}
+
+const HDFC_GROUP: GroupSpec<HdfcDraft> = {
+  toDraft: (settings) => ({
+    hdfc_portal_url: settings.hdfc_portal_url ?? "https://corpcardassist.hdfc.bank.in",
+    hdfc_portal_user: settings.hdfc_portal_user ?? "",
+    hdfc_portal_password: "",
+    hdfc_portal_otp_mobile: settings.hdfc_portal_otp_mobile ?? "",
+    hdfc_portal_otp_email: settings.hdfc_portal_otp_email ?? "",
+    hdfc_portal_otp_sender: settings.hdfc_portal_otp_sender ?? "HDFC",
+    hdfc_portal_step_seconds: String(settings.hdfc_portal_step_seconds ?? 60),
+    hdfc_sender_filter: settings.hdfc_sender_filter ?? "hdfc",
+    hdfc_since_days: String(settings.hdfc_since_days ?? 30),
+    hdfc_auto_fetch_minutes: String(settings.hdfc_auto_fetch_minutes ?? 0),
+    hdfc_batch_wait_minutes: String(settings.hdfc_batch_wait_minutes ?? 60),
+  }),
+  validate: (draft) => {
+    const errors: Record<string, string> = {};
+    if (!isWholeBetween(draft.hdfc_portal_step_seconds, 10, 300)) {
+      errors.hdfc_portal_step_seconds = "Enter a whole number from 10 to 300 seconds.";
+    }
+    if (!isWholeBetween(draft.hdfc_since_days, 1, 365)) {
+      errors.hdfc_since_days = "Enter a whole number from 1 to 365 days.";
+    }
+    if (!isWholeBetween(draft.hdfc_auto_fetch_minutes, 0, 1440)) {
+      errors.hdfc_auto_fetch_minutes = "Enter 0 (manual) to 1440 minutes.";
+    }
+    if (!isWholeBetween(draft.hdfc_batch_wait_minutes, 1, 1440)) {
+      errors.hdfc_batch_wait_minutes = "Enter 1 to 1440 minutes.";
+    }
+    return errors;
+  },
+  toPatch: (draft) => {
+    const patch: SettingsUpdate = {
+      hdfc_portal_url: draft.hdfc_portal_url.trim(),
+      hdfc_portal_user: draft.hdfc_portal_user.trim(),
+      hdfc_portal_otp_mobile: draft.hdfc_portal_otp_mobile.trim(),
+      hdfc_portal_otp_email: draft.hdfc_portal_otp_email.trim(),
+      hdfc_portal_otp_sender: draft.hdfc_portal_otp_sender.trim() || "HDFC",
+      hdfc_portal_step_seconds: Number(draft.hdfc_portal_step_seconds),
+      hdfc_sender_filter: draft.hdfc_sender_filter.trim() || "hdfc",
+      hdfc_since_days: Number(draft.hdfc_since_days),
+      hdfc_auto_fetch_minutes: Number(draft.hdfc_auto_fetch_minutes),
+      hdfc_batch_wait_minutes: Number(draft.hdfc_batch_wait_minutes),
+    };
+    if (draft.hdfc_portal_password.trim() !== "") {
+      patch.hdfc_portal_password = draft.hdfc_portal_password;
+    }
+    return patch;
+  },
+};
+
+function HdfcGroup({ settings, onSaved }: { settings: AppSettings; onSaved: (next: AppSettings) => void }) {
+  const { draft, set, dirty, saving, saved, error, fieldErrors, save, reset } = useSettingsGroup(
+    settings,
+    HDFC_GROUP,
+    onSaved,
+  );
+  const id = useId();
+  return (
+    <GroupCard
+      title="HDFC CorpAssist Portal & Cards"
+      description="Saved in the database (no .env edits needed). Leave portal login blank to use manual sheet downloads only."
+      dirty={dirty}
+      saving={saving}
+      saved={saved}
+      error={error}
+      onSave={save}
+      onReset={reset}
+    >
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <Field id={`${id}-url`} label="Portal URL" error={fieldErrors.hdfc_portal_url}>
+          <TextInput value={draft.hdfc_portal_url} onChange={(e) => set({ hdfc_portal_url: e.target.value })} />
+        </Field>
+        <Field id={`${id}-user`} label="Portal Username" error={fieldErrors.hdfc_portal_user}>
+          <TextInput value={draft.hdfc_portal_user} onChange={(e) => set({ hdfc_portal_user: e.target.value })} />
+        </Field>
+        <Field
+          id={`${id}-pass`}
+          label="Portal Password"
+          hint={settings.hdfc_portal_password_set ? "A password is saved — leave blank to keep it." : "Not saved yet."}
+          error={fieldErrors.hdfc_portal_password}
+        >
+          <TextInput
+            type="password"
+            autoComplete="new-password"
+            placeholder={settings.hdfc_portal_password_set ? "••••••••" : ""}
+            value={draft.hdfc_portal_password}
+            onChange={(e) => set({ hdfc_portal_password: e.target.value })}
+          />
+        </Field>
+        <Field
+          id={`${id}-mob`}
+          label="Sign-in OTP Mobile (10 digits)"
+          hint="Must match an Employee Phone. Set either mobile OR email."
+          error={fieldErrors.hdfc_portal_otp_mobile}
+        >
+          <TextInput value={draft.hdfc_portal_otp_mobile} onChange={(e) => set({ hdfc_portal_otp_mobile: e.target.value })} />
+        </Field>
+        <Field
+          id={`${id}-email`}
+          label="Sign-in OTP Email"
+          hint="Alternative to OTP Mobile — read from the OTP inbox."
+          error={fieldErrors.hdfc_portal_otp_email}
+        >
+          <TextInput value={draft.hdfc_portal_otp_email} onChange={(e) => set({ hdfc_portal_otp_email: e.target.value })} />
+        </Field>
+        <Field id={`${id}-otpsender`} label="OTP SMS Sender Match">
+          <TextInput value={draft.hdfc_portal_otp_sender} onChange={(e) => set({ hdfc_portal_otp_sender: e.target.value })} />
+        </Field>
+        <Field id={`${id}-sender`} label="Card Email Sender Filter">
+          <TextInput value={draft.hdfc_sender_filter} onChange={(e) => set({ hdfc_sender_filter: e.target.value })} />
+        </Field>
+        <Field id={`${id}-since`} label="Fetch Lookback (days)" error={fieldErrors.hdfc_since_days}>
+          <NumberInput min={1} max={365} value={draft.hdfc_since_days} onChange={(e) => set({ hdfc_since_days: e.target.value })} />
+        </Field>
+        <Field
+          id={`${id}-auto`}
+          label="Auto-Fetch Interval (minutes)"
+          hint="0 = Fetch by hand; e.g. 15 = fetch active user IDs every 15m."
+          error={fieldErrors.hdfc_auto_fetch_minutes}
+        >
+          <NumberInput min={0} max={1440} value={draft.hdfc_auto_fetch_minutes} onChange={(e) => set({ hdfc_auto_fetch_minutes: e.target.value })} />
+        </Field>
+        <Field id={`${id}-wait`} label="Batch Wait Timeout (minutes)" error={fieldErrors.hdfc_batch_wait_minutes}>
+          <NumberInput min={1} max={1440} value={draft.hdfc_batch_wait_minutes} onChange={(e) => set({ hdfc_batch_wait_minutes: e.target.value })} />
+        </Field>
+        <Field id={`${id}-step`} label="Portal Step Timeout (seconds)" error={fieldErrors.hdfc_portal_step_seconds}>
+          <NumberInput min={10} max={300} value={draft.hdfc_portal_step_seconds} onChange={(e) => set({ hdfc_portal_step_seconds: e.target.value })} />
+        </Field>
+      </div>
+    </GroupCard>
+  );
+}
+
+/* ===========================================================================
    Page
    =========================================================================== */
 
@@ -785,6 +936,7 @@ export default function Settings() {
           ) : null}
           <PerformanceGroup settings={settings} onSaved={onSaved} />
           <OtpGroup settings={settings} onSaved={onSaved} />
+          <HdfcGroup settings={settings} onSaved={onSaved} />
         </>
       ) : null}
     </div>

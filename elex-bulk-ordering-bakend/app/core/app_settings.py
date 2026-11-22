@@ -37,6 +37,8 @@ EDITABLE_FIELDS: tuple[str, ...] = (
     "browser_headless",
     "proxy_server",
     "sync_every_hours",
+    "track_every_minutes",
+    "out_for_delivery_minutes",
     "otp_imap_host",
     "otp_imap_port",
     "otp_imap_user",
@@ -45,10 +47,25 @@ EDITABLE_FIELDS: tuple[str, ...] = (
     "otp_imap_use_ssl",
     "otp_poll_interval",
     "otp_fetch_timeout",
+    "otp_sender_filter",
+    "otp_since_days",
+    "otp_max_age_minutes",
+    "employee_phones_assume_online",
+    "hdfc_sender_filter",
+    "hdfc_since_days",
+    "hdfc_auto_fetch_minutes",
+    "hdfc_batch_wait_minutes",
+    "hdfc_portal_url",
+    "hdfc_portal_user",
+    "hdfc_portal_password",
+    "hdfc_portal_otp_mobile",
+    "hdfc_portal_otp_email",
+    "hdfc_portal_otp_sender",
+    "hdfc_portal_step_seconds",
 )
 
 #: Write-only fields: settable, never echoed back by the API (see public_view).
-SECRET_FIELDS: tuple[str, ...] = ("otp_imap_password",)
+SECRET_FIELDS: tuple[str, ...] = ("otp_imap_password", "hdfc_portal_password")
 
 
 class SettingsValidationError(ValueError):
@@ -161,14 +178,36 @@ def _coerce(key: str, value: Any) -> Any:
     if key == "sync_every_hours":
         # 0 turns the timer off; a week is the longest gap worth calling automatic.
         return _coerce_int(key, value, minimum=0, maximum=168)
+    if key in ("track_every_minutes", "out_for_delivery_minutes", "hdfc_auto_fetch_minutes"):
+        return _coerce_int(key, value, minimum=0, maximum=1440)
+    if key == "hdfc_batch_wait_minutes":
+        return _coerce_int(key, value, minimum=1, maximum=1440)
+    if key == "hdfc_since_days":
+        return _coerce_int(key, value, minimum=1, maximum=365)
+    if key == "hdfc_portal_step_seconds":
+        return _coerce_int(key, value, minimum=10, maximum=300)
+    if key == "otp_since_days":
+        return _coerce_int(key, value, minimum=1, maximum=30)
+    if key == "otp_max_age_minutes":
+        return _coerce_int(key, value, minimum=1, maximum=120)
     if key == "otp_poll_interval":
         return _coerce_int(key, value, minimum=OTP_POLL_RANGE[0], maximum=OTP_POLL_RANGE[1])
     if key == "otp_fetch_timeout":
         return _coerce_int(key, value, minimum=OTP_WAIT_RANGE[0], maximum=OTP_WAIT_RANGE[1])
-    if key in ("browser_headless", "otp_imap_use_ssl"):
+    if key in ("browser_headless", "otp_imap_use_ssl", "employee_phones_assume_online"):
         return _coerce_bool(key, value)
     if key == "proxy_server":
         return _coerce_proxy(key, value)
+    if key == "hdfc_portal_otp_mobile":
+        text = _coerce_str(key, value)
+        if not text:
+            return ""
+        digits_only = "".join(ch for ch in text if ch.isdigit())
+        if len(digits_only) == 12 and digits_only.startswith("91"):
+            digits_only = digits_only[2:]
+        if len(digits_only) != 10:
+            raise SettingsValidationError(key, "must be a 10-digit mobile number or blank")
+        return digits_only
     return _coerce_str(key, value)
 
 

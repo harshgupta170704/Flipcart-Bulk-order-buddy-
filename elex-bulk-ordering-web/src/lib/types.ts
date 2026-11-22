@@ -488,6 +488,8 @@ export interface AppSettings {
   proxy_server: string;
   /** Automatic read-backs every N hours; 0 = only when someone presses the button. */
   sync_every_hours: number;
+  track_every_minutes?: number;
+  out_for_delivery_minutes?: number;
   otp_imap_host: string;
   otp_imap_port: number;
   otp_imap_user: string;
@@ -497,15 +499,31 @@ export interface AppSettings {
   otp_fetch_timeout: number;
   /** The OTP password is never returned — only whether one is on file. */
   otp_imap_password_set: boolean;
+  otp_sender_filter?: string;
+  otp_since_days?: number;
+  otp_max_age_minutes?: number;
+  employee_phones_assume_online?: boolean;
+  hdfc_sender_filter?: string;
+  hdfc_since_days?: number;
+  hdfc_auto_fetch_minutes?: number;
+  hdfc_batch_wait_minutes?: number;
+  hdfc_portal_url?: string;
+  hdfc_portal_user?: string;
+  hdfc_portal_password_set?: boolean;
+  hdfc_portal_otp_mobile?: string;
+  hdfc_portal_otp_email?: string;
+  hdfc_portal_otp_sender?: string;
+  hdfc_portal_step_seconds?: number;
   /** Inboxes 2, 3, … from the server's settings file; read-only here. */
   otp_extra_inboxes?: ExtraOtpInbox[];
   /** Numbered inboxes the server's settings file names but cannot use. */
   otp_unused_inboxes?: UnusedOtpInbox[];
 }
 
-/** PUT /settings takes any subset of the fields, plus the write-only password. */
-export type SettingsUpdate = Partial<Omit<AppSettings, "otp_imap_password_set">> & {
+/** PUT /settings takes any subset of the fields, plus the write-only passwords. */
+export type SettingsUpdate = Partial<Omit<AppSettings, "otp_imap_password_set" | "hdfc_portal_password_set">> & {
   otp_imap_password?: string;
+  hdfc_portal_password?: string;
 };
 
 /* --- jobs ----------------------------------------------------------------- */
@@ -779,6 +797,11 @@ export interface ProductSearchResult {
   price: number | null;
   rating: number | null;
   image: string | null;
+  /** The struck-out list price and the discount off it, when the card shows them. */
+  mrp?: number | null;
+  discount_pct?: number | null;
+  /** The card's short spec lines ("6 GB RAM | 128 GB ROM"). */
+  highlights?: string[];
 }
 
 export interface ProductSearchAnswer {
@@ -1109,6 +1132,24 @@ export interface ProductPreview {
   /** Why the sellers could not be read, when they could not. The rest of the
    *  preview stands, and a seller's name can still be typed. */
   sellers_error?: string | null;
+  /** Product Screener extras, best effort: the list price and discount, every
+   *  picture the page publishes, and the other variants it links to. */
+  mrp?: number | null;
+  discount_pct?: number | null;
+  images?: string[];
+  variants?: ProductVariant[];
+}
+
+/** Another variant of a product (colour, storage, size) its page links to. */
+export interface ProductVariant {
+  label: string;
+  link: string;
+  pid: string;
+  /** What the variant's swatch shows, when it shows it. */
+  price?: number | null;
+  mrp?: number | null;
+  discount_pct?: number | null;
+  in_stock?: boolean | null;
 }
 
 /** One seller of a product, as its sellers page lists it. */
@@ -1811,6 +1852,10 @@ export interface HdfcUserId {
   email: string;
   mobile: string | null;
   parent_card_last4: string | null;
+  /** The parent card's "Alternate A/c No." from HDFC's Card Relationship page, digits only. */
+  aan: string | null;
+  /** HDFC's own "Virtual Card User ID" (e.g. 4574). */
+  portal_user_id: string | null;
   active: boolean;
   last_fetched_at: string | null;
   last_error: string | null;
@@ -1855,6 +1900,96 @@ export interface HdfcCardFilters {
   search?: string;
 }
 
+export type HdfcBatchStatus = "sending" | "waiting" | "done" | "failed" | "cancelled";
+export type HdfcBatchSend = "portal" | "download";
+
+/** One user id's line in a card batch request. */
+export interface HdfcBatchRowInput {
+  user_id: number;
+  amount: number;
+  count: number;
+  valid_days: number;
+}
+
+export interface HdfcBatchRow extends HdfcBatchRowInput {
+  username: string;
+}
+
+/** A request for new HDFC virtual cards (GET /hdfc/batches). */
+export interface HdfcBatch {
+  id: number;
+  status: HdfcBatchStatus;
+  send: HdfcBatchSend;
+  rows: HdfcBatchRow[];
+  card_count: number;
+  cards_received: number;
+  error: string | null;
+  portal_report: string | null;
+  started_by: string | null;
+  created_at: string;
+  submitted_at: string | null;
+  finished_at: string | null;
+}
+
+/** The HDFC CorpAssist portal sign-in, as the API sees it (GET /hdfc/portal). */
+export interface HdfcPortalStatus {
+  configured: boolean;
+  url: string;
+  user_hint: string | null;
+  otp_via: "sms" | "email" | null;
+  otp_ready: boolean;
+  otp_detail: string | null;
+  auto_fetch_minutes: number;
+  busy: boolean;
+  last_error: string | null;
+}
+
+export interface HdfcPortalTestResult {
+  ok: boolean;
+  detail: string;
+}
+
+export interface HdfcPortalSyncResult {
+  seen: number;
+  added: number;
+  updated: number;
+}
+
+/** A phone running an SMS forwarder app (GET /otp-phones). */
+export interface OtpPhone {
+  id: number;
+  label: string;
+  phone_number: string;
+  employee_id: string | null;
+  corporate_id: string | null;
+  /** The token's last few characters, to tell tokens apart. */
+  token_hint: string;
+  active: boolean;
+  online: boolean;
+  last_ping_at: string | null;
+  last_sms_at: string | null;
+  last_sender: string | null;
+  last_otp: string | null;
+  last_otp_at: string | null;
+  created_at: string;
+}
+
+/** A phone just added or given a new token: the token is shown this once. */
+export interface OtpPhoneCreated extends OtpPhone {
+  token: string;
+  webhook_path: string;
+  ping_path: string;
+}
+
+/** One text a phone forwarded. */
+export interface OtpPhoneMessage {
+  id: number;
+  sender: string | null;
+  body: string;
+  otp: string | null;
+  received_at: string;
+}
+
 /** A number a run may put on the delivery address. */
 export interface OrderPhoneNumber {
   id: number;
@@ -1890,3 +2025,118 @@ export interface AgentsStatus {
     error: string | null;
   };
 }
+
+export interface OtpPhoneSettings {
+  assume_online: boolean;
+}
+
+export interface OtpPhoneBulkResult {
+  added: OtpPhoneCreated[];
+  updated: number;
+  skipped: string[];
+}
+
+export interface ScreenerConfig {
+  master_email: string;
+  banks: string[];
+  check_every_minutes: number;
+  supercoin_offers: boolean;
+  coupon_offers: boolean;
+  enabled: boolean;
+}
+
+export interface ScreenerOfferCombo {
+  label: string;
+  discount: number;
+  net_price: number;
+}
+
+export interface ScreenerItem {
+  id: number;
+  platform: string;
+  product_url: string;
+  product_title: string | null;
+  target_price: number | null;
+  listed_price: number | null;
+  mrp: number | null;
+  best_offer: string | null;
+  offer_applied: string | null;
+  offer_combos: ScreenerOfferCombo[] | null;
+  net_price: number | null;
+  in_stock: boolean | null;
+  stock_text: string | null;
+  last_checked_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InventoryStockRow {
+  platform: string;
+  product_name: string;
+  opening_qty: number;
+  delivered_qty: number;
+  expected_qty: number;
+  received_qty: number;
+  approved_qty: number;
+  transferred_qty: number;
+  mismatch_qty: number;
+  to_be_transferred_qty: number;
+  completed: boolean;
+}
+
+export interface InventoryBatch {
+  id: number;
+  name: string;
+  platform: string;
+  product_name: string;
+  opening_qty: number;
+  received_qty: number;
+  approved_qty: number;
+  status: "active" | "completed";
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InventoryTransfer {
+  id: number;
+  reference: string;
+  platform: string;
+  product_name: string;
+  quantity: number;
+  destination: string | null;
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+}
+
+export interface CodCardsUpdateResult {
+  updated: number;
+  not_found: string[];
+  skipped: string[];
+}
+
+export interface JobTaskItem {
+  id: number;
+  job_id: number;
+  job_type: string;
+  source: string;
+  email: string | null;
+  order_id: string | null;
+  status: string;
+  message: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  triggered_by: string | null;
+}
+
+export interface JobTaskPage {
+  items: JobTaskItem[];
+  total: number;
+  page: number;
+  size: number;
+}
+

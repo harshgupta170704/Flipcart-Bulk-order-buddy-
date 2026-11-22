@@ -6,6 +6,7 @@ import { PAYMENT_MODE_LABELS } from "../lib/types";
 import { DASH, formatCount, formatCurrency, formatDateTime, formatLink, truncate } from "../lib/format";
 import { Alert } from "../components/Alert";
 import { AgentsBar } from "../components/AgentsBar";
+import OrderUnits from "./OrderUnits";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Dialog } from "../components/Dialog";
@@ -533,17 +534,7 @@ export default function Orders() {
           </div>
         </Card>
       ) : tab === "all" ? (
-        <Card
-          title="All Orders"
-          description="Every unit of every order, with status, delivery, invoices and cancellations, is in Order Units History."
-        >
-          <Link
-            to="/order-units"
-            className="inline-flex h-[38px] items-center rounded-control border border-line px-4 text-sm font-medium text-ink hover:bg-page"
-          >
-            Open Order Units History
-          </Link>
-        </Card>
+        <OrderUnits embedded />
       ) : (
         <Card title="CSV Downloads" description="Exports of the runs and of every order unit.">
           <div className="flex flex-wrap gap-2">

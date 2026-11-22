@@ -41,6 +41,8 @@ class SettingsOut(BaseModel):
     proxy_server: str
     #: Automatic read-backs every N hours; 0 = only when someone presses the button.
     sync_every_hours: int
+    track_every_minutes: int = 60
+    out_for_delivery_minutes: int = 30
     otp_imap_host: str
     otp_imap_port: int
     otp_imap_user: str
@@ -49,6 +51,21 @@ class SettingsOut(BaseModel):
     otp_poll_interval: int
     otp_fetch_timeout: int
     otp_imap_password_set: bool
+    otp_sender_filter: str = "flipkart"
+    otp_since_days: int = 1
+    otp_max_age_minutes: int = 15
+    employee_phones_assume_online: bool = False
+    hdfc_sender_filter: str = "hdfc"
+    hdfc_since_days: int = 30
+    hdfc_auto_fetch_minutes: int = 0
+    hdfc_batch_wait_minutes: int = 60
+    hdfc_portal_url: str = "https://corpcardassist.hdfc.bank.in"
+    hdfc_portal_user: str = ""
+    hdfc_portal_password_set: bool = False
+    hdfc_portal_otp_mobile: str = ""
+    hdfc_portal_otp_email: str = ""
+    hdfc_portal_otp_sender: str = "HDFC"
+    hdfc_portal_step_seconds: int = 60
     #: Inboxes 2, 3, … (app.automation.otp): shown so nobody wonders where a
     #: second account's code came from; set in the server's .env, not here.
     otp_extra_inboxes: list[ExtraInboxOut] = Field(default_factory=list)
@@ -67,6 +84,8 @@ class SettingsUpdate(BaseModel):
     browser_headless: bool | None = None
     proxy_server: str | None = None
     sync_every_hours: int | None = Field(default=None, ge=0, le=168)
+    track_every_minutes: int | None = Field(default=None, ge=0, le=1440)
+    out_for_delivery_minutes: int | None = Field(default=None, ge=0, le=1440)
     otp_imap_host: str | None = None
     otp_imap_port: int | None = Field(default=None, ge=1, le=65535)
     otp_imap_user: str | None = None
@@ -75,3 +94,18 @@ class SettingsUpdate(BaseModel):
     otp_imap_use_ssl: bool | None = None
     otp_poll_interval: int | None = Field(default=None, ge=1)
     otp_fetch_timeout: int | None = Field(default=None, ge=1)
+    otp_sender_filter: str | None = None
+    otp_since_days: int | None = Field(default=None, ge=1, le=30)
+    otp_max_age_minutes: int | None = Field(default=None, ge=1, le=120)
+    employee_phones_assume_online: bool | None = None
+    hdfc_sender_filter: str | None = None
+    hdfc_since_days: int | None = Field(default=None, ge=1, le=365)
+    hdfc_auto_fetch_minutes: int | None = Field(default=None, ge=0, le=1440)
+    hdfc_batch_wait_minutes: int | None = Field(default=None, ge=1, le=1440)
+    hdfc_portal_url: str | None = None
+    hdfc_portal_user: str | None = None
+    hdfc_portal_password: str | None = None
+    hdfc_portal_otp_mobile: str | None = None
+    hdfc_portal_otp_email: str | None = None
+    hdfc_portal_otp_sender: str | None = None
+    hdfc_portal_step_seconds: int | None = Field(default=None, ge=10, le=300)

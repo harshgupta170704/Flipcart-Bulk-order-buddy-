@@ -230,7 +230,14 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
     setSubmitError(null);
   };
   const phones = useMemo(() => splitPhones(phonesText), [phonesText]);
-  const [productLink, setProductLink] = useState("");
+  /* A product picked in the Product Screener arrives as ?product=<link>. */
+  const [productLink, setProductLink] = useState(() => {
+    try {
+      return new URLSearchParams(window.location.search).get("product") ?? "";
+    } catch {
+      return "";
+    }
+  });
   /* Find the product by its link, or by searching Flipkart for it. */
   const [productTab, setProductTab] = useState<"url" | "search">("url");
   /* A free-text reference carried onto every order of the run. */
@@ -1588,7 +1595,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                   {/* The pairing the run will use; gone with the file once a run starts. */}
                   {sendableSheet && runCount > 0 ? (
                     <FieldLookProvider value="stacked">
-                      <CardPairingPreview file={sendableSheet} selection={selection} cardType={cardType} />
+                      <CardPairingPreview file={sendableSheet} selection={selection} cardType={cardType} minRemaining={numberOrNull(cardRules.minRemaining)} />
                     </FieldLookProvider>
                   ) : null}
 

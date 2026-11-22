@@ -99,6 +99,27 @@ class Settings(BaseSettings):
     hdfc_sender_filter: str = "hdfc"
     # How far back Fetch looks for child-card emails.
     hdfc_since_days: int = 30
+    # Fetch every active user id's cards this often, in minutes; 0 = only by hand.
+    hdfc_auto_fetch_minutes: int = 0
+    # How long a card batch watches the inbox for its cards before giving up.
+    hdfc_batch_wait_minutes: int = 60
+    # --- HDFC CorpAssist portal (app.automation.hdfc_portal) ----------------
+    # Card batches sent with "Create on HDFC" sign in here and upload HDFC's
+    # bulk virtual-card sheet. Empty user or password: the portal is not used
+    # and batches are downloaded to upload by hand.
+    hdfc_portal_url: str = "https://corpcardassist.hdfc.bank.in"
+    hdfc_portal_user: str = ""
+    hdfc_portal_password: str = ""
+    # Where the portal's sign-in OTP is read: the Employee Phone registered for
+    # this 10-digit mobile (SMS relay), else this address's OTP inbox.
+    hdfc_portal_otp_mobile: str = ""
+    hdfc_portal_otp_email: str = ""
+    # Only texts from (or mentioning) this sender count as the portal's OTP.
+    hdfc_portal_otp_sender: str = "HDFC"
+    # The longest the portal may take over one page, in seconds.
+    hdfc_portal_step_seconds: int = 60
+    # When true, treat all active Employee Phones as online on the UI and portal check.
+    employee_phones_assume_online: bool = False
 
     # --- Concurrency / queue -------------------------------------------------
     max_concurrency: int = 4  # accounts processed in parallel per job

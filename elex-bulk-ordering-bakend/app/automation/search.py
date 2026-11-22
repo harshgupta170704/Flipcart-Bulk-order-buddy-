@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from playwright.async_api import Page
@@ -143,6 +143,11 @@ class SearchResult:
     price: float | None = None
     rating: float | None = None
     image: str | None = None
+    #: The struck-out list price, and the discount Flipkart shows off it.
+    mrp: float | None = None
+    discount_pct: int | None = None
+    #: The card's short spec lines ("6 GB RAM | 128 GB ROM"), for the screener.
+    highlights: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -223,13 +228,90 @@ def parse_search_cards(cards: list[dict], *, limit: int = MAX_RESULTS) -> list[S
             continue
         price = next((float(m.group(1).replace(",", "")) for m in map(_PRICE.match, lines) if m), None)
         rating = next((float(m.group(1)) for m in map(_RATING.match, lines) if m), None)
+        mrp, discount = parse_mrp(lines, price)
         seen.add(pid)
         results.append(
-            SearchResult(title=title[:300], link=link, pid=pid, price=price, rating=rating, image=_image(card.get("image")))
+            SearchResult(
+                title=title[:300],
+                link=link,
+                pid=pid,
+                price=price,
+                rating=rating,
+                image=_image(card.get("image")),
+                mrp=mrp,
+                discount_pct=discount,
+                highlights=_highlights(lines, title),
+            )
         )
         if len(results) >= limit:
             break
     return results
+
+
+#: Every rupee figure in a line: "₹1,104₹2,38553% off" holds two, the second
+#: run into the discount.
+_RUPEES = re.compile(r"₹\s*([\d,]+(?:\.\d{1,2})?)")
+_DISCOUNT = re.compile(r"(\d{1,2})\s*%\s*off", re.IGNORECASE)
+#: Card lines that are no highlight: labels, prices, ratings, offers.
+_NOT_A_HIGHLIGHT = re.compile(r"₹|%\s*off|ratings?|reviews?|offer|delivery|compare|exchange", re.IGNORECASE)
+_HIGHLIGHTS = 4
+
+
+def split_mrp(price: float | None, glued: str, discount: int | None) -> tuple[float | None, int | None]:
+    """``(mrp, discount_pct)`` from the struck-out price's digits as the page
+    runs them together: "2,38553" after a "₹1,104" price is ₹2,385 at 53% off.
+    The split is the one whose discount agrees with the two prices; with the
+    discount on a line of its own (``discount``) the figure is taken whole."""
+    digits = glued.replace(",", "")
+    if discount is not None:
+        try:
+            return float(digits), discount
+        except ValueError:
+            return None, discount
+    if price is None or not digits.isdigit():
+        return None, None
+    for cut in (2, 1):
+        if len(digits) <= cut:
+            continue
+        mrp, pct = int(digits[:-cut]), int(digits[-cut:])
+        if mrp > price and abs((mrp - price) * 100 / mrp - pct) <= 1:
+            return float(mrp), pct
+    return None, None
+
+
+def parse_mrp(lines: list[str], price: float | None) -> tuple[float | None, int | None]:
+    """The list price and discount among a card's (or a page's) lines: the
+    first rupee figure after the price that is followed by "% off", glued or
+    on the next line."""
+    for index, line in enumerate(lines):
+        figures = _RUPEES.findall(line)
+        if not figures:
+            continue
+        rest = line[line.rfind("₹") :]
+        if _DISCOUNT.search(rest):
+            glued = re.match(r"₹\s*([\d,]+)", rest)
+            if glued:
+                return split_mrp(price, glued.group(1), None)
+        nxt = lines[index + 1] if index + 1 < len(lines) else ""
+        found = _DISCOUNT.match(nxt.strip())
+        if found and len(figures) >= 1:
+            candidate = figures[-1]
+            if price is None or float(candidate.replace(",", "")) > price:
+                return split_mrp(price, candidate, int(found.group(1)))
+    return None, None
+
+
+def _highlights(lines: list[str], title: str) -> list[str]:
+    kept: list[str] = []
+    for line in lines:
+        if line == title or title.startswith(line.rstrip(". ")) or _NOT_A_NAME.match(line) or _RATING.match(line):
+            continue
+        if _NOT_A_HIGHLIGHT.search(line) or len(line) > 90:
+            continue
+        kept.append(line)
+        if len(kept) >= _HIGHLIGHTS:
+            break
+    return kept
 
 
 class NoResultsInTime(Exception):
