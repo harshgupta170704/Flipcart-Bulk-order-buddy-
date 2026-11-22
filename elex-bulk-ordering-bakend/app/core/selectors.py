@@ -548,19 +548,30 @@ DELIVERY_DETAILS_HEADING = '//*[not(*)][normalize-space(text())="Delivery detail
 #: same three ids the operator's existing portal reports per order unit.
 ORDER_DETAIL_PATH = "/order_details"
 
-# --- Coupons (mobile emulation) ---------------------------------------------
-COUPON_INPUT = (
-    '//input[@class="css-11aywtz r-6taxm2 r-z2wwpe r-rs99b7 r-13awgt0 '
-    'r-16y2uox r-ubezar r-135wba7 r-iphfwy r-kls4rr r-1hfyk0a r-1h8ys4a r-fdjqy7"]'
-)
+# --- Coupons (mobile emulation, verified live on /myrewards 2026-11-22) -----
+# The legacy RNW obfuscated class strings matched 0 elements for COUPON_CLAIM
+# on live Flipkart ("Enter Coupon Code" + "Add Coupon" button). Text-anchored
+# XPaths survive React-Native-Web class churn.
+COUPON_INPUT = '//*[normalize-space(text())="Enter Coupon Code"]/following::input[1]'
 COUPON_CLAIM = (
-    '//div[@class="css-175oi2r r-1awozwy r-18u37iz r-1777fci '
-    'r-1tuna9m r-eu3ka"]'
+    '//*[normalize-space(text())="Enter Coupon Code"]'
+    '/following::*[not(*)][normalize-space(text())="Add Coupon" or normalize-space(text())="Claim"][1]'
 )
 COUPON_SUCCESS = (
-    '//div[@class="css-1rynq56 r-1et8rh5 r-1enofrn r-1cwl3u0 r-c8eef1 '
-    'r-19u6a5r r-1b7u577 r-1dpkw9"]'
+    '//*[not(*) and not(self::script) and not(self::style)][contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"claim successful") or contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"coupon added") or contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"successfully added")]'
 )
 COUPON_ALREADY_USED = (
-    '//div[@class="css-1rynq56 r-1xv17tt r-1et8rh5 r-1b43r93 r-14gqq1x"]'
+    '//*[not(*) and not(self::script) and not(self::style)][contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"already been used") or contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"already claimed") or contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"already applied")]'
+)
+COUPON_INVALID = (
+    '//*[not(*) and not(self::script) and not(self::style)][contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"invalid") or contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"expired") or contains(translate(normalize-space(text()),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),'
+    '"not valid")]'
 )

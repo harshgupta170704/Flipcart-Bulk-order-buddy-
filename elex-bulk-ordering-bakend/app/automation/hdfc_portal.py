@@ -193,7 +193,14 @@ class PlaywrightPortal:
             from app.config import get_settings
 
             try:
-                reader = get_otp_reader(get_settings())
+                if self._session_factory is not None:
+                    from app.core import corpassist
+
+                    with self._session_factory() as db:
+                        eff = corpassist.effective_settings(db)
+                else:
+                    eff = get_settings()
+                reader = get_otp_reader(eff)
                 code = await reader.get_otp(self.config.otp_email, timeout=timeout, not_before=asked_at)
             except OtpNotConfigured:
                 raise PortalError("the portal's OTP goes by email, but no OTP inbox is set up") from None
