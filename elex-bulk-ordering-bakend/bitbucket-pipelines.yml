@@ -1,0 +1,16 @@
+# Runs the API's tests on every push, in the image the API itself is built on
+# (the browser the tests drive is already in it).
+#
+# The few tests that compare this repository with the web one are skipped here
+# — the web repository is not checked out beside it — and say so in the log.
+image: mcr.microsoft.com/playwright/python:v1.64.1-noble
+
+pipelines:
+  default:
+    - step:
+        name: Tests
+        caches:
+          - pip
+        script:
+          - pip install --no-cache-dir -r requirements.txt
+          - pytest -q

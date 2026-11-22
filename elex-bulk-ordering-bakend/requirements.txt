@@ -1,0 +1,29 @@
+# Phase 1 — backend scaffold, DB, Excel I/O
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sqlalchemy>=2.0.36
+pydantic>=2.10
+pydantic-settings>=2.6
+email-validator>=2.2
+openpyxl>=3.1
+python-multipart>=0.0.17
+playwright>=1.47
+pyjwt>=2.9
+# The certificate authorities an inbox connection is checked against
+# (app.automation.otp.imap_ssl_context): the python.org Python on macOS has no
+# list of its own until its "Install Certificates" step is run.
+certifi>=2024.2
+arq>=0.26
+redis>=5.0
+# PostgreSQL driver — only needed when ORDERING_DATABASE_URL points at Postgres
+psycopg[binary]>=3.2
+# Schema migrations (backend/alembic/, docs/DEPLOY.md §5). 1.16 is the first
+# release that reads alembic.ini's path_separator setting.
+alembic>=1.16
+
+# Phase 5 — invoice reading
+pdfplumber>=0.11
+
+# dev / test
+pytest>=8.3
+httpx>=0.28

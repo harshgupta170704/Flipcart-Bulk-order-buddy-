@@ -1,0 +1,231 @@
+# Full stack: Postgres + Redis + API + browser workers + web UI.
+#
+# This file lives in the API's repository and builds two images: the API from
+# this folder, and the web UI from the web repository checked out BESIDE this
+# one:
+#
+#   some-folder/
+#     elex-bulk-ordering-bakend/   <- this repository (run compose from here)
+#     elex-bulk-ordering-web/      <- the web UI
+#
+# The web UI is somewhere else? Name it: ORDERING_WEB_DIR=/path/to/web in .env
+# (on a developer's machine with both in one folder: ORDERING_WEB_DIR=../frontend).
+#
+#   docker compose up --build            # start everything
+#   docker compose up -d --scale worker=4   # more browser workers = more throughput
+#
+# The web UI is on http://localhost:8080 and proxies /api and /ws to the API,
+# so the browser only talks to one origin.
+
+name: ordering
+
+services:
+  db:
+    image: postgres:16-alpine
+    # Comes back after a reboot or a crash on its own (audit F-18, 25 Oct 2026).
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ordering
+      # No shipped database password either: set ORDERING_DB_PASSWORD in the
+      # project's .env — a long random string of letters, digits, "-" and "_"
+      # only, because it is pasted into ORDERING_DATABASE_URL below, where an
+      # "@", ":", "/", "?", "#" or "%" would break the address. Generate one with
+      #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+      # Nothing but these containers ever sees it.
+      POSTGRES_PASSWORD: ${ORDERING_DB_PASSWORD:?set ORDERING_DB_PASSWORD in .env before starting}
+      POSTGRES_DB: ordering
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ordering -d ordering"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    # Exactly ONE api container (audit F-19): runs are tracked in this process,
+    # a second replica would fail the first one's live runs at its start-up and
+    # let two runs start at once. Scale the browser workers, never the api.
+    # The fixed name enforces it: a container name is unique on a machine, so
+    # `docker compose up --scale api=2` stops with an error instead of starting
+    # a second API. (A second copy of this stack on the same machine, under
+    # another project name, must change this name.)
+    container_name: ordering-api
+    # The orders in flight get this long to finish when the container stops;
+    # an order cut short mid-send is left "unconfirmed" for a person to settle.
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    environment: &backend_env
+      ORDERING_DATABASE_URL: postgresql+psycopg://ordering:${ORDERING_DB_PASSWORD:?set ORDERING_DB_PASSWORD in .env before starting}@db:5432/ordering
+      ORDERING_REDIS_URL: redis://redis:6379
+      ORDERING_BROWSER_HEADLESS: "true"
+      ORDERING_MAX_CONCURRENCY: "4"
+      # No shipped secrets: compose refuses to start until these are set in the
+      # project's .env (or the shell). Generate the secret with
+      #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+      # and the hash with
+      #   python -m app.core.security hash '<password>'   (from this folder)
+      # Put the hash in .env in single quotes: it contains '$' signs, which
+      # compose otherwise reads as variables. A hash with a part missing locks
+      # the admin out; the API reports one at start-up as an ERROR.
+      ORDERING_JWT_SECRET: ${ORDERING_JWT_SECRET:?set ORDERING_JWT_SECRET in .env before starting}
+      ORDERING_ADMIN_USERNAME: ${ORDERING_ADMIN_USERNAME:-admin}
+      ORDERING_ADMIN_PASSWORD_HASH: ${ORDERING_ADMIN_PASSWORD_HASH:?set ORDERING_ADMIN_PASSWORD_HASH in .env before starting}
+      # The other settings docs/DEPLOY.md §2 lists, each from the project's
+      # .env with the app's own default when left out, so leaving one out
+      # changes nothing: wrong passwords tolerated in fifteen minutes per
+      # email and per address, the password hashing work factor, the level of
+      # the app's own log lines, the proxy browsers go through (blank: none;
+      # the Settings page can set it instead, and wins), and how often placed
+      # orders are read back until they arrive, in minutes (0 switches it off).
+      ORDERING_LOGIN_MAX_FAILURES_PER_EMAIL: ${ORDERING_LOGIN_MAX_FAILURES_PER_EMAIL:-5}
+      ORDERING_LOGIN_MAX_FAILURES_PER_ADDRESS: ${ORDERING_LOGIN_MAX_FAILURES_PER_ADDRESS:-50}
+      ORDERING_PBKDF2_ITERATIONS: ${ORDERING_PBKDF2_ITERATIONS:-390000}
+      ORDERING_LOG_LEVEL: ${ORDERING_LOG_LEVEL:-INFO}
+      ORDERING_PROXY_SERVER: ${ORDERING_PROXY_SERVER:-}
+      ORDERING_TRACK_EVERY_MINUTES: ${ORDERING_TRACK_EVERY_MINUTES:-60}
+      ORDERING_OUT_FOR_DELIVERY_MINUTES: ${ORDERING_OUT_FOR_DELIVERY_MINUTES:-30}
+      # The OTP inbox, for reading Flipkart's sign-in codes by itself, set in
+      # the project's .env like the mail below (or later on the Settings page,
+      # which wins). Blank keeps it off; the port, mailbox and SSL keep the
+      # app's own defaults, since a blank port or switch would stop the API.
+      # A second inbox, for accounts whose codes land in another mailbox: its
+      # address and App Password, which accounts it serves (its own address
+      # when left out), and its own host if it needs one. A Gmail address
+      # needs none (imap.gmail.com); any other borrows the first inbox's host
+      # as set here, never one saved on the Settings page, which lists an
+      # inbox it cannot use, with why. Blank means no second inbox. A third
+      # goes in a docker-compose.override.yml: docs/DEPLOY.md §2.
+      ORDERING_OTP_IMAP_HOST: ${ORDERING_OTP_IMAP_HOST:-}
+      ORDERING_OTP_IMAP_PORT: ${ORDERING_OTP_IMAP_PORT:-993}
+      ORDERING_OTP_IMAP_USER: ${ORDERING_OTP_IMAP_USER:-}
+      ORDERING_OTP_IMAP_PASSWORD: ${ORDERING_OTP_IMAP_PASSWORD:-}
+      ORDERING_OTP_IMAP_MAILBOX: ${ORDERING_OTP_IMAP_MAILBOX:-INBOX}
+      ORDERING_OTP_IMAP_USE_SSL: ${ORDERING_OTP_IMAP_USE_SSL:-true}
+      ORDERING_OTP_IMAP_USER_2: ${ORDERING_OTP_IMAP_USER_2:-}
+      ORDERING_OTP_IMAP_PASSWORD_2: ${ORDERING_OTP_IMAP_PASSWORD_2:-}
+      ORDERING_OTP_IMAP_FOR_2: ${ORDERING_OTP_IMAP_FOR_2:-}
+      ORDERING_OTP_IMAP_HOST_2: ${ORDERING_OTP_IMAP_HOST_2:-}
+      # CorpAssist (HDFC): Fetch reads the first inbox above, mail from these
+      # senders only, this many days back.
+      ORDERING_HDFC_SENDER_FILTER: ${ORDERING_HDFC_SENDER_FILTER:-hdfc}
+      ORDERING_HDFC_SINCE_DAYS: ${ORDERING_HDFC_SINCE_DAYS:-30}
+      # How long compiled invoice archives are kept (spec C-11), in days.
+      ORDERING_ARCHIVE_RETENTION_DAYS: ${ORDERING_ARCHIVE_RETENTION_DAYS:-90}
+      # Mail for the sign-in page's "Forgot password?" link (spec C-13), set
+      # in the project's .env. A container gets only the variables named here
+      # (the image copies no .env), so each one is named, taken from the .env:
+      # left out, the host, sender and app address stay blank, which keeps the
+      # link off (admins set temporary passwords under Users), and the port
+      # and STARTTLS keep the app's own defaults — a blank port or STARTTLS
+      # would stop the API at start-up. ORDERING_APP_URL is the https address
+      # browsers use, for the link in the mail. Prove them with
+      #   docker compose exec api python -m app.cli test-mail <your address>
+      ORDERING_SMTP_HOST: ${ORDERING_SMTP_HOST:-}
+      ORDERING_SMTP_PORT: ${ORDERING_SMTP_PORT:-587}
+      ORDERING_SMTP_USER: ${ORDERING_SMTP_USER:-}
+      ORDERING_SMTP_PASSWORD: ${ORDERING_SMTP_PASSWORD:-}
+      ORDERING_SMTP_FROM: ${ORDERING_SMTP_FROM:-}
+      ORDERING_SMTP_STARTTLS: ${ORDERING_SMTP_STARTTLS:-true}
+      ORDERING_APP_URL: ${ORDERING_APP_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # The schema is brought up to the code first (the migrate service below).
+      migrate:
+        condition: service_completed_successfully
+    # No published port, on purpose: the browser reaches the API only through
+    # the web proxy (http://localhost:8080/api and /ws), which forwards the
+    # browser's address in X-Forwarded-For, and uvicorn trusts that header
+    # from the compose network (FORWARDED_ALLOW_IPS in the Dockerfile here) so
+    # the sign-in throttle counts per browser, not once for the whole proxy.
+    # A port published here would let a caller skip the proxy and name any
+    # address. Need the raw API on a laptop? Add a ports: entry for it in a
+    # docker-compose.override.yml, never in production.
+    # Invoice PDFs and the compiled archives built from them (ORDERING_INVOICE_DIR
+    # and ORDERING_ARCHIVE_DIR, default ./data/… under /app) must outlive the
+    # container: a named volume now, S3 later.
+    volumes:
+      - appdata:/app/data
+    # Browsers need more than the default shared-memory segment.
+    shm_size: "1gb"
+
+  # Brings the PostgreSQL schema up to the current models, once per
+  # `docker compose up`, before the API or a worker starts (docs/DEPLOY.md §5):
+  # runs `alembic upgrade head` and exits. The api and worker start only when
+  # it has finished without an error, so a failed migration stops the deploy
+  # here with its own log (`docker compose logs migrate`) instead of an API
+  # starting on a schema its code does not match. A separate service rather
+  # than a step in the API's start command: the API's command, and the 90 s
+  # drain its stop relies on, stay exactly as they are. One-off commands run
+  # through it too, e.g. `docker compose run --rm migrate alembic current`.
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend_env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # Scale this service for throughput: docker compose up -d --scale worker=4
+  # Note: ordering jobs run in the API process by design, because card details
+  # must never be serialized into the Redis queue (docs/PLAN.md §5). Workers
+  # handle login and coupon jobs.
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["arq", "app.jobs.arq_worker.WorkerSettings"]
+    environment: *backend_env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    shm_size: "1gb"
+
+  web:
+    # The web repository, beside this one unless ORDERING_WEB_DIR says otherwise.
+    build: ${ORDERING_WEB_DIR:-../elex-bulk-ordering-web}
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      # The TLS proxy or load balancer in front of nginx, when there is one:
+      # its addresses or CIDRs, separated by spaces or commas, set in the
+      # project's .env (audit F-30). nginx then takes the browser's address
+      # from the X-Forwarded-For header that hop adds, and the sign-in
+      # throttle counts each browser on its own instead of all as one. Which
+      # value: docs/DEPLOY.md §4, "TLS". Empty by default, which is right only
+      # while browsers reach port 8080 directly. A value that is not an
+      # address stops this container at start, with the reason in
+      # `docker compose logs web`.
+      ORDERING_TRUSTED_PROXIES: ${ORDERING_TRUSTED_PROXIES:-}
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  appdata:
