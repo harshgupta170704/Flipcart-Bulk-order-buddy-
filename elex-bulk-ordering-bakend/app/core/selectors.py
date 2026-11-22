@@ -58,6 +58,13 @@ BUY_NOW_BTN = (
     '(//*[not(*)][normalize-space(text())="Buy now"]'
     f' | //*[{_BUY_AT_ODOMETER}][not(*[{_BUY_AT_ODOMETER}])])[1]'
 )
+#: Electronics/audio product pages can pop up a "Frequently Bought Together"
+#: extended-warranty sheet after pressing Buy now, holding checkout until
+#: "SKIP & CONTINUE" is clicked (confirmed live 2026-11-22).
+BUY_NOW_SKIP_CONTINUE = (
+    '//*[not(*)][translate(normalize-space(text()),'
+    '"abcdefghijklmnopqrstuvwxyz","ABCDEFGHIJKLMNOPQRSTUVWXYZ")="SKIP & CONTINUE"]'
+)
 CHECKOUT_EMAIL = '//input[@class="c3Bd2c XnemW5"]'
 CHECKOUT_CONTINUE = '//button[@class="dSM5Ub dL4Phl KcXDCU"]'
 

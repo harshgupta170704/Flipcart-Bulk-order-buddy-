@@ -192,7 +192,13 @@ async def buy_now(page: Page, product_link: str, *, already_open: bool = False) 
         await page.goto(product_link, wait_until="domcontentloaded")
     # An account with no saved address lands on the first-address form instead
     # of the checkout: that is arriving too, not a press that did nothing.
-    if not await click_until_navigated(page, S.BUY_NOW_BTN, "/viewcheckout", also=(FIRST_ADDRESS_PATH,)):
+    if not await click_until_navigated(
+        page,
+        S.BUY_NOW_BTN,
+        "/viewcheckout",
+        also=(FIRST_ADDRESS_PATH,),
+        dismiss_xpath=S.BUY_NOW_SKIP_CONTINUE,
+    ):
         log.error("buy_now: Buy now never took effect (page did not reach checkout)")
 
 
@@ -2780,6 +2786,7 @@ async def click_until_navigated(
     attempts: int = 4,
     settle_ms: int = 2_000,
     also: tuple[str, ...] = (),
+    dismiss_xpath: str | None = None,
 ) -> bool:
     """Click an RN-Web control and wait for the navigation it should cause.
 
@@ -2789,17 +2796,38 @@ async def click_until_navigated(
     the wrong page. Observed live — Buy now reported a successful click and the
     URL never changed. Waiting once is not enough either, because hydration
     time varies with the page, so this retries until the URL actually moves.
+
+    When ``dismiss_xpath`` is supplied (for example, the "SKIP & CONTINUE"
+    button on Flipkart's "Frequently Bought Together" warranty sheet), an
+    interstitial that appears instead of navigating is dismissed automatically.
     """
+    fragments = (url_fragment, *also)
     for attempt in range(1, attempts + 1):
         # Give the page a moment to hydrate before (re)trying.
         await page.wait_for_timeout(settle_ms)
-        # A native click is often a silent no-op before RN-Web has hydrated,
-        # so later attempts escalate to the DOM click rather than doing both
-        # at once (which would double-activate a toggle).
-        await click_rnw(
-            page, xpath, timeout_ms=QUICK_TIMEOUT_MS, force_js=(attempt > 1)
-        )
-        fragments = (url_fragment, *also)
+        # If an interstitial from the previous click is already open, dismiss
+        # it instead of clicking the obscured trigger behind it.
+        dismissed = False
+        if dismiss_xpath:
+            with contextlib.suppress(Exception):
+                dl = page.locator(f"xpath={dismiss_xpath}").first
+                if await dl.count() > 0 and await dl.is_visible():
+                    log.info("dismissing interstitial (%s)", dismiss_xpath[:40])
+                    await click_rnw(page, dismiss_xpath, timeout_ms=QUICK_TIMEOUT_MS, force_js=(attempt > 1))
+                    dismissed = True
+        if not dismissed:
+            # A native click is often a silent no-op before RN-Web has hydrated,
+            # so later attempts escalate to the DOM click rather than doing both
+            # at once (which would double-activate a toggle).
+            await click_rnw(
+                page, xpath, timeout_ms=QUICK_TIMEOUT_MS, force_js=(attempt > 1)
+            )
+            if dismiss_xpath:
+                with contextlib.suppress(Exception):
+                    dl = page.locator(f"xpath={dismiss_xpath}").first
+                    await dl.wait_for(state="visible", timeout=1_500)
+                    log.info("dismissing interstitial after click (%s)", dismiss_xpath[:40])
+                    await click_rnw(page, dismiss_xpath, timeout_ms=QUICK_TIMEOUT_MS)
         try:
             if also:
                 await page.wait_for_url(lambda url: any(f in url for f in fragments), timeout=STEP_TIMEOUT_MS)
