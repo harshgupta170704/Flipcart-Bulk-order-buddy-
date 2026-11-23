@@ -187,6 +187,8 @@ async def lifespan(app: FastAPI):
     # cards of the batches still waiting (app.core.hdfc_batches).
     hdfc_recover_in_own_session()
     hdfc_loop = asyncio.create_task(hdfc_batches.run_forever())
+    # Product Screener 20-slot watchlist auto-checker (runs only when enabled in DB).
+    screener_loop = asyncio.create_task(screener.run_screener_scheduler())
     # Shout at startup if this deployment is still on the default signing key
     # (only dev mode gets this far with it) or a plaintext admin password,
     # rather than quietly accepting them.
@@ -199,6 +201,7 @@ async def lifespan(app: FastAPI):
     scheduler.cancel()
     heart.cancel()
     hdfc_loop.cancel()
+    screener_loop.cancel()
     await drain_background_tasks()
     # The refusal was for the drain window only. A real process is gone a
     # moment later; the test suite stops one application and starts the next

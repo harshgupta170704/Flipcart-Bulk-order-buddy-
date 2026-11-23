@@ -145,8 +145,8 @@ _AI_RETRYABLE_ERRORS: frozenset[ErrorCode] = frozenset(
 
 
 def _ai_outcome_meta(status: OrderStatus, result: dict) -> dict:
-    """Extract live price, stock signal, and AI-retryability from a run result."""
-    raw_amount = result.get("amount")
+    """Extract live per-unit price, stock signal, and AI-retryability from a run result."""
+    raw_amount = result.get("unit_amount") if result.get("unit_amount") is not None else result.get("amount")
     seen_price = float(raw_amount) if isinstance(raw_amount, (int, float)) and raw_amount > 0 else None
     if status == OrderStatus.placed:
         return {"seen_price": seen_price, "in_stock": True, "retryable": False, "market_blocked": False}

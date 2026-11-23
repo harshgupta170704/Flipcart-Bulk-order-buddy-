@@ -309,3 +309,52 @@ async def check_all_screener_items(db: DbSession = Depends(get_db)) -> list[Scre
         updated = await _check_one(db, item, cfg)
         out.append(ScreenerItemOut.model_validate(updated))
     return out
+
+
+async def tick_due_items(session_factory=None) -> int:
+    """Check any watchlist products whose last check is older than ``check_every_minutes``.
+    Returns how many items were checked; 0 when the screener is off or none are due."""
+    from datetime import timedelta
+    from app.db.base import SessionLocal
+
+    factory = session_factory or SessionLocal
+    with factory() as db:
+        cfg = _load_config(db)
+        every = int(cfg.get("check_every_minutes") or 0)
+        if not cfg.get("enabled") or every <= 0:
+            return 0
+        cutoff = naive_utcnow() - timedelta(minutes=every)
+        due_ids = [
+            row.id
+            for row in db.scalars(select(ScreenerItem).order_by(ScreenerItem.id.asc())).all()
+            if row.last_checked_at is None or row.last_checked_at <= cutoff
+        ]
+    checked = 0
+    for item_id in due_ids:
+        with factory() as db:
+            item = db.get(ScreenerItem, item_id)
+            if item is None:
+                continue
+            cfg = _load_config(db)
+            if not cfg.get("enabled"):
+                break
+            await _check_one(db, item, cfg)
+            checked += 1
+    return checked
+
+
+async def run_screener_scheduler(poll_seconds: float = 60.0) -> None:
+    """Background loop for the 20-slot Product Screener Watchlist."""
+    import asyncio
+
+    while True:
+        try:
+            await asyncio.sleep(poll_seconds)
+            checked = await tick_due_items()
+            if checked:
+                log.info("screener scheduler checked %d watchlist product(s)", checked)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never kill the API loop
+            log.warning("screener scheduler tick failed: %s", exc)
+

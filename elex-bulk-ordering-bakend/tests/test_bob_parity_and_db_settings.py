@@ -204,3 +204,51 @@ def test_job_tasks_endpoint(client, auth_headers, db):
     assert body["items"][0]["email"] == "task-test@example.com"
     assert body["items"][0]["source"] == "ai"
     assert body["items"][0]["triggered_by"] == "admin"
+
+
+def test_screener_tick_due_items_respects_enabled_and_interval(db, monkeypatch):
+    import asyncio
+    from contextlib import contextmanager
+    from datetime import timedelta
+    from app.api import screener
+    from app.db.models import ScreenerItem, naive_utcnow
+
+    checked_ids: list[int] = []
+
+    async def fake_check_one(session, item, _cfg):
+        checked_ids.append(item.id)
+        item.last_checked_at = naive_utcnow()
+        item.listed_price = 699.0
+        session.commit()
+        return item
+
+    monkeypatch.setattr(screener, "_check_one", fake_check_one)
+
+    @contextmanager
+    def session_factory():
+        yield db
+
+    due = ScreenerItem(
+        product_url="https://www.flipkart.com/p/due-item",
+        last_checked_at=naive_utcnow() - timedelta(minutes=30),
+    )
+    fresh = ScreenerItem(
+        product_url="https://www.flipkart.com/p/fresh-item",
+        last_checked_at=naive_utcnow(),
+    )
+    db.add_all([due, fresh])
+    db.commit()
+
+    # Disabled by default -> checks nothing
+    screener._save_config(db, {"enabled": False, "check_every_minutes": 15})
+    assert asyncio.run(screener.tick_due_items(session_factory)) == 0
+    assert checked_ids == []
+
+    # Enabled -> checks only the due item, leaves fresh item untouched
+    screener._save_config(db, {"enabled": True, "check_every_minutes": 15})
+    assert asyncio.run(screener.tick_due_items(session_factory)) == 1
+    assert checked_ids == [due.id]
+
+    # Immediately running again -> now neither is due
+    assert asyncio.run(screener.tick_due_items(session_factory)) == 0
+

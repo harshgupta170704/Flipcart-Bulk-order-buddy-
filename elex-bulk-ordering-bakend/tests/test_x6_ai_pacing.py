@@ -270,3 +270,35 @@ def test_fixed_count_scale_up_mode_and_api_wire(api, db, recorder):
     bad_mode = _post(api, mode="ai", ai_scale_up_mode="magic")
     assert bad_mode.status_code == 422
 
+
+def test_ai_outcome_meta_prefers_unit_amount_over_total():
+    """When qty > 1, AI tracker must compare & report per-unit price, not total cart amount."""
+    from app.db.models import OrderStatus
+    from app.jobs.tasks import _ai_outcome_meta
+
+    meta = _ai_outcome_meta(
+        OrderStatus.over_target,
+        {"amount": 2154.0, "unit_amount": 718.0, "qty": 3},
+    )
+    assert meta["seen_price"] == 718.0
+    assert meta["in_stock"] is True
+    assert meta["retryable"] is True
+    assert meta["market_blocked"] is True
+
+    # Falls back to total amount when unit_amount is absent (qty == 1 or legacy driver output)
+    fallback = _ai_outcome_meta(
+        OrderStatus.over_target,
+        {"amount": 718.0, "qty": 1},
+    )
+    assert fallback["seen_price"] == 718.0
+
+    # Product unavailable marks out of stock and retryable
+    oos = _ai_outcome_meta(
+        OrderStatus.failed,
+        {"error": "Product is currently out of stock"},
+    )
+    assert oos["in_stock"] is False
+    assert oos["retryable"] is True
+    assert oos["market_blocked"] is True
+
+

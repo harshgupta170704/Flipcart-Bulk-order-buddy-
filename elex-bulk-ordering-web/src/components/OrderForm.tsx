@@ -159,7 +159,7 @@ const DEFAULT_AI: {
   scaleUp: "20",
   scaleUpCount: "2",
   duration: "12h",
-  priceTracker: false,
+  priceTracker: true,
   rehearsal: false,
 };
 const DURATION_RE = /^\s*\d+(\.\d+)?\s*[mhd]\s*$/i;
@@ -637,6 +637,26 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
           setTarget("");
         } else if (p.target !== undefined && p.target !== null) setTarget(String(p.target));
         if (p.mode === "mock" || p.mode === "ai") setRunMode(p.mode);
+        if (p.mode === "ai" && p.pacing && typeof p.pacing === "object") {
+          const pc = p.pacing as Record<string, unknown>;
+          const secs = Number(pc.run_seconds ?? 12 * 3600);
+          const dur =
+            secs % 86400 === 0
+              ? `${secs / 86400}d`
+              : secs % 3600 === 0
+                ? `${secs / 3600}h`
+                : `${Math.max(60, Math.round(secs / 60))}m`;
+          setAiDraft({
+            interval: String(Math.max(1, Math.round(Number(pc.max_interval_s ?? 60) / 60))),
+            minAttempts: String(Number(pc.min_batch ?? 10)),
+            scaleUpMode: pc.scale_up_mode === "count" ? "count" : "percent",
+            scaleUp: String(Number(pc.scale_up_pct ?? 20)),
+            scaleUpCount: String(Number(pc.scale_up_count ?? 2)),
+            duration: dur,
+            priceTracker: Boolean(pc.single_probe || pc.recycle_accounts),
+            rehearsal: Boolean(p.rehearsal),
+          });
+        }
         if (p.payment_mode === "cod" || p.payment_mode === "card") setPaymentMode(p.payment_mode);
         if (p.qty_mode === "minimum") setQtyMode("minimum");
         setQuantity((prev) => ({

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { cancelJob, errorMessage, getJob, listBulkOrderCreators, listBulkOrders } from "../lib/api";
-import type { BulkOrderRun, BulkOrderRunFilters, JobDetail } from "../lib/types";
+import type { AiTrackerState, BulkOrderRun, BulkOrderRunFilters, JobDetail } from "../lib/types";
 import { PAYMENT_MODE_LABELS } from "../lib/types";
 import { DASH, formatCount, formatCurrency, formatDateTime, formatLink, truncate } from "../lib/format";
+import { AiTrackerCard } from "../components/AiTrackerCard";
 import { Alert } from "../components/Alert";
 import { AgentsBar } from "../components/AgentsBar";
 import OrderUnits from "./OrderUnits";
@@ -300,21 +301,40 @@ export default function Orders() {
       {
         key: "product",
         header: "Product",
-        width: "200px",
-        render: (run) =>
-          run.product_link ? (
-            <a
-              href={run.product_link}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="block text-[12px] leading-snug text-ink hover:underline"
-              title={run.product_name ?? run.product_link}
-            >
-              {run.product_name ? truncate(run.product_name, 60) : formatLink(run.product_link, 40)}
-            </a>
+        width: "220px",
+        render: (run) => {
+          const tracker = (run.payload as { ai_tracker?: AiTrackerState } | null | undefined)?.ai_tracker;
+          return run.product_link ? (
+            <div className="flex flex-col gap-0.5">
+              <a
+                href={run.product_link}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="block text-[12px] leading-snug text-ink hover:underline"
+                title={run.product_name ?? run.product_link}
+              >
+                {run.product_name ? truncate(run.product_name, 60) : formatLink(run.product_link, 40)}
+              </a>
+              {tracker ? (
+                <button
+                  type="button"
+                  onClick={() => void open(run, "settings")}
+                  className="w-fit text-left text-[11px] tabular-nums text-accent hover:underline"
+                >
+                  {tracker.last_seen_price != null
+                    ? `Live ${formatCurrency(tracker.last_seen_price)}`
+                    : tracker.in_stock === false
+                      ? "Out of stock"
+                      : "AI tracker"}
+                  {tracker.lowest_seen_price != null ? ` · low ${formatCurrency(tracker.lowest_seen_price)}` : ""}
+                  {` · ${tracker.status.replace(/_/g, " ")}`}
+                </button>
+              ) : null}
+            </div>
           ) : (
             DASH
-          ),
+          );
+        },
       },
       {
         key: "quantity",
@@ -562,14 +582,23 @@ export default function Orders() {
         width="720px"
       >
         {details?.kind === "settings" ? (
-          <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-[13px]">
-            {Object.entries(details.job.payload ?? {}).map(([key, value]) => (
-              <div key={key} className="contents">
-                <dt className="text-ink-2">{key.replace(/_/g, " ")}</dt>
-                <dd className="break-all text-ink">{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd>
-              </div>
-            ))}
-          </dl>
+          <div className="flex flex-col gap-4">
+            {(() => {
+              const tracker = (details.job.payload as { ai_tracker?: AiTrackerState } | null | undefined)?.ai_tracker;
+              const done = details.job.status === "completed" || details.job.status === "failed";
+              return tracker ? <AiTrackerCard tracker={tracker} terminal={done} maxProbes={20} /> : null;
+            })()}
+            <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-[13px]">
+              {Object.entries(details.job.payload ?? {})
+                .filter(([key]) => key !== "ai_tracker")
+                .map(([key, value]) => (
+                  <div key={key} className="contents">
+                    <dt className="text-ink-2">{key.replace(/_/g, " ")}</dt>
+                    <dd className="break-all text-ink">{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd>
+                  </div>
+                ))}
+            </dl>
+          </div>
         ) : details ? (
           failures.length === 0 ? (
             <p className="text-[13px] text-ink-2">Every account in this run finished without an error.</p>
