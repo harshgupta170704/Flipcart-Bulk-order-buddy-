@@ -37,6 +37,7 @@ from app.api import (
     auth,
     changes,
     corpassist,
+    email_swap,
     health,
     inventory,
     jobs,
@@ -189,6 +190,10 @@ async def lifespan(app: FastAPI):
     hdfc_loop = asyncio.create_task(hdfc_batches.run_forever())
     # Product Screener 20-slot watchlist auto-checker (runs only when enabled in DB).
     screener_loop = asyncio.create_task(screener.run_screener_scheduler())
+    # Swap Email Address: drains queued (old email -> new email) swaps. Its
+    # endpoints are sync handlers with no event loop, so the worker needs this
+    # loop on the main event loop to run on (app.api.email_swap).
+    email_swap_loop = asyncio.create_task(email_swap.run_email_swap_scheduler())
     # Shout at startup if this deployment is still on the default signing key
     # (only dev mode gets this far with it) or a plaintext admin password,
     # rather than quietly accepting them.
@@ -202,6 +207,7 @@ async def lifespan(app: FastAPI):
     heart.cancel()
     hdfc_loop.cancel()
     screener_loop.cancel()
+    email_swap_loop.cancel()
     await drain_background_tasks()
     # The refusal was for the drain window only. A real process is gone a
     # moment later; the test suite stops one application and starts the next
@@ -285,6 +291,7 @@ def create_app() -> FastAPI:
     app.include_router(corpassist.router)
     app.include_router(phones.router)
     app.include_router(screener.router)
+    app.include_router(email_swap.router)
     app.include_router(inventory.router)
     app.include_router(master_lists.phone_router)
 
