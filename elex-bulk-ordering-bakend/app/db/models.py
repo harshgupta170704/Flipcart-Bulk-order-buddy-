@@ -1216,6 +1216,29 @@ class ScreenerItem(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, onupdate=naive_utcnow)
 
 
+class EmailSwap(Base):
+    """One row per requested email change (old login email -> new login email).
+
+    Fed by the Swap Email Address CSV. A background worker logs in with the
+    account's stored session, drives Flipkart's profile email change, and reads
+    the verification code(s) the modal asks for (both go to mailboxes we read for
+    these accounts). ``status`` walks pending -> running -> done / failed.
+    """
+
+    __tablename__ = "email_swaps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    old_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    new_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
+    stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, onupdate=naive_utcnow)
+
+
 class InventoryBatch(Base):
     """Warehouse receiving / stock-count batch per platform + product (BOB Inventory)."""
 
