@@ -43,6 +43,13 @@ STATE_KEY = "instaddr.browser_state"
 #: Cached domains owned by the connected InstAddr account (e.g. catbar.net).
 DOMAINS_KEY = "instaddr.domains"
 DEFAULT_DOMAINS: tuple[str, ...] = ("catbar.net",)
+#: Further InstAddr accounts, each with its own custom domains, beside the
+#: first one above (24 Nov 2026: @apmail.org lives on a second account). A
+#: list of ``{"name", "state", "domains"}``; the first account keeps the two
+#: keys above, so a setup with one account reads exactly as before.
+ACCOUNTS_KEY = "instaddr.accounts"
+#: The name the first account (the two keys above) goes by.
+MAIN_ACCOUNT = "main"
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _ORDINAL_DAY_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
@@ -90,8 +97,12 @@ def load_domains(db: DbSession) -> tuple[str, ...]:
     return DEFAULT_DOMAINS
 
 
+def _clean_domains(domains) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(d).strip().lower().lstrip("@") for d in (domains or ()) if str(d).strip()))
+
+
 def save_domains(db: DbSession, domains: list[str] | tuple[str, ...]) -> tuple[str, ...]:
-    cleaned = list(dict.fromkeys(str(d).strip().lower().lstrip("@") for d in domains if str(d).strip()))
+    cleaned = list(_clean_domains(domains))
     row = db.get(Setting, DOMAINS_KEY)
     if row is None:
         db.add(Setting(key=DOMAINS_KEY, value=cleaned))
@@ -101,23 +112,144 @@ def save_domains(db: DbSession, domains: list[str] | tuple[str, ...]) -> tuple[s
     return tuple(cleaned)
 
 
-async def fetch_domains(state: dict) -> tuple[str, ...]:
-    """Read the domains of all addresses held by the signed-in InstAddr account."""
+def _extra_accounts(db: DbSession) -> list[dict]:
+    row = db.get(Setting, ACCOUNTS_KEY)
+    if row is None or not isinstance(row.value, list):
+        return []
+    return [item for item in row.value if isinstance(item, dict) and str(item.get("name") or "").strip()]
+
+
+def load_accounts(db: DbSession) -> list[dict]:
+    """Every connected InstAddr account as ``{"name", "state", "domains"}``,
+    the first account (the original two keys) first. An account with no
+    saved sign-in or no domain is left out: it could read nobody's mail."""
+    accounts: list[dict] = []
+    state = load_state(db)
+    if state:
+        accounts.append({"name": MAIN_ACCOUNT, "state": state, "domains": list(load_domains(db))})
+    for item in _extra_accounts(db):
+        domains = _clean_domains(item.get("domains"))
+        if isinstance(item.get("state"), dict) and item["state"] and domains:
+            accounts.append(
+                {
+                    "name": str(item["name"]).strip(),
+                    "state": item["state"],
+                    "domains": list(domains),
+                    "addresses": list(_clean_addresses(item.get("addresses"))),
+                }
+            )
+    return accounts
+
+
+def _clean_addresses(addresses) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(str(a).strip().lower() for a in (addresses or ()) if "@" in str(a) and str(a).strip())
+    )
+
+
+def save_account(db: DbSession, name: str | None, state: dict, domains, addresses=None) -> tuple[str, ...]:
+    """Keep one account's signed-in state and domains. The first account
+    (no name, or ``main``) keeps the original keys; any other name is kept,
+    or replaced, in the list of further accounts, with the exact addresses
+    it holds: two accounts can hold addresses on the same domain (24 Nov
+    2026: @catbar.net on both), so a further account is matched by address
+    first and by domain only where no earlier account claims the domain."""
+    clean_name = (name or "").strip()
+    cleaned = _clean_domains(domains)
+    if not clean_name or clean_name.lower() == MAIN_ACCOUNT:
+        save_state(db, state)
+        return save_domains(db, cleaned) if cleaned else load_domains(db)
+    if not cleaned:
+        raise ValueError(f"InstAddr account {clean_name!r} holds no address on any domain; nothing to read")
+    items = [item for item in _extra_accounts(db) if str(item.get("name")).strip() != clean_name]
+    items.append(
+        {"name": clean_name, "state": state, "domains": list(cleaned), "addresses": list(_clean_addresses(addresses))}
+    )
+    row = db.get(Setting, ACCOUNTS_KEY)
+    if row is None:
+        db.add(Setting(key=ACCOUNTS_KEY, value=items))
+    else:
+        row.value = items
+    db.commit()
+    return cleaned
+
+
+def account_state(db: DbSession, name: str | None) -> dict | None:
+    """The saved signed-in state of one account (``None``/``main`` = the first)."""
+    clean_name = (name or "").strip()
+    if not clean_name or clean_name.lower() == MAIN_ACCOUNT:
+        return load_state(db)
+    for item in _extra_accounts(db):
+        if str(item.get("name")).strip() == clean_name and isinstance(item.get("state"), dict):
+            return item["state"]
+    return None
+
+
+async def _addresses_in(context) -> tuple[str, ...]:
+    """Every address the context's InstAddr account holds."""
+    resp = await context.request.get(ADDR_LIST_URL, timeout=30_000)
+    if resp.status != 200:
+        return ()
+    text = await resp.text()
+    return tuple(sorted({m.lower() for m in _EMAIL_RE.findall(text)}))
+
+
+def domains_of(addresses) -> tuple[str, ...]:
+    return tuple(sorted({addr.rpartition("@")[2] for addr in addresses if "@" in addr}))
+
+
+async def _domains_in(context) -> tuple[str, ...]:
+    """The domains of the addresses the context's InstAddr account holds."""
+    return domains_of(await _addresses_in(context))
+
+
+async def fetch_addresses(state: dict) -> tuple[str, ...]:
+    """Every address held by the signed-in InstAddr account (empty on failure)."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(storage_state=state)
         try:
-            resp = await context.request.get(ADDR_LIST_URL, timeout=30_000)
-            if resp.status != 200:
-                return ()
-            text = await resp.text()
-            addrs = {m.lower() for m in _EMAIL_RE.findall(text)}
-            return tuple(sorted({addr.rpartition("@")[2] for addr in addrs if "@" in addr}))
+            return await _addresses_in(context)
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not fetch InstAddr domain list: %s", exc.__class__.__name__)
+            log.warning("could not fetch InstAddr address list: %s", exc.__class__.__name__)
             return ()
         finally:
             await browser.close()
+
+
+async def fetch_domains(state: dict) -> tuple[str, ...]:
+    """Read the domains of all addresses held by the signed-in InstAddr account."""
+    return domains_of(await fetch_addresses(state))
+
+
+async def connect_until_domain(domain: str, *, timeout_s: int = 900, poll_s: float = 3.0) -> dict:
+    """Open a visible browser on InstAddr for a person to sign in, and hand
+    back its signed-in state as soon as the account's address list holds an
+    address on ``domain`` — no key to press. Nothing is typed by the tool.
+    An empty dict when the window is closed or ``timeout_s`` passes first.
+    (A visitor who is not signed in also gets a few addresses, but only on
+    InstAddr's public domains, so waiting for the account's own domain is
+    what tells a real sign-in apart.)"""
+    wanted = (domain or "").strip().lower().lstrip("@")
+    if not wanted:
+        raise ValueError("say which domain the account holds, e.g. apmail.org")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto(HOME_URL, wait_until="domcontentloaded")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        try:
+            while loop.time() < deadline and not page.is_closed():
+                with contextlib.suppress(Exception):
+                    if wanted in await _domains_in(context):
+                        return await context.storage_state()
+                await asyncio.sleep(poll_s)
+            return {}
+        finally:
+            with contextlib.suppress(Exception):
+                await browser.close()
 
 
 async def connect_interactively(wait_for_person) -> dict:

@@ -444,14 +444,15 @@ def test_the_timeline_fallback_uses_the_last_DATED_step():
     assert order.delivery_date == datetime(2018, 10, 22)
 
 
-def test_an_invoice_link_is_absolute_when_present_and_none_when_not():
-    page = _page()
-    page.attrs[(sync._INVOICE_LINK, "href")] = "/invoice/OD111.pdf"
+def test_an_order_that_may_hold_invoices_is_pointed_at_flipkarts_invoice_api():
+    """The page has no invoice link to read (27 Nov 2026): every order is
+    pointed at the API its "Download Invoice" button calls."""
+    from app.core.invoices import invoice_api_url
 
-    assert _scrape(page)[0].invoice_url == "https://www.flipkart.com/invoice/OD111.pdf"
-    # No link at all (none was visible on a 2017-era order) -> left as None
-    # rather than guessed at.
-    assert all(o.invoice_url is None for o in _scrape(_page()))
+    scraped = _scrape(_page())
+    assert scraped
+    for order in scraped:
+        assert order.invoice_url == (invoice_api_url(order.order_id) if order.order_id else None)
 
 
 def test_an_amount_with_extra_digits_is_not_concatenated():

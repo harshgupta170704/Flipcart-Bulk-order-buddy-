@@ -252,3 +252,48 @@ def test_screener_tick_due_items_respects_enabled_and_interval(db, monkeypatch):
     # Immediately running again -> now neither is due
     assert asyncio.run(screener.tick_due_items(session_factory)) == 0
 
+
+def test_screener_check_one_reads_preview_name_and_offers(db, monkeypatch):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from app.api import screener
+    from app.automation.product import ProductPreview
+    from app.db.models import ScreenerItem
+
+    @asynccontextmanager
+    async def fake_browser_page(**_kwargs):
+        yield None, object()
+
+    async def fake_fetch(_page, url):
+        return ProductPreview(
+            url=url,
+            name="TRIGGR Trinity 2 Bluetooth",
+            price=799.0,
+            mrp=2999.0,
+            in_stock=True,
+        )
+
+    async def fake_details(_page, _preview):
+        return None
+
+    async def fake_offers(_page):
+        return ["₹759 with Bank offer", "₹40 off — Flipkart Axis", "₹40 off — Flipkart Finance"]
+
+    monkeypatch.setattr(screener, "browser_page", fake_browser_page)
+    monkeypatch.setattr(screener, "fetch_product_preview", fake_fetch)
+    monkeypatch.setattr(screener, "add_screener_details", fake_details)
+    monkeypatch.setattr(screener, "_extract_page_offers", fake_offers)
+
+    item = ScreenerItem(product_url="https://www.flipkart.com/triggr/p/itm123")
+    db.add(item)
+    db.commit()
+
+    updated = asyncio.run(screener._check_one(db, item, {"banks": [], "supercoin_offers": True, "coupon_offers": True}))
+    assert updated.last_error is None
+    assert updated.product_title == "TRIGGR Trinity 2 Bluetooth"
+    assert updated.listed_price == 799.0
+    assert updated.mrp == 2999.0
+    assert updated.net_price == 759.0
+    assert updated.best_offer in ("₹759 with Bank offer", "₹40 off — Flipkart Axis")
+
+

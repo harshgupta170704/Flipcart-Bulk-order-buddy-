@@ -37,6 +37,7 @@ from playwright.async_api import Page
 from app.automation.ordering import parse_amount
 from app.core import order_status
 from app.core import selectors as S
+from app.core.invoices import invoice_api_url
 
 log = logging.getLogger("ordering.sync")
 
@@ -695,10 +696,6 @@ async def _history_lines(page: Page) -> list[str]:
 #: 2026-10-23 — so rather than invent a class name we read the page text and
 #: require the label to be next to the digits.
 _DETAIL_TEXT = "//body"
-#: Best-effort invoice link, matched on visible wording rather than a class
-#: because none was visible to confirm. Absent on older orders; see
-#: selectors.py — ``invoice_url`` stays None instead of being guessed.
-_INVOICE_LINK = '//a[contains(translate(., "INVOCE", "invoce"), "invoice")]'
 
 #: Per-field read budget. Playwright's 30s default would turn one missing field
 #: on each of 20 rows into a ten-minute sync, and a field that is not there is
@@ -706,14 +703,6 @@ _INVOICE_LINK = '//a[contains(translate(., "INVOCE", "invoce"), "invoice")]'
 _FIELD_TIMEOUT_MS = 5_000
 #: The list itself is worth waiting for; it is one navigation per account.
 _LIST_TIMEOUT_MS = 60_000
-#: How long a page is looked at for an invoice link it should not have yet —
-#: an order on its way or cancelled. The page has rendered by then. Before
-#: 26 Oct 2026 this one read carried no budget at all, so the browser's 30 s
-#: default ran out on every such page: measured live, 30.0 s of a page's 31.4 s,
-#: and ten minutes for one account's read-back of 20 pages.
-_INVOICE_WAIT_MS = 1_500
-#: The states with no invoice to offer yet: only these get the short look.
-_NO_INVOICE_YET = frozenset({order_status.IN_TRANSIT, order_status.CANCELLED})
 #: Guard against a pathological page; a real timeline has about five steps.
 _MAX_TIMELINE_STEPS = 12
 
@@ -937,13 +926,16 @@ async def _read_detail(page: Page, order: ScrapedOrder) -> None:
     if method:
         order.payment_method = method
 
-    # A delivered order (or one whose state is unread or unfamiliar) is given
-    # the whole field budget to show its invoice link; one still on its way, a
-    # short look — its page has no link to wait for.
-    expected = order_status.classify(order.platform_status) not in _NO_INVOICE_YET
-    invoice = await _invoice_url(page, expected=expected)
-    if invoice:
-        order.invoice_url = invoice
+    # The invoices. The page has no link to read: "Download Invoice", under
+    # the collapsed Price details, is a plain div that calls Flipkart's API
+    # (mapped live 27 Nov 2026) — the old look for an <a href> never matched,
+    # so no invoice was ever fetched, and it cost up to 5 s a delivered page.
+    # Every order is pointed at that API, whatever its state: an order still
+    # "Arriving" already holds its product and fee invoices (issued at
+    # dispatch, seen live 27 Nov 2026), and a cancelled or returned one gains
+    # credit notes. How often each is asked is invoices._fetch_not_needed's.
+    if order.order_id:
+        order.invoice_url = invoice_api_url(order.order_id)
 
     # Last, as it lays a panel over the page: the dated history. Its steps are
     # dated once they have happened, which the page's own timeline is not
@@ -1033,19 +1025,6 @@ async def _reveal(page: Page, xpath: str) -> None:
     with contextlib.suppress(Exception):
         await page.wait_for_timeout(300)
 
-
-async def _invoice_url(page: Page, *, expected: bool = True) -> str | None:
-    """Absolute invoice link if the page offers one, else ``None``. Looked
-    for for the field budget, or only briefly when none is ``expected``."""
-    try:
-        href = await page.locator(f"xpath={_INVOICE_LINK}").first.get_attribute(
-            "href", timeout=_FIELD_TIMEOUT_MS if expected else _INVOICE_WAIT_MS
-        )
-    except Exception:  # noqa: BLE001 — no invoice link is normal on old orders
-        return None
-    if not href:
-        return None
-    return urljoin(page.url or S.ORDERS_URL, href)
 
 
 async def scrape_orders(

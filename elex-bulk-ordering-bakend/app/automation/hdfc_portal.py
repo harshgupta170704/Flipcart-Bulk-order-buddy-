@@ -7,7 +7,8 @@ What it does, each from the screens of the owner's recording of 21 Nov 2026:
   (app.core.sms_relay) or, failing that, from the inbox of
   ``hdfc_portal_otp_email`` (app.automation.otp). The sign-in page itself is
   not in the recording, so it is found by its fields (a password input, an OTP
-  input) rather than by fixed selectors, and a captcha stops it with a reason.
+  input) rather than by fixed selectors. A captcha on the sign-in form is
+  answered by a person on the Captchas page (app.automation.challenges).
 * **Create Virtual Card (Bulk)** (``/create-virtual-card-bulk-new``): attach
   the sheet (app.io.hdfc_bulk_csv), Submit, Confirm. "Upload Failed!" is
   answered by downloading the portal's output file and reporting its rows.
@@ -35,6 +36,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
+
+from app.automation import challenges
 
 log = logging.getLogger("ordering.hdfc_portal")
 
@@ -245,11 +248,6 @@ class PlaywrightPortal:
         await page.wait_for_load_state("networkidle", timeout=step)
         if await _signed_in(page):
             return
-        if await page.locator("img[src*='captcha' i], [id*='captcha' i], [class*='captcha' i]").count():
-            raise PortalError(
-                "the portal's sign-in asks for a captcha: press 'Sign in with captcha' on the "
-                "CorpAssist Create cards tab and type the characters shown"
-            )
 
         password = page.locator("input[type='password']").first
         try:
@@ -261,6 +259,12 @@ class PlaywrightPortal:
             user = page.locator("input[type='text'], input[type='email'], input:not([type])").first
         await user.fill(self.config.user)
         await password.fill(self.config.password)
+        # A captcha on the sign-in form is answered by a person on the
+        # Captchas page (app.automation.challenges); the form is sent below.
+        try:
+            await challenges.guard(page, site=challenges.HDFC, step="sign-in", submit=False)
+        except challenges.ChallengeFailed as exc:
+            raise PortalError(str(exc)) from None
         asked_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=5)
         if not await _click_button(page, _SUBMIT_WORDS):
             await password.press("Enter")

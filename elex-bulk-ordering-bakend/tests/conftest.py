@@ -34,6 +34,9 @@ os.environ["ORDERING_PBKDF2_ITERATIONS"] = "1000"
 # (audit F-34, 25 Oct 2026). Blank here, set by the tests that need them.
 for _name in ("ORDERING_SMTP_HOST", "ORDERING_SMTP_FROM", "ORDERING_APP_URL", "ORDERING_OTP_IMAP_HOST", "ORDERING_REDIS_URL"):
     os.environ[_name] = ""
+# Nor its browser choice: a laptop that shows its browser (false in its .env)
+# must not turn the suite's hidden default into windows on the screen.
+os.environ["ORDERING_BROWSER_HEADLESS"] = "true"
 # The signing key too: outside dev mode the shipped default stops the app's
 # start-up (audit F-31), and the suite must neither run on that default nor
 # lean on dev mode being on. Made up, and longer than HMAC-SHA256's 32 bytes.
@@ -140,6 +143,10 @@ def _kept_page_text_in_the_tests_own_folder(monkeypatch, tmp_path):
     (app.automation.sync._keep_page_text); in the suite it goes to the test's
     own folder, never into the app's real backend/diagnostics (found 26 Oct
     2026: eight test files had landed there)."""
+    from app.automation import ordering as ordering_module
     from app.automation import sync as sync_module
 
     monkeypatch.setattr(sync_module, "DIAGNOSTICS_DIR", str(tmp_path / "diagnostics"))
+    # The bank step's record (24 Nov 2026) too: a card run that does not
+    # confirm writes one, and the suite runs many.
+    monkeypatch.setattr(ordering_module, "DIAGNOSTICS_DIR", tmp_path / "diagnostics")

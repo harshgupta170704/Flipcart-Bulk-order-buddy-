@@ -41,6 +41,7 @@ import { UnitRequestDialog, type UnitRequestDraft } from "../components/UnitRequ
 import { UploadInvoices } from "../components/UploadInvoices";
 import { UploadOrderIds } from "../components/UploadOrderIds";
 import { UploadOrderReport } from "../components/UploadOrderReport";
+import { FillMultiTrack } from "../components/FillMultiTrack";
 import { AllTasksView, BatchRequestsView } from "../components/OrderUnitsSubViews";
 import { useDismiss } from "../components/useDismiss";
 
@@ -387,6 +388,7 @@ export default function OrderUnits({ embedded = false }: { embedded?: boolean } 
   const [syncOpen, setSyncOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [multiTrackOpen, setMultiTrackOpen] = useState(false);
   const [invoicesOpen, setInvoicesOpen] = useState(false);
   const { toasts, push, dismiss } = useToasts();
   const requestNo = useRef(0);
@@ -776,6 +778,14 @@ export default function OrderUnits({ embedded = false }: { embedded?: boolean } 
             <Button size="sm" variant="secondary" onClick={() => setReportOpen((o) => !o)} aria-expanded={reportOpen}>
               {reportOpen ? "Hide order report" : "Upload order report"}
             </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setMultiTrackOpen((o) => !o)}
+              aria-expanded={multiTrackOpen}
+            >
+              {multiTrackOpen ? "Hide multi-track" : "Fill multi-track sheet"}
+            </Button>
             <Button size="sm" variant="secondary" onClick={() => setInvoicesOpen((o) => !o)} aria-expanded={invoicesOpen}>
               {invoicesOpen ? "Hide invoices" : "Upload invoices"}
             </Button>
@@ -791,6 +801,7 @@ export default function OrderUnits({ embedded = false }: { embedded?: boolean } 
 
       {uploadOpen ? <UploadOrderIds onChanged={reload} blocked={runActive} /> : null}
       {reportOpen ? <UploadOrderReport onChanged={reload} /> : null}
+      {multiTrackOpen ? <FillMultiTrack /> : null}
       {invoicesOpen ? <UploadInvoices onChanged={reload} /> : null}
       {syncOpen ? <SyncPanel onSynced={reload} blocked={runActive} /> : null}
 

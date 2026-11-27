@@ -29,7 +29,11 @@ export interface OrderPreviewPanelProps {
   phones: number;
   useAddressPhone: boolean;
   excludeDays?: number | null;
-  smartSelection?: boolean;
+  /** The Smart ID Selection switch: set aside the IDs that cannot buy. */
+  smartId?: boolean;
+  /** "Spread orders across accounts" (sent as smart_selection). */
+  spreadOrders?: boolean;
+  skipBought?: boolean;
   /** Card filters in words, e.g. ["cooldown 3 days", "max 2 per card"]. */
   cardRules?: string[];
   /** The chosen address and the GST the run bills under, as the picker resolved them. */
@@ -149,8 +153,10 @@ export function OrderPreviewPanel(props: OrderPreviewPanelProps) {
           {props.maxDeliveryDays.trim() ? <Row label="Max Delivery Days">{props.maxDeliveryDays}</Row> : null}
           <Row label="Mode">{props.qtyMode === "minimum" ? "Minimum" : "Upto"}</Row>
           <Row label="Email IDs">{formatCount(props.accounts)}</Row>
-          <Row label="Smart ID">{props.smartSelection ? "Enabled" : "Disabled"}</Row>
+          <Row label="Smart ID">{props.smartId ? "Enabled" : "Disabled"}</Row>
+          <Row label="Spread across accounts">{props.spreadOrders ? "On" : "Off"}</Row>
           {props.excludeDays ? <Row label="Exclude IDs">ordered in {props.excludeDays} days</Row> : null}
+          {props.skipBought ? <Row label="Skip IDs">already bought this product</Row> : null}
           {props.gstMandatory ? <Row label="GST Mandatory">Yes</Row> : null}
           {phoneText ? <Row label="Phone">{phoneText}</Row> : null}
           {seller ? <Row label="Seller">{seller}</Row> : null}

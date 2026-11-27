@@ -821,6 +821,9 @@ export function OrderDetail({ order, onClose, onSettled, onRefreshed }: OrderDet
               <Row label="Pincode">{text(order.pin)}</Row>
               <Row label="Brand">{text(order.brand)}</Row>
               <Row label="Category">{text(order.category)}</Row>
+              <Row label="Product ID">
+                {order.product_id ? <span className="font-mono">{order.product_id}</span> : text(null)}
+              </Row>
               <Row label="Invoices">
                 <Invoices order={order} />
               </Row>

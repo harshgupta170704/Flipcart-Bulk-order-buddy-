@@ -137,3 +137,108 @@ def test_no_gstin_means_no_click():
     clicks, filled, shown = asyncio.run(_run(_page(), GstInfo(gstin="", business_name="")))
 
     assert clicks == [] and filled is None and shown is None
+
+
+def test_gst_invoice_change_button_adds_and_switches_from_another_gstin():
+    """Mapped live 23 Nov 2026: when another GSTIN is pre-selected, Flipkart
+    shows 'GST Invoice' + 'Change' (no 'Use GST Invoice' checkbox), opening
+    'Select GST Details' with 'Add new GST Details' and 'Confirm and Use'."""
+    html = """<!doctype html><html><body>
+    <div><div>Deliver to:</div><div>Change</div></div>
+    <div id="gst-block">
+      <div>GST Invoice</div>
+      <div id="gst-change" style="cursor:pointer" onclick="window.clicks.push('change'); document.getElementById('drawer').style.display='block'">Change</div>
+      <div id="billed">09AALCK2977Q1ZG KIKAKU EXIM PRIVATE LIMITED</div>
+    </div>
+    <div id="drawer" style="display:none">
+      <div>Select GST Details</div>
+      <div>09AALCK2977Q1ZG</div>
+      <div id="add-new" style="cursor:pointer" onclick="window.clicks.push('add_new'); document.getElementById('form').style.display='block'">Add new GST Details</div>
+      <div id="form" style="display:none">
+        <input maxlength="15" autocapitalize="characters" id="gstin">
+        <input maxlength="60" id="bname">
+        <div id="save" style="cursor:pointer" onclick="window.clicks.push('save'); window.filled=[document.getElementById('gstin').value, document.getElementById('bname').value]; document.getElementById('form').style.display='none'; document.getElementById('saved-new').textContent=window.filled[0];">Confirm and Save</div>
+      </div>
+      <div id="saved-new" style="cursor:pointer" onclick="window.clicks.push('pick_new')"></div>
+      <div id="use" style="cursor:pointer" onclick="window.clicks.push('use'); document.getElementById('drawer').style.display='none'; document.getElementById('billed').textContent = window.filled[0] + ' ' + window.filled[1]">Confirm and Use</div>
+    </div>
+    <script>window.clicks = [];</script>
+    </body></html>"""
+    clicks, filled, shown = asyncio.run(_run(html))
+
+    assert "change" in clicks and "add_new" in clicks and "save" in clicks and "use" in clicks
+    assert filled == [GSTIN, "TRANSPARENT DEALS"]
+    assert shown == GSTIN
+
+
+def test_apply_product_coupons_uses_real_click_and_ignores_exchange_and_bank():
+    from playwright.async_api import async_playwright
+
+    html = """<!doctype html><html><body>
+    <div id="coupon-tile"><div>Coupons</div><div>₹500 off</div><div id="c-apply" style="cursor:pointer">Apply</div></div>
+    <div id="exchange-tile"><div>Exchange offer</div><div>Up to ₹15,000</div><div id="e-apply" style="cursor:pointer">Apply</div></div>
+    <div id="bank-tile"><div>Bank offer</div><div>HDFC Credit Card</div><div id="b-apply" style="cursor:pointer">Apply</div></div>
+    <script>
+      window.clicked = [];
+      document.getElementById('c-apply').addEventListener('click', (e) => {
+        if (!e.isTrusted) return; // proves real Playwright click, not synthetic el.click()
+        window.clicked.push('coupon');
+        e.target.textContent = 'Remove';
+      });
+      document.getElementById('e-apply').addEventListener('click', () => window.clicked.push('exchange'));
+      document.getElementById('b-apply').addEventListener('click', () => window.clicked.push('bank'));
+    </script>
+    </body></html>"""
+
+    async def _run_coupon():
+        async with async_playwright() as pw:
+            try:
+                browser = await pw.chromium.launch(headless=True)
+            except Exception as exc:  # noqa: BLE001
+                pytest.skip(f"Chromium cannot start here: {exc}")
+            try:
+                page = await browser.new_page()
+                await page.route("**/*", lambda route: route.abort())
+                await page.set_content(html)
+                result = await ordering.apply_product_coupons(page)
+                clicked = await page.evaluate("window.clicked")
+                return result, clicked
+            finally:
+                await browser.close()
+
+    result, clicked = asyncio.run(_run_coupon())
+    assert result.applied == ["₹500 off"]
+    assert clicked == ["coupon"]
+
+
+def test_type_bank_password_falls_back_to_enter_when_submit_is_hidden():
+    from playwright.async_api import async_playwright
+
+    html = """<!doctype html><html><body>
+    <form id="f" onsubmit="event.preventDefault(); window.submitted = document.getElementById('pw').value;">
+      <input id="pw" type="password">
+      <input type="submit" style="display:none" value="Submit">
+    </form>
+    <script>window.submitted = null;</script>
+    </body></html>"""
+
+    async def _run_pw():
+        async with async_playwright() as pw:
+            try:
+                browser = await pw.chromium.launch(headless=True)
+            except Exception as exc:  # noqa: BLE001
+                pytest.skip(f"Chromium cannot start here: {exc}")
+            try:
+                page = await browser.new_page()
+                await page.route("**/*", lambda route: route.abort())
+                await page.set_content(html)
+                err = await ordering._type_bank_password(page, page.locator("#pw"), "0123456")
+                submitted = await page.evaluate("window.submitted")
+                return err, submitted
+            finally:
+                await browser.close()
+
+    err, submitted = asyncio.run(_run_pw())
+    assert err is None
+    assert submitted == "0123456"
+

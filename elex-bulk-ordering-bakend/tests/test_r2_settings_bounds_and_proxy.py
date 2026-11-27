@@ -22,9 +22,7 @@ def test_a_proxy_sent_back_as_it_was_shown_keeps_the_saved_sign_in(db):
     assert shown == "http://***@proxy.example:8000"
 
     # The Performance card's Save, as the page sent it: every field, the proxy as shown.
-    app_settings.set_overrides(
-        db, {"max_concurrency": 6, "browser_headless": True, "proxy_server": shown, "sync_every_hours": 0}
-    )
+    app_settings.set_overrides(db, {"max_concurrency": 6, "proxy_server": shown, "sync_every_hours": 0})
 
     effective = app_settings.get_effective(db)
     assert effective["proxy_server"] == REAL

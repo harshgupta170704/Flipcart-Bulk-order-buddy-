@@ -2,38 +2,18 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   actOnHdfcChildCards,
   addHdfcUserId,
-  cancelHdfcBatch,
-  createHdfcBatch,
   deleteHdfcUserId,
-  downloadHdfcBatchSheet,
   downloadHdfcChildCards,
   errorMessage,
   fetchHdfcCards,
-  getHdfcPortal,
-  listHdfcBatches,
+  getHdfcNetSafe,
   listHdfcChildCards,
   listHdfcUserIds,
-  retryHdfcBatch,
-  startHdfcCaptcha,
-  submitHdfcCaptcha,
-  submitHdfcOtp,
-  syncHdfcPortalUsers,
-  pointHdfcUserEmail,
-  testHdfcPortalLogin,
+  retryHdfcChildCards,
   updateHdfcUserId,
 } from "../lib/api";
-import { formatCurrency, formatDateTime, formatNumber } from "../lib/format";
-import type {
-  HdfcBatch,
-  HdfcBatchSend,
-  HdfcBatchStatus,
-  HdfcCardFilters,
-  HdfcChildCard,
-  HdfcFetchResult,
-  HdfcPortalStatus,
-  HdfcPortalTestResult,
-  HdfcUserId,
-} from "../lib/types";
+import { formatCurrency, formatDateTime } from "../lib/format";
+import type { HdfcCardFilters, HdfcChildCard, HdfcFetchResult, HdfcFetchStatus, HdfcNetSafeStatus, HdfcUserId } from "../lib/types";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -42,11 +22,10 @@ import { Field, NumberInput, Select, TextInput } from "../components/Field";
 import { StatusBadge } from "../components/StatusBadge";
 import { Table, type Column } from "../components/Table";
 
-type Tab = "users" | "create" | "cards";
+type Tab = "users" | "cards";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "users", label: "User IDs" },
-  { id: "create", label: "Create cards" },
   { id: "cards", label: "Child cards" },
 ];
 
@@ -71,20 +50,14 @@ function fetchSummary(results: HdfcFetchResult[]): string {
 
 /* --- User IDs ------------------------------------------------------------- */
 
-const AAN_LABEL = "Aan (parent card's Alternate A/c No.)";
-const AAN_HELP = "From HDFC's Card Relationship page. HDFC needs it to create cards.";
-const PORTAL_ID_LABEL = "HDFC Virtual Card User ID";
-
 interface UserDraft {
   username: string;
   email: string;
   mobile: string;
   parent: string;
-  aan: string;
-  portalUserId: string;
 }
 
-const EMPTY_DRAFT: UserDraft = { username: "", email: "", mobile: "", parent: "", aan: "", portalUserId: "" };
+const EMPTY_DRAFT: UserDraft = { username: "", email: "", mobile: "", parent: "" };
 
 /** Edit one user id. The parent card is sent only when typed, since only its last four digits are kept. */
 function EditUserIdDialog({ row, onClose, onSaved }: { row: HdfcUserId | null; onClose: () => void; onSaved: () => void }) {
@@ -99,8 +72,6 @@ function EditUserIdDialog({ row, onClose, onSaved }: { row: HdfcUserId | null; o
       email: row.email,
       mobile: row.mobile ?? "",
       parent: "",
-      aan: row.aan ?? "",
-      portalUserId: row.portal_user_id ?? "",
     });
     setError(null);
   }, [row]);
@@ -116,8 +87,6 @@ function EditUserIdDialog({ row, onClose, onSaved }: { row: HdfcUserId | null; o
         email: draft.email.trim(),
         mobile: draft.mobile.trim() || null,
         ...(draft.parent.trim() ? { parent_card: draft.parent.trim() } : {}),
-        aan: draft.aan.trim() || null,
-        portal_user_id: draft.portalUserId.trim() || null,
       });
       onSaved();
       onClose();
@@ -172,23 +141,12 @@ function EditUserIdDialog({ row, onClose, onSaved }: { row: HdfcUserId | null; o
         >
           <TextInput inputMode="numeric" autoComplete="off" value={draft.parent} onChange={(e) => setDraft({ ...draft, parent: e.target.value })} />
         </Field>
-        <Field label={AAN_LABEL} help={AAN_HELP}>
-          <TextInput inputMode="numeric" autoComplete="off" value={draft.aan} onChange={(e) => setDraft({ ...draft, aan: e.target.value })} />
-        </Field>
-        <Field label={PORTAL_ID_LABEL}>
-          <TextInput
-            autoComplete="off"
-            value={draft.portalUserId}
-            maxLength={64}
-            onChange={(e) => setDraft({ ...draft, portalUserId: e.target.value })}
-          />
-        </Field>
       </form>
     </Dialog>
   );
 }
 
-function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPortalStatus | null }) {
+function UserIds({ onFetched }: { onFetched: () => void }) {
   const [rows, setRows] = useState<HdfcUserId[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -196,7 +154,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
   const [draft, setDraft] = useState<UserDraft>(EMPTY_DRAFT);
   const [saving, setSaving] = useState(false);
   const [fetching, setFetching] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [editing, setEditing] = useState<HdfcUserId | null>(null);
 
   const load = useCallback(async () => {
@@ -222,8 +179,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
         email: draft.email.trim(),
         mobile: draft.mobile.trim() || null,
         parent_card: draft.parent.trim() || null,
-        aan: draft.aan.trim() || null,
-        portal_user_id: draft.portalUserId.trim() || null,
       });
       setDraft(EMPTY_DRAFT);
       await load();
@@ -251,21 +206,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
     }
   };
 
-  const syncFromHdfc = async () => {
-    setSyncing(true);
-    setNotice(null);
-    setError(null);
-    try {
-      const result = await syncHdfcPortalUsers();
-      setNotice(`${result.added} added, ${result.updated} updated.`);
-      await load();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setSyncing(false);
-    }
-  };
-
   const all = rows ?? [];
   const columns: Column<HdfcUserId>[] = [
     {
@@ -284,7 +224,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
     { key: "email", header: "Email" },
     { key: "mobile", header: "Mobile" },
     { key: "parent_card_last4", header: "Parent card", render: (row) => (row.parent_card_last4 ? `•••• ${row.parent_card_last4}` : "—") },
-    { key: "aan", header: "Aan", render: (row) => (row.aan ? <span className="font-mono tabular-nums">{row.aan}</span> : "—") },
     { key: "card_count", header: "Child cards", numeric: true },
     {
       key: "active",
@@ -325,23 +264,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
           <Button size="sm" variant="ghost" onClick={() => setEditing(row)}>
             Edit
           </Button>
-          {portal?.configured ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                if (!window.confirm(`Change ${row.username}'s email on the HDFC portal to ${row.email}? HDFC then mails its cards there.`)) return;
-                setNotice(null);
-                setError(null);
-                void pointHdfcUserEmail(row.id).then(
-                  () => setNotice(`${row.username}'s email on HDFC is now ${row.email}.`),
-                  (err) => setError(errorMessage(err)),
-                );
-              }}
-            >
-              Set email on HDFC
-            </Button>
-          ) : null}
           <Button
             size="sm"
             variant="ghost"
@@ -370,7 +292,7 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
           <Field label="Username" required>
             <TextInput value={draft.username} maxLength={64} onChange={(e) => setDraft({ ...draft, username: e.target.value })} />
           </Field>
-          <Field label="Email" required help="The address HDFC mails this user's child cards to. It must reach the shared inbox.">
+          <Field label="Email" required help="The address HDFC mails this user's child cards to. The app must be able to read that inbox.">
             <TextInput type="email" value={draft.email} onChange={(e) => setDraft({ ...draft, email: e.target.value })} />
           </Field>
           <Field label="Mobile">
@@ -378,17 +300,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
           </Field>
           <Field label="Parent card" help="Only its last four digits are saved.">
             <TextInput inputMode="numeric" autoComplete="off" value={draft.parent} onChange={(e) => setDraft({ ...draft, parent: e.target.value })} />
-          </Field>
-          <Field label={AAN_LABEL} help={AAN_HELP}>
-            <TextInput inputMode="numeric" autoComplete="off" value={draft.aan} onChange={(e) => setDraft({ ...draft, aan: e.target.value })} />
-          </Field>
-          <Field label={PORTAL_ID_LABEL}>
-            <TextInput
-              autoComplete="off"
-              value={draft.portalUserId}
-              maxLength={64}
-              onChange={(e) => setDraft({ ...draft, portalUserId: e.target.value })}
-            />
           </Field>
           <div className="flex items-end">
             <Button type="submit" variant="primary" loading={saving} disabled={!draft.username.trim() || !draft.email.trim()}>
@@ -402,11 +313,6 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
         title="User IDs"
         actions={
           <div className="flex gap-2">
-            {portal?.configured ? (
-              <Button size="sm" loading={syncing} onClick={() => void syncFromHdfc()}>
-                Sync from HDFC
-              </Button>
-            ) : null}
             <Button size="sm" loading={fetching} disabled={selected.size === 0} onClick={() => void runFetch([...selected])}>
               Fetch selected
             </Button>
@@ -423,421 +329,50 @@ function UserIds({ onFetched, portal }: { onFetched: () => void; portal: HdfcPor
   );
 }
 
-/* --- Create cards ---------------------------------------------------------- */
-
-const LIMITS = {
-  amount: [1, 10_000_000],
-  count: [1, 500],
-  days: [1, 365],
-} as const satisfies Record<string, readonly [number, number]>;
-/** The most cards one batch may ask for, across every user id. */
-const MAX_CARDS = 1000;
-/** How often the batches list refreshes while one is still sending or waiting. */
-const POLL_MS = 10_000;
-
-/** A batch status drawn with the shared status badge's look. */
-const BATCH_BADGE: Record<HdfcBatchStatus, { status: string; label: string }> = {
-  sending: { status: "running", label: "Sending" },
-  waiting: { status: "pending", label: "Waiting for cards" },
-  done: { status: "done", label: "Done" },
-  failed: { status: "failed", label: "Failed" },
-  cancelled: { status: "cancelled_by_user", label: "Cancelled" },
-};
-
-function isOpen(batch: HdfcBatch): boolean {
-  return batch.status === "sending" || batch.status === "waiting";
-}
-
-/** The whole number typed, or null when it is empty, not whole, or out of range. */
-function inRange(text: string, [min, max]: readonly [number, number]): number | null {
-  const value = Number(text);
-  if (text.trim() === "" || !Number.isInteger(value) || value < min || value > max) return null;
-  return value;
-}
-
-/** Distinct values across a batch's rows, e.g. "₹5,000" or "₹5,000, ₹10,000". */
-function distinct(values: number[], show: (value: number) => string): string {
-  return [...new Set(values)].map(show).join(", ") || "—";
-}
-
-function PortalLine({ portal, error }: { portal: HdfcPortalStatus | null; error: string | null }) {
-  const [testing, setTesting] = useState(false);
-  const [result, setResult] = useState<HdfcPortalTestResult | null>(null);
-  // The captcha sign-in: HDFC's captcha is shown to a person, never solved by code.
-  const [captcha, setCaptcha] = useState<{ image: string } | null>(null);
-  const [step, setStep] = useState<"captcha" | "otp">("captcha");
-  const [typed, setTyped] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [dialogError, setDialogError] = useState<string | null>(null);
-
-  const openCaptcha = async () => {
-    setBusy(true);
-    setDialogError(null);
-    setTyped("");
-    setStep("captcha");
-    try {
-      setCaptcha(await startHdfcCaptcha());
-    } catch (err) {
-      setResult({ ok: false, detail: errorMessage(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const closeCaptcha = () => {
-    setCaptcha(null);
-    setTyped("");
-    setDialogError(null);
-  };
-
-  const submitTyped = async () => {
-    setBusy(true);
-    setDialogError(null);
-    try {
-      if (step === "captcha") {
-        const answer = await submitHdfcCaptcha(typed.trim());
-        if (answer.needs_otp) {
-          setStep("otp");
-          setTyped("");
-        } else if (answer.ok) {
-          setResult(answer);
-          closeCaptcha();
-        } else {
-          setDialogError(answer.detail);
-        }
-      } else {
-        const answer = await submitHdfcOtp(typed.trim());
-        if (answer.ok) {
-          setResult(answer);
-          closeCaptcha();
-        } else {
-          setDialogError(answer.detail);
-        }
-      }
-    } catch (err) {
-      setDialogError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (error) return <Alert tone="error">{error}</Alert>;
-  if (!portal) return null;
-  if (!portal.configured) {
-    return (
-      <Alert tone="info">
-        HDFC portal not set up: download the sheet and upload it on HDFC's Create Virtual Card (Bulk) page yourself.
-      </Alert>
-    );
-  }
-
-  const test = async () => {
-    setTesting(true);
-    setResult(null);
-    try {
-      setResult(await testHdfcPortalLogin());
-    } catch (err) {
-      setResult({ ok: false, detail: errorMessage(err) });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const signedIn = `HDFC portal: signed in as ${portal.user_hint ?? "—"}`;
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-start gap-3">
-        <div className="min-w-0 flex-1">
-          {portal.otp_ready ? (
-            <Alert tone="success">
-              {signedIn}, OTP via {portal.otp_via ?? "—"}
-            </Alert>
-          ) : (
-            <Alert tone="warning">
-              {signedIn}, but its OTP can't be read: {portal.otp_detail ?? "no way to read it is set up."}
-            </Alert>
-          )}
-        </div>
-        <Button size="sm" variant="secondary" loading={busy && !captcha} onClick={() => void openCaptcha()}>
-          Sign in with captcha
-        </Button>
-        <Button size="sm" loading={testing} onClick={() => void test()}>
-          Test sign-in
-        </Button>
-      </div>
-      {portal.last_error ? <p className="text-[12px] text-ink-2">Last portal error: {portal.last_error}</p> : null}
-      {result ? <Alert tone={result.ok ? "success" : "error"}>{result.detail}</Alert> : null}
-      <Dialog
-        open={captcha !== null}
-        title={step === "captcha" ? "Sign in to HDFC CorpAssist" : "Enter HDFC's OTP"}
-        description={
-          step === "captcha"
-            ? "HDFC asks for this captcha on every sign-in. Type the 6 characters shown; your user and password are already filled."
-            : "HDFC sent an OTP to the number or email on the portal user. Type it here."
-        }
-        onClose={closeCaptcha}
-        width="420px"
-        footer={
-          <>
-            <Button variant="secondary" onClick={closeCaptcha}>
-              Cancel
-            </Button>
-            <Button
-              loading={busy}
-              disabled={typed.trim().length < (step === "captcha" ? 6 : 4)}
-              onClick={() => void submitTyped()}
-            >
-              {step === "captcha" ? "Sign in" : "Submit OTP"}
-            </Button>
-          </>
-        }
-      >
-        <div className="flex flex-col gap-3">
-          {step === "captcha" && captcha ? (
-            <img src={captcha.image} alt="HDFC captcha" className="h-12 self-start rounded border border-line bg-white" />
-          ) : null}
-          <Field label={step === "captcha" ? "Captcha" : "OTP"}>
-            <TextInput
-              value={typed}
-              autoFocus
-              autoComplete="off"
-              maxLength={step === "captcha" ? 6 : 8}
-              inputMode={step === "captcha" ? "text" : "numeric"}
-              onChange={(e) => setTyped(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && typed.trim().length >= (step === "captcha" ? 6 : 4)) void submitTyped();
-              }}
-            />
-          </Field>
-          {dialogError ? <Alert tone="error">{dialogError}</Alert> : null}
-          {dialogError && step === "captcha" ? (
-            <Button size="sm" variant="secondary" onClick={() => void openCaptcha()}>
-              Get a new captcha
-            </Button>
-          ) : null}
-        </div>
-      </Dialog>
-    </div>
-  );
-}
-
-function CreateCards({ portal, portalError }: { portal: HdfcPortalStatus | null; portalError: string | null }) {
-  const [users, setUsers] = useState<HdfcUserId[] | null>(null);
-  const [batches, setBatches] = useState<HdfcBatch[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [amount, setAmount] = useState("1");
-  const [count, setCount] = useState("1");
-  const [days, setDays] = useState("7");
-  const [sending, setSending] = useState<HdfcBatchSend | null>(null);
-  const [report, setReport] = useState<HdfcBatch | null>(null);
-
-  const loadBatches = useCallback(async () => {
-    try {
-      setBatches(await listHdfcBatches());
-    } catch (err) {
-      setError(errorMessage(err));
-    }
-  }, []);
-
-  useEffect(() => {
-    void listHdfcUserIds().then(setUsers, (err) => setError(errorMessage(err)));
-    void loadBatches();
-  }, [loadBatches]);
-
-  const polling = (batches ?? []).some(isOpen);
-  useEffect(() => {
-    if (!polling) return;
-    const handle = window.setInterval(() => void loadBatches(), POLL_MS);
-    return () => window.clearInterval(handle);
-  }, [polling, loadBatches]);
-
-  const active = (users ?? []).filter((u) => u.active);
-  const chosen = active.filter((u) => selected.has(u.id));
-  const noAan = chosen.filter((u) => !u.aan);
-  const amountN = inRange(amount, LIMITS.amount);
-  const countN = inRange(count, LIMITS.count);
-  const daysN = inRange(days, LIMITS.days);
-  const totalCards = countN ? chosen.length * countN : 0;
-  const tooMany = totalCards > MAX_CARDS;
-  const ready = chosen.length > 0 && amountN !== null && countN !== null && daysN !== null && !tooMany;
-
-  const create = async (send: HdfcBatchSend) => {
-    if (!ready || amountN === null || countN === null || daysN === null) return;
-    setSending(send);
-    setError(null);
-    setNotice(null);
-    try {
-      const batch = await createHdfcBatch(
-        chosen.map((u) => ({ user_id: u.id, amount: amountN, count: countN, valid_days: daysN })),
-        send,
-      );
-      setSelected(new Set());
-      if (send === "download") {
-        await downloadHdfcBatchSheet(batch.id);
-        setNotice(`Sheet for ${batch.card_count} card(s) downloaded. Upload it on HDFC's Create Virtual Card (Bulk) page.`);
-      } else {
-        setNotice(`Sending ${batch.card_count} card(s) to HDFC. Each card is read from HDFC's email as it arrives.`);
-      }
-      await loadBatches();
-    } catch (err) {
-      setError(errorMessage(err));
-      void loadBatches();
-    } finally {
-      setSending(null);
-    }
-  };
-
-  const act = (run: () => Promise<unknown>) => {
-    setError(null);
-    void run().then(loadBatches, (err) => setError(errorMessage(err)));
-  };
-
-  const columns: Column<HdfcBatch>[] = [
-    { key: "created_at", header: "Created", render: (row) => formatDateTime(row.created_at) },
-    { key: "users", header: "Users", render: (row) => row.rows.map((r) => r.username).join(", ") || "—" },
-    { key: "cards", header: "Cards", numeric: true, render: (row) => `${row.cards_received}/${row.card_count}` },
-    { key: "amount", header: "Amount", numeric: true, render: (row) => distinct(row.rows.map((r) => r.amount), formatCurrency) },
-    { key: "valid_days", header: "Valid days", numeric: true, render: (row) => distinct(row.rows.map((r) => r.valid_days), String) },
-    { key: "send", header: "Send", render: (row) => (row.send === "portal" ? "HDFC portal" : "Sheet") },
-    {
-      key: "status",
-      header: "Status",
-      render: (row) => <StatusBadge status={BATCH_BADGE[row.status]?.status ?? row.status} label={BATCH_BADGE[row.status]?.label} />,
-    },
-    { key: "error", header: "Error", render: (row) => (row.error ? <span className="text-critical">{row.error}</span> : "—") },
-    {
-      key: "actions",
-      header: "",
-      sticky: "right",
-      render: (row) => (
-        <div className="flex gap-1">
-          <Button size="sm" variant="ghost" aria-label={`CSV of batch ${row.id}`} onClick={() => act(() => downloadHdfcBatchSheet(row.id))}>
-            CSV
-          </Button>
-          {row.portal_report ? (
-            <Button size="sm" variant="ghost" onClick={() => setReport(row)}>
-              Report
-            </Button>
-          ) : null}
-          {row.status === "failed" && row.send === "portal" ? (
-            <Button size="sm" variant="ghost" onClick={() => act(() => retryHdfcBatch(row.id))}>
-              Retry
-            </Button>
-          ) : null}
-          {isOpen(row) ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => {
-                if (!window.confirm("Stop waiting for this batch's cards?")) return;
-                act(() => cancelHdfcBatch(row.id));
-              }}
-            >
-              Cancel
-            </Button>
-          ) : null}
-        </div>
-      ),
-    },
-  ];
-
-  return (
-    <div className="flex flex-col gap-5">
-      <PortalLine portal={portal} error={portalError} />
-      {error ? <Alert tone="error">{error}</Alert> : null}
-      {notice ? <Alert tone="success">{notice}</Alert> : null}
-      <Card title="Create cards" description="Ask HDFC for new virtual cards: each selected user id gets this many cards of this amount.">
-        <div className="flex flex-col gap-4">
-          <fieldset className="flex flex-col gap-2">
-            <legend className="mb-1.5 text-[13px] font-medium text-ink">User ids</legend>
-            {users === null ? (
-              <p className="text-[13px] text-ink-2">Loading…</p>
-            ) : active.length === 0 ? (
-              <p className="text-[13px] text-ink-2">No active user ids. Add one on the User IDs tab.</p>
-            ) : (
-              <>
-                <label className="flex items-center gap-2 text-[13px] font-medium text-ink">
-                  <SelectBox
-                    label="Select all"
-                    checked={chosen.length === active.length}
-                    onChange={(on) => setSelected(on ? new Set(active.map((u) => u.id)) : new Set())}
-                  />
-                  Select all
-                </label>
-                <div className="grid max-h-56 gap-1.5 overflow-y-auto rounded-control border border-line p-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {active.map((u) => (
-                    <label key={u.id} className="flex min-w-0 items-center gap-2 text-[13px] text-ink">
-                      <SelectBox label={`Create for ${u.username}`} checked={selected.has(u.id)} onChange={(on) => setSelected((s) => toggle(s, u.id, on))} />
-                      <span className="truncate">{u.username}</span>
-                      {u.aan ? null : <span className="shrink-0 text-[12px] text-ink-2">(no Aan)</span>}
-                    </label>
-                  ))}
-                </div>
-              </>
-            )}
-          </fieldset>
-          {noAan.length ? (
-            <Alert tone="warning">
-              {noAan.map((u) => u.username).join(", ")} {noAan.length === 1 ? "has" : "have"} no Aan (parent card's Alternate
-              A/c No.), so HDFC will refuse {noAan.length === 1 ? "its" : "their"} cards. Add it on the User IDs tab first.
-            </Alert>
-          ) : null}
-          <div className="grid gap-3 sm:grid-cols-3">
-            <Field label="Amount (₹)" required error={amount && amountN === null ? "Whole rupees, 1 to 1,00,00,000." : undefined}>
-              <NumberInput min={LIMITS.amount[0]} max={LIMITS.amount[1]} step={1} value={amount} onChange={(e) => setAmount(e.target.value)} />
-            </Field>
-            <Field label="Cards per user id" required error={count && countN === null ? "1 to 500." : undefined}>
-              <NumberInput min={LIMITS.count[0]} max={LIMITS.count[1]} step={1} value={count} onChange={(e) => setCount(e.target.value)} />
-            </Field>
-            <Field label="Valid for days" required error={days && daysN === null ? "1 to 365." : undefined}>
-              <NumberInput min={LIMITS.days[0]} max={LIMITS.days[1]} step={1} value={days} onChange={(e) => setDays(e.target.value)} />
-            </Field>
-          </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <p className="text-[13px] font-medium text-ink" aria-live="polite">
-              Total: {formatNumber(totalCards)} card{totalCards === 1 ? "" : "s"}, {formatCurrency(amountN ? totalCards * amountN : 0)}
-            </p>
-            {tooMany ? <p className="text-[12px] text-critical">At most {MAX_CARDS} cards in one batch.</p> : null}
-            <div className="ml-auto flex flex-wrap gap-2">
-              <Button loading={sending === "download"} disabled={!ready || sending !== null} onClick={() => void create("download")}>
-                Download HDFC sheet
-              </Button>
-              <Button
-                variant="primary"
-                loading={sending === "portal"}
-                disabled={!ready || sending !== null || !portal?.configured}
-                title={portal?.configured ? undefined : "The HDFC portal sign-in is not set up."}
-                onClick={() => void create("portal")}
-              >
-                Create on HDFC
-              </Button>
-            </div>
-          </div>
-        </div>
-      </Card>
-      <Card flush title={`Batches${batches ? ` (${batches.length})` : ""}`}>
-        <Table
-          caption="HDFC card batches"
-          columns={columns}
-          rows={batches ?? []}
-          rowKey={(row) => row.id}
-          dense
-          minWidth="1100px"
-          empty="No batches yet."
-        />
-      </Card>
-      <Dialog open={report !== null} title="HDFC portal report" onClose={() => setReport(null)} width="720px">
-        <pre className="whitespace-pre-wrap break-words font-mono text-[12px] text-ink">{report?.portal_report}</pre>
-      </Dialog>
-    </div>
-  );
-}
-
 /* --- Child cards ---------------------------------------------------------- */
 
-const NO_FILTERS: HdfcCardFilters = { status: "", min_remaining: "", created_from: "", created_to: "", search: "" };
+const NO_FILTERS: HdfcCardFilters = {
+  status: "",
+  fetch_status: "",
+  min_remaining: "",
+  created_from: "",
+  created_to: "",
+  search: "",
+};
+
+/** How often the list refreshes while a card is still being read from NetSafe. */
+const NETSAFE_POLL_MS = 10_000;
+
+const FETCH_LABEL: Record<HdfcFetchStatus, string> = {
+  pending: "Pending",
+  in_progress: "In progress",
+  completed: "Completed",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
+/** Cards NetSafe may still read: Cancel stops them. */
+function isReading(row: HdfcChildCard): boolean {
+  return row.fetch_status === "pending" || row.fetch_status === "in_progress";
+}
+
+/** Cards Retry reads again. */
+function canRetry(row: HdfcChildCard): boolean {
+  return row.fetch_status === "failed" || row.fetch_status === "cancelled";
+}
+
+function FetchStatus({ row }: { row: HdfcChildCard }) {
+  // "In progress" shows the running spinner; the rest use their own look.
+  const look =
+    row.fetch_status === "in_progress" ? "running" : row.fetch_status === "cancelled" ? "cancelled_by_user" : row.fetch_status;
+  return <StatusBadge status={look} label={FETCH_LABEL[row.fetch_status]} />;
+}
+
+/** The number once read; until then the last four digits NetSafe's email gave. */
+function cardLabel(row: HdfcChildCard): string {
+  if (row.card_number) return row.card_number;
+  return row.card_last4 ? `•••• ${row.card_last4}` : "—";
+}
 
 function ChildCards({ reloadKey }: { reloadKey: number }) {
   const [rows, setRows] = useState<HdfcChildCard[] | null>(null);
@@ -845,10 +380,13 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
   const [filters, setFilters] = useState<HdfcCardFilters>(NO_FILTERS);
   const [applied, setApplied] = useState<HdfcCardFilters>(NO_FILTERS);
   const [busy, setBusy] = useState(false);
+  const [netsafe, setNetsafe] = useState<HdfcNetSafeStatus | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setRows(await listHdfcChildCards(applied));
+      const [cards, status] = await Promise.all([listHdfcChildCards(applied), getHdfcNetSafe()]);
+      setRows(cards);
+      setNetsafe(status);
       setError(null);
     } catch (err) {
       setError(errorMessage(err));
@@ -860,11 +398,34 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
   }, [load, reloadKey]);
 
   const shown = rows ?? [];
+  // Cards being read from NetSafe change on their own: refresh until they settle.
+  const reading = shown.some((r) => r.fetch_status === "pending" || r.fetch_status === "in_progress");
+  useEffect(() => {
+    if (!reading) return;
+    const handle = window.setInterval(() => void load(), NETSAFE_POLL_MS);
+    return () => window.clearInterval(handle);
+  }, [reading, load]);
+
+  const failed = shown.filter(canRetry);
+  const retry = async (ids: number[]) => {
+    if (!ids.length) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await retryHdfcChildCards(ids);
+      await load();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
   const act = async (action: "cancel" | "activate" | "delete") => {
     const ids = shown.map((r) => r.id);
     if (!ids.length) return;
     const verb = { cancel: "Cancel", activate: "Reactivate", delete: "Delete" }[action];
-    if (!window.confirm(`${verb} the ${ids.length} child card(s) shown?`)) return;
+    const stopping = action !== "activate" && shown.some(isReading) ? " Cards being read from NetSafe stop at once." : "";
+    if (!window.confirm(`${verb} the ${ids.length} child card(s) shown?${stopping}`)) return;
     setBusy(true);
     setError(null);
     try {
@@ -880,7 +441,7 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
   const columns: Column<HdfcChildCard>[] = [
     { key: "username", header: "Username" },
     { key: "email", header: "Email" },
-    { key: "card_number", header: "Child card", render: (row) => <span className="font-mono tabular-nums">{row.card_number}</span> },
+    { key: "card_number", header: "Child card", render: (row) => <span className="font-mono tabular-nums">{cardLabel(row)}</span> },
     { key: "parent_card_last4", header: "Parent card", render: (row) => (row.parent_card_last4 ? `•••• ${row.parent_card_last4}` : "—") },
     { key: "opening_amount", header: "Opening Amount", numeric: true, render: (row) => formatCurrency(row.opening_amount) },
     { key: "used", header: "Used", numeric: true, render: (row) => formatCurrency(row.used) },
@@ -899,13 +460,41 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
         </button>
       ),
     },
-    { key: "error", header: "Error" },
+    { key: "fetch_status", header: "NetSafe", render: (row) => <FetchStatus row={row} /> },
+    { key: "error", header: "Error", render: (row) => (row.error ? <span className="text-critical">{row.error}</span> : "—") },
     { key: "created_at", header: "Created", render: (row) => formatDateTime(row.created_at) },
+    {
+      key: "actions",
+      header: "",
+      sticky: "right",
+      render: (row) =>
+        isReading(row) ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            title="Stop reading this card from NetSafe"
+            onClick={() => void actOnHdfcChildCards([row.id], "cancel").then(load, (err) => setError(errorMessage(err)))}
+          >
+            Stop
+          </Button>
+        ) : canRetry(row) ? (
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void retry([row.id])}>
+            Retry
+          </Button>
+        ) : null,
+    },
   ];
 
   return (
     <div className="flex flex-col gap-5">
       {error ? <Alert tone="error">{error}</Alert> : null}
+      {netsafe && !netsafe.key_set ? (
+        <Alert tone="warning">
+          Cards cannot be read from NetSafe: the server has no ORDERING_CARD_SECRET_KEY, which keeps their details
+          encrypted. Set it in the server's .env and restart the API.
+        </Alert>
+      ) : null}
       <Card title="Filters">
         <form
           className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6"
@@ -921,6 +510,19 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
             <Select value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value as HdfcCardFilters["status"] })}>
               <option value="">Any</option>
               <option value="active">Active</option>
+              <option value="cancelled">Cancelled</option>
+            </Select>
+          </Field>
+          <Field label="NetSafe">
+            <Select
+              value={filters.fetch_status}
+              onChange={(e) => setFilters({ ...filters, fetch_status: e.target.value as HdfcCardFilters["fetch_status"] })}
+            >
+              <option value="">Any</option>
+              <option value="pending">Pending</option>
+              <option value="in_progress">In progress</option>
+              <option value="completed">Completed</option>
+              <option value="failed">Failed</option>
               <option value="cancelled">Cancelled</option>
             </Select>
           </Field>
@@ -955,6 +557,9 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
         title={`Child cards${rows ? ` (${rows.length})` : ""}`}
         actions={
           <div className="flex flex-wrap gap-2">
+            <Button size="sm" disabled={!failed.length || busy} onClick={() => void retry(failed.map((r) => r.id))}>
+              Retry all{failed.length ? ` (${failed.length})` : ""}
+            </Button>
             <Button size="sm" disabled={!shown.length || busy} onClick={() => void act("cancel")}>
               Cancel all
             </Button>
@@ -973,36 +578,24 @@ function ChildCards({ reloadKey }: { reloadKey: number }) {
   );
 }
 
-/** CorpAssist (HDFC): user ids, new virtual card requests, and the child cards read from HDFC's emails. */
+/** CorpAssist (HDFC): user ids, and the child cards read from HDFC's emails. Cards are created by hand on CorpAssist. */
 export default function CorpAssist() {
   const [tab, setTab] = useState<Tab>("users");
   const [reloadKey, setReloadKey] = useState(0);
-  const [portal, setPortal] = useState<HdfcPortalStatus | null>(null);
-  const [portalError, setPortalError] = useState<string | null>(null);
 
   useEffect(() => {
     document.title = "CorpAssist — Ordering Suite";
   }, []);
-
-  // Re-read on every tab change, so a sign-in set up meanwhile shows without a reload.
-  useEffect(() => {
-    void getHdfcPortal().then(
-      (status) => {
-        setPortal(status);
-        setPortalError(null);
-      },
-      (err) => setPortalError(errorMessage(err)),
-    );
-  }, [tab]);
 
   return (
     <div className="flex flex-col gap-5">
       <header>
         <h1 className="text-[20px] font-semibold tracking-tight text-ink">CorpAssist (HDFC)</h1>
         <p className="mt-1 max-w-prose text-[13px] text-ink-2">
-          User ids for HDFC virtual card emails, and the child cards read from those emails in the shared inbox. Used is
-          what a card paid for in this tool's orders; spending elsewhere is not seen. A card's expiry and CVV are never
-          kept, so they still come from the run's card sheet.
+          User ids for HDFC virtual card emails, and the child cards read from them. Each email gives a card's last four
+          digits and a NetSafe link; the card is then read from NetSafe with the OTP from the user id's Employee Phone,
+          and its expiry, CVV and static password are kept encrypted. Used is what a card paid for in this tool's
+          orders; spending elsewhere is not seen.
         </p>
       </header>
       <div role="tablist" aria-label="CorpAssist" className="flex w-full max-w-lg rounded-control border border-line bg-page p-1">
@@ -1022,9 +615,7 @@ export default function CorpAssist() {
         ))}
       </div>
       {tab === "users" ? (
-        <UserIds portal={portal} onFetched={() => setReloadKey((k) => k + 1)} />
-      ) : tab === "create" ? (
-        <CreateCards portal={portal} portalError={portalError} />
+        <UserIds onFetched={() => setReloadKey((k) => k + 1)} />
       ) : (
         <ChildCards reloadKey={reloadKey} />
       )}

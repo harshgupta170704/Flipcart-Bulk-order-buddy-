@@ -5,6 +5,7 @@ import { useAuth } from "../lib/auth";
 import { hereAsReturnTo } from "../lib/returnTo";
 import { OpenAlertsBadge } from "./AlertsSummary";
 import { UnseenChangesBadge } from "./ChangesFeed";
+import { CaptchaHeaderLink, CaptchaWatchProvider, OpenCaptchasBadge } from "./CaptchaWatch";
 
 type ThemePref = "light" | "dark" | "system";
 
@@ -126,6 +127,17 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   {
+    to: "/captchas",
+    label: "Captchas",
+    icon: ({ className }) => (
+      <IconFrame className={className}>
+        <rect x="2" y="3.5" width="12" height="9" rx="1.5" {...strokeProps} />
+        <path d="M4.5 9.5 6 7l1.5 2.5L9 6.5l1.5 3 1-1.5" {...strokeProps} />
+      </IconFrame>
+    ),
+    badge: () => <OpenCaptchasBadge />,
+  },
+  {
     to: "/hdfc-corpassist",
     label: "CorpAssist",
     match: ["/hdfc-corpassist", "/corpassist"],
@@ -140,6 +152,7 @@ const NAV_ITEMS: NavItem[] = [
 
 const TOOLS_ITEMS: { to: string; label: string; badge?: () => ReactNode }[] = [
   { to: "/screener", label: "Product Screener" },
+  { to: "/swap-email", label: "Swap Email Address" },
   { to: "/inventory", label: "Inventory" },
   { to: "/alerts", label: "Alerts", badge: () => <OpenAlertsBadge /> },
   { to: "/requests", label: "Requests" },
@@ -459,73 +472,76 @@ export function Layout() {
   const who = name || username || "—";
 
   return (
-    <div className="flex min-h-dvh flex-col">
-      <header className="sticky top-0 z-20 shrink-0 border-b border-line bg-surface">
-        <div className="flex h-14 items-center gap-4 px-3 md:px-5">
-          <button
-            type="button"
-            onClick={() => setMenuOpen((open) => !open)}
-            aria-expanded={menuOpen}
-            aria-controls="mobile-nav"
-            aria-label={menuOpen ? "Close navigation" : "Open navigation"}
-            className="inline-flex size-9 items-center justify-center rounded-control border border-line text-ink xl:hidden"
-          >
-            <svg viewBox="0 0 16 16" className="size-4" aria-hidden="true" focusable="false">
-              {menuOpen ? (
-                <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" {...strokeProps} />
-              ) : (
-                <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" {...strokeProps} />
-              )}
-            </svg>
-          </button>
-
-          <Brand />
-
-          <div className="hidden min-w-0 flex-1 xl:block">
-            <TopNav isAdmin={isAdmin} />
-          </div>
-
-          <div className="ml-auto flex shrink-0 items-center gap-1">
-            <ThemeToggle />
-            <Menu
-              align="right"
-              label={
-                <span className="flex items-center gap-1.5" title={username ?? undefined}>
-                  <svg viewBox="0 0 16 16" className="size-3.5" aria-hidden="true">
-                    <circle cx="8" cy="5.5" r="2.6" {...strokeProps} />
-                    <path d="M3 14c.5-2.8 2.5-4.3 5-4.3s4.5 1.5 5 4.3" {...strokeProps} />
-                  </svg>
-                  <span className="hidden max-w-40 truncate text-ink sm:inline">{who}</span>
-                </span>
-              }
+    <CaptchaWatchProvider>
+      <div className="flex min-h-dvh flex-col">
+        <header className="sticky top-0 z-20 shrink-0 border-b border-line bg-surface">
+          <div className="flex h-14 items-center gap-4 px-3 md:px-5">
+            <button
+              type="button"
+              onClick={() => setMenuOpen((open) => !open)}
+              aria-expanded={menuOpen}
+              aria-controls="mobile-nav"
+              aria-label={menuOpen ? "Close navigation" : "Open navigation"}
+              className="inline-flex size-9 items-center justify-center rounded-control border border-line text-ink xl:hidden"
             >
-              <p className="px-2.5 pb-1 pt-1.5 text-[12px] text-muted">
-                Signed in as {who}
-                {role ? ` · ${role === "admin" ? "Admin" : "Operator"}` : ""}
-              </p>
-              <Link role="menuitem" to="/change-password" className={menuItemClass}>
-                Change password
-              </Link>
-              <button role="menuitem" type="button" onClick={logout} className={menuItemClass}>
-                Sign out
-              </button>
-            </Menu>
+              <svg viewBox="0 0 16 16" className="size-4" aria-hidden="true" focusable="false">
+                {menuOpen ? (
+                  <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" {...strokeProps} />
+                ) : (
+                  <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" {...strokeProps} />
+                )}
+              </svg>
+            </button>
+
+            <Brand />
+
+            <div className="hidden min-w-0 flex-1 xl:block">
+              <TopNav isAdmin={isAdmin} />
+            </div>
+
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              <CaptchaHeaderLink className="xl:hidden" />
+              <ThemeToggle />
+              <Menu
+                align="right"
+                label={
+                  <span className="flex items-center gap-1.5" title={username ?? undefined}>
+                    <svg viewBox="0 0 16 16" className="size-3.5" aria-hidden="true">
+                      <circle cx="8" cy="5.5" r="2.6" {...strokeProps} />
+                      <path d="M3 14c.5-2.8 2.5-4.3 5-4.3s4.5 1.5 5 4.3" {...strokeProps} />
+                    </svg>
+                    <span className="hidden max-w-40 truncate text-ink sm:inline">{who}</span>
+                  </span>
+                }
+              >
+                <p className="px-2.5 pb-1 pt-1.5 text-[12px] text-muted">
+                  Signed in as {who}
+                  {role ? ` · ${role === "admin" ? "Admin" : "Operator"}` : ""}
+                </p>
+                <Link role="menuitem" to="/change-password" className={menuItemClass}>
+                  Change password
+                </Link>
+                <button role="menuitem" type="button" onClick={logout} className={menuItemClass}>
+                  Sign out
+                </button>
+              </Menu>
+            </div>
           </div>
-        </div>
-      </header>
+        </header>
 
-      {menuOpen ? (
-        <div id="mobile-nav" className="border-b border-line bg-surface px-2 py-2 xl:hidden">
-          <MobileNav onNavigate={closeMenu} isAdmin={isAdmin} />
-        </div>
-      ) : null}
+        {menuOpen ? (
+          <div id="mobile-nav" className="border-b border-line bg-surface px-2 py-2 xl:hidden">
+            <MobileNav onNavigate={closeMenu} isAdmin={isAdmin} />
+          </div>
+        ) : null}
 
-      <SessionCountdown />
+        <SessionCountdown />
 
-      <main className="min-w-0 flex-1 px-4 py-5 md:px-6 md:py-6">
-        <Outlet />
-      </main>
-    </div>
+        <main className="min-w-0 flex-1 px-4 py-5 md:px-6 md:py-6">
+          <Outlet />
+        </main>
+      </div>
+    </CaptchaWatchProvider>
   );
 }
 

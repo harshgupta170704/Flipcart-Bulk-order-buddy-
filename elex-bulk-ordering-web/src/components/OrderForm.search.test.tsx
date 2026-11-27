@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/api", () => ({
   ...mocks,
   listCardFailureCodes: () => Promise.resolve([]),
+  // Where Smart ID Selection starts (on, the server's default), and its room check.
+  getSettings: () => Promise.resolve({ smart_id_default_on: true }),
+  checkRun: () => new Promise(() => undefined),
   errorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
 }));
 

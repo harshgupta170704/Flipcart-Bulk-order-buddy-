@@ -21,7 +21,7 @@ def _read(name: str) -> bytes:
 
 
 def test_the_parser_has_a_version():
-    assert PARSER_VERSION == 3  # 2: the transport invoice and multi-line fee labels; 3: a second IMEI in one bracket
+    assert PARSER_VERSION == 5  # 2: the transport invoice and multi-line fee labels; 3: a second IMEI in one bracket; 4: reference names; 5: Nov 2026 credit-note labels
 
 
 # --- the real invoices -----------------------------------------------------------------
@@ -257,7 +257,8 @@ def test_a_credit_note_is_read_on_its_labels():
     out = parse_invoice_text(CREDIT_NOTE)
 
     assert out.error is None
-    assert (out.kind, out.invoice_type) == ("credit_note", "Credit Note")
+    # Named for what it reverses, as the owner's reference file names it.
+    assert (out.kind, out.invoice_type) == ("credit_note", "Product Credit Note")
     assert out.invoice_number == "CN2500113513"  # not the original invoice's number
     assert out.original_invoice == "FASUUT2500113513"
     assert out.reason == "Return"
@@ -295,3 +296,55 @@ def test_a_recognised_layout_with_nothing_readable_says_what_is_missing():
     out = parse_invoice_text("Tax Invoice\nProduct\tTitle\tQty\tGross\tDiscounts\tTaxable\tIGST\tTotal\nGrand Total ₹ 0.00\n")
     assert out.kind == "product"
     assert out.error == "no invoice number; no order id; no invoice lines"
+
+
+#: Flipkart's credit-note layout of Nov 2026 (OD339240224678012100): the
+#: "Original Invoice Number:" and "Reason Of Issuance:" labels stand alone in
+#: the left column, their values lines below beside the address column, and
+#: the Place of Supply state broken over two lines.
+CREDIT_NOTE_NOV_2026 = """Credit Note
+Sold By: Health & Happiness Private Limited ,
+GSTIN - 06AADCH8449J1Z8
+Credit Note Number # LKAAIQX270002331
+Order ID:\tBill To\tShip From\tShip To
+OD339240224678012100\tAyush\tAyush\tHealth & Happiness Private
+Order Date: 25-11-2026\tAARTHBODHA PRIVATE\t59, PNB road, railway ganj.\tLimited
+Invoice Date: 26-11-2026
+59, PNB road, railway ganj.\tPhone: xxxxxxxxxx\t//20/2, 22//21 & 25//5/1, 24//1,
+Original Invoice Number:\tPhone: xxxxxxxxxx\t//10,25//7, 20//24, 20//25, 21
+LIAAJYY270010016\tGSTIN: 09ABACA7232Q1Z9\t//19, 21//21, 21//22, 21//23& 21
+State: Uttar Pradesh\t//24, AND OTHERS, VILLAGE
+Reason Of Issuance:
+State Code: IN-UP\tSANPKA, TEHSIL
+sales_return
+Place of Supply: UTTAR\tFARUKHNAGAR, DISTRICT
+PRADESH\tGURUGRAM, HARYANA, INDIA-
+Product\tTitle\tQty\tGross\tDiscounts\tTaxable\tIGST ₹\tTotal ₹
+Handsets\tAi+ Nova 2 5G (Pink, 64 GB)\t1\t11412.00\t0.00\t9671.19\t1740.81\t11412.00
+FSN:\tWarranty: 1 Year
+MOBHKHPY6XQGZXNK
+HSN/SAC: 85171300
+Total\t1\t11412.00\t0.00\t9671.19\t1740.81\t11412.00
+Grand Total\t₹ 11412.00
+"""
+
+
+def test_a_nov_2026_credit_note_reads_its_column_labels_like_the_reference():
+    out = parse_invoice_text(CREDIT_NOTE_NOV_2026)
+
+    assert out.kind == "credit_note"
+    assert out.invoice_number == "LKAAIQX270002331"
+    # Not "Phone" (the next cell on the label's line), nor the FSN further down.
+    assert out.original_invoice == "LIAAJYY270010016"
+    # Not "State Code: IN-UP …": the reference file's value, state rejoined.
+    assert out.reason == "Place of Supply: UTTAR PRADESH"
+
+
+def test_a_credit_note_with_the_state_two_lines_below_still_joins_it():
+    text = (
+        "Credit Note\nCredit Note Number # LDAAAB4270190489\nOriginal Invoice Number:\tState: Uttar Pradesh\n"
+        "LBAAAJA270765491\tState Code: IN-UP\nPlace of Supply: UTTAR\nReason Of Issuance:\nPRADESH\n"
+    )
+    out = parse_invoice_text(text)
+
+    assert (out.original_invoice, out.reason) == ("LBAAAJA270765491", "Place of Supply: UTTAR PRADESH")

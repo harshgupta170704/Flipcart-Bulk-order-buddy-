@@ -142,10 +142,15 @@ def test_no_cell_of_the_invoice_data_csv_runs_as_a_formula():
     text = "".join(invoice_data_csv.stream([(invoice, order)])).lstrip("﻿")
     rows = list(csv.reader(io.StringIO(text)))
     header, line = rows[0], rows[1]
-    assert not [(name, cell) for name, cell in zip(header, line) if runs_as_a_formula(cell)]
+    # An IMEI is written as the owner's reference file writes it (27 Nov 2026):
+    # a tab, then digits only — nothing a spreadsheet can run.
+    imei = dict(zip(header, line))["IMEI"]
+    assert imei == "\t864414083556330"
+    assert not [
+        (name, cell) for name, cell in zip(header, line) if runs_as_a_formula(cell) and not re.fullmatch(r"\t\d+", cell)
+    ]
     # A credit note's negative amounts stay numbers a spreadsheet can sum.
     assert "-100.00" in line and "-118.00" in line
-    assert '="864414083556330"' in line
 
 
 def _formula_cells(data: bytes) -> list[str]:

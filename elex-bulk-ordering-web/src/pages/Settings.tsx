@@ -53,9 +53,6 @@ function isWholeBetween(value: string, low: number, high: number): boolean {
   return value.trim() !== "" && Number.isInteger(n) && n >= low && n <= high;
 }
 
-/** The most accounts one run works at once (the server's ceiling). */
-const MAX_CONCURRENCY = 50;
-
 /* ===========================================================================
    One group = one draft, one validator, one patch builder.
    Defined at module scope so their identities are stable across renders.
@@ -70,8 +67,6 @@ interface GroupSpec<D extends object> {
 }
 
 interface PerformanceDraft {
-  max_concurrency: string;
-  browser_headless: boolean;
   proxy_server: string;
   sync_every_hours: string;
 }
@@ -83,16 +78,11 @@ function isHours(value: string): boolean {
 
 const PERFORMANCE: GroupSpec<PerformanceDraft> = {
   toDraft: (settings) => ({
-    max_concurrency: String(settings.max_concurrency ?? 1),
-    browser_headless: Boolean(settings.browser_headless),
     proxy_server: settings.proxy_server ?? "",
     sync_every_hours: String(settings.sync_every_hours ?? 0),
   }),
   validate: (draft) => {
     const errors: Record<string, string> = {};
-    if (!isWholeBetween(draft.max_concurrency, 1, MAX_CONCURRENCY)) {
-      errors.max_concurrency = `Enter a whole number from 1 to ${MAX_CONCURRENCY}.`;
-    }
     if (draft.proxy_server.includes("***@")) {
       errors.proxy_server =
         "This still has *** where the proxy's sign-in goes. Type the whole address again, or press Reset to keep the saved one.";
@@ -104,8 +94,6 @@ const PERFORMANCE: GroupSpec<PerformanceDraft> = {
   },
   toPatch: (draft, loaded) => {
     const patch: SettingsUpdate = {
-      max_concurrency: Number(draft.max_concurrency),
-      browser_headless: draft.browser_headless,
       sync_every_hours: Number(draft.sync_every_hours),
     };
     // The saved proxy is shown with its sign-in masked ("http://***@host").
@@ -114,6 +102,17 @@ const PERFORMANCE: GroupSpec<PerformanceDraft> = {
     if (draft.proxy_server.trim() !== loaded.proxy_server.trim()) patch.proxy_server = draft.proxy_server.trim();
     return patch;
   },
+};
+
+interface OrderingDraft {
+  smart_id_default_on: boolean;
+}
+
+const ORDERING: GroupSpec<OrderingDraft> = {
+  // A server from before the switch sends no value: on, as the form starts.
+  toDraft: (settings) => ({ smart_id_default_on: settings.smart_id_default_on !== false }),
+  validate: () => ({}),
+  toPatch: (draft) => ({ smart_id_default_on: draft.smart_id_default_on }),
 };
 
 interface OtpDraft {
@@ -364,7 +363,7 @@ function PerformanceGroup({
 }) {
   const group = useSettingsGroup(settings, PERFORMANCE, onSaved);
   const { draft, fieldErrors, set } = group;
-  const concurrency = Number(draft.max_concurrency);
+  const concurrency = settings.max_concurrency;
   const pushingIt = Number.isFinite(concurrency) && concurrency > 8;
 
   return (
@@ -378,30 +377,22 @@ function PerformanceGroup({
       onSave={group.save}
       onReset={group.reset}
     >
-      <Field
-        label="Max concurrency"
-        error={fieldErrors.max_concurrency}
-        className="sm:max-w-[200px]"
-        help={
-          <>
-            <span className="block">How many accounts run in parallel.</span>
-            <span className="block">
-              Pushing this too high trips Flipkart&rsquo;s rate limiting and bot checks, which makes
-              the whole run slower rather than faster. Raise it a little at a time and watch the
-              failure rate.
-            </span>
-          </>
-        }
-      >
-        <NumberInput
-          min={1}
-          max={MAX_CONCURRENCY}
-          step={1}
-          inputMode="numeric"
-          value={draft.max_concurrency}
-          onChange={(event) => set({ max_concurrency: event.target.value })}
-        />
-      </Field>
+      {/* Read-only text, not a control: how many accounts run at once is the
+          server's own .env, not a number saved here for every computer at once
+          (24 Nov 2026: a box here beat the .env, so 6 there still ran 4). */}
+      <dl className="flex flex-col gap-1.5">
+        <dt className="text-[13px] font-medium leading-none text-ink">Max concurrency</dt>
+        <dd className="text-[13px] leading-snug text-ink">{concurrency}</dd>
+        <dd className="text-[12px] leading-snug text-ink-2">
+          How many accounts run in parallel. Set in the server&rsquo;s .env file as
+          ORDERING_MAX_CONCURRENCY, from 1 to 50. Restart the API after changing it. A Normal Speed
+          run still works 2 at a time, and one where you finish the bank&rsquo;s step yourself 1.
+        </dd>
+        <dd className="text-[12px] leading-snug text-ink-2">
+          Pushing this too high trips Flipkart&rsquo;s rate limiting and bot checks, which makes the
+          whole run slower rather than faster. Raise it a little at a time and watch the failure rate.
+        </dd>
+      </dl>
 
       {pushingIt ? (
         <Alert tone="warning" title={`${concurrency} accounts at once is a lot`}>
@@ -410,12 +401,20 @@ function PerformanceGroup({
         </Alert>
       ) : null}
 
-      <Checkbox
-        label="Run the browser headless"
-        checked={draft.browser_headless}
-        onChange={(event) => set({ browser_headless: event.target.checked })}
-        help="Off opens a real browser window per account — handy when something looks wrong, much heavier when many accounts run at once."
-      />
+      {/* Read-only text, not a control: hidden or shown is the server's own .env,
+          not a setting saved here for every computer at once (24 Nov 2026). */}
+      <dl className="flex flex-col gap-1.5">
+        <dt className="text-[13px] font-medium leading-none text-ink">Browser window</dt>
+        <dd className="text-[13px] leading-snug text-ink">
+          {settings.browser_headless ? "Hidden" : "Shown"}
+        </dd>
+        <dd className="text-[12px] leading-snug text-ink-2">
+          Set in the server&rsquo;s .env file: ORDERING_BROWSER_HEADLESS=true hides it, false shows a
+          window per account (handy when something looks wrong, much heavier when many accounts run at
+          once). Restart the API after changing it. A run where you finish the bank&rsquo;s step
+          yourself always shows its window.
+        </dd>
+      </dl>
 
       <Field
         label="Read orders back every (hours)"
@@ -458,6 +457,37 @@ function PerformanceGroup({
           onChange={(event) => set({ proxy_server: event.target.value })}
         />
       </Field>
+    </GroupCard>
+  );
+}
+
+function OrderingGroup({
+  settings,
+  onSaved,
+}: {
+  settings: AppSettings;
+  onSaved: (next: AppSettings) => void;
+}) {
+  const group = useSettingsGroup(settings, ORDERING, onSaved);
+  const { draft, set } = group;
+
+  return (
+    <GroupCard
+      title="Ordering"
+      description="How the Smart Bulk Order form starts for every user."
+      dirty={group.dirty}
+      saving={group.saving}
+      saved={group.saved}
+      error={group.error}
+      onSave={group.save}
+      onReset={group.reset}
+    >
+      <Checkbox
+        label="Smart ID Selection starts on"
+        checked={draft.smart_id_default_on}
+        onChange={(event) => set({ smart_id_default_on: event.target.checked })}
+        help="On: each new order starts with Smart ID Selection on, so IDs that cannot buy the product under the unit limits are set aside before the run starts. Off: each new order starts with it off. Either way it can be changed for one order on the form."
+      />
     </GroupCard>
   );
 }
@@ -712,71 +742,36 @@ function OtpGroup({
 }
 
 /* ===========================================================================
-   Group 3 — HDFC CorpAssist Portal & Cards (stored in DB, no .env editing)
+   Group 3 — HDFC CorpAssist cards (stored in DB, no .env editing)
    =========================================================================== */
 
 interface HdfcDraft {
-  hdfc_portal_url: string;
-  hdfc_portal_user: string;
-  hdfc_portal_password: string;
-  hdfc_portal_otp_mobile: string;
-  hdfc_portal_otp_email: string;
-  hdfc_portal_otp_sender: string;
-  hdfc_portal_step_seconds: string;
   hdfc_sender_filter: string;
   hdfc_since_days: string;
   hdfc_auto_fetch_minutes: string;
-  hdfc_batch_wait_minutes: string;
 }
 
 const HDFC_GROUP: GroupSpec<HdfcDraft> = {
   toDraft: (settings) => ({
-    hdfc_portal_url: settings.hdfc_portal_url ?? "https://corpcardassist.hdfc.bank.in",
-    hdfc_portal_user: settings.hdfc_portal_user ?? "",
-    hdfc_portal_password: "",
-    hdfc_portal_otp_mobile: settings.hdfc_portal_otp_mobile ?? "",
-    hdfc_portal_otp_email: settings.hdfc_portal_otp_email ?? "",
-    hdfc_portal_otp_sender: settings.hdfc_portal_otp_sender ?? "HDFC",
-    hdfc_portal_step_seconds: String(settings.hdfc_portal_step_seconds ?? 60),
     hdfc_sender_filter: settings.hdfc_sender_filter ?? "hdfc",
     hdfc_since_days: String(settings.hdfc_since_days ?? 30),
     hdfc_auto_fetch_minutes: String(settings.hdfc_auto_fetch_minutes ?? 0),
-    hdfc_batch_wait_minutes: String(settings.hdfc_batch_wait_minutes ?? 60),
   }),
   validate: (draft) => {
     const errors: Record<string, string> = {};
-    if (!isWholeBetween(draft.hdfc_portal_step_seconds, 10, 300)) {
-      errors.hdfc_portal_step_seconds = "Enter a whole number from 10 to 300 seconds.";
-    }
     if (!isWholeBetween(draft.hdfc_since_days, 1, 365)) {
       errors.hdfc_since_days = "Enter a whole number from 1 to 365 days.";
     }
     if (!isWholeBetween(draft.hdfc_auto_fetch_minutes, 0, 1440)) {
       errors.hdfc_auto_fetch_minutes = "Enter 0 (manual) to 1440 minutes.";
     }
-    if (!isWholeBetween(draft.hdfc_batch_wait_minutes, 1, 1440)) {
-      errors.hdfc_batch_wait_minutes = "Enter 1 to 1440 minutes.";
-    }
     return errors;
   },
-  toPatch: (draft) => {
-    const patch: SettingsUpdate = {
-      hdfc_portal_url: draft.hdfc_portal_url.trim(),
-      hdfc_portal_user: draft.hdfc_portal_user.trim(),
-      hdfc_portal_otp_mobile: draft.hdfc_portal_otp_mobile.trim(),
-      hdfc_portal_otp_email: draft.hdfc_portal_otp_email.trim(),
-      hdfc_portal_otp_sender: draft.hdfc_portal_otp_sender.trim() || "HDFC",
-      hdfc_portal_step_seconds: Number(draft.hdfc_portal_step_seconds),
-      hdfc_sender_filter: draft.hdfc_sender_filter.trim() || "hdfc",
-      hdfc_since_days: Number(draft.hdfc_since_days),
-      hdfc_auto_fetch_minutes: Number(draft.hdfc_auto_fetch_minutes),
-      hdfc_batch_wait_minutes: Number(draft.hdfc_batch_wait_minutes),
-    };
-    if (draft.hdfc_portal_password.trim() !== "") {
-      patch.hdfc_portal_password = draft.hdfc_portal_password;
-    }
-    return patch;
-  },
+  toPatch: (draft) => ({
+    hdfc_sender_filter: draft.hdfc_sender_filter.trim() || "hdfc",
+    hdfc_since_days: Number(draft.hdfc_since_days),
+    hdfc_auto_fetch_minutes: Number(draft.hdfc_auto_fetch_minutes),
+  }),
 };
 
 function HdfcGroup({ settings, onSaved }: { settings: AppSettings; onSaved: (next: AppSettings) => void }) {
@@ -788,8 +783,8 @@ function HdfcGroup({ settings, onSaved }: { settings: AppSettings; onSaved: (nex
   const id = useId();
   return (
     <GroupCard
-      title="HDFC CorpAssist Portal & Cards"
-      description="Saved in the database (no .env edits needed). Leave portal login blank to use manual sheet downloads only."
+      title="HDFC CorpAssist cards"
+      description="How child-card emails are read from the inbox. Saved in the database (no .env edits needed)."
       dirty={dirty}
       saving={saving}
       saved={saved}
@@ -798,45 +793,6 @@ function HdfcGroup({ settings, onSaved }: { settings: AppSettings; onSaved: (nex
       onReset={reset}
     >
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        <Field id={`${id}-url`} label="Portal URL" error={fieldErrors.hdfc_portal_url}>
-          <TextInput value={draft.hdfc_portal_url} onChange={(e) => set({ hdfc_portal_url: e.target.value })} />
-        </Field>
-        <Field id={`${id}-user`} label="Portal Username" error={fieldErrors.hdfc_portal_user}>
-          <TextInput value={draft.hdfc_portal_user} onChange={(e) => set({ hdfc_portal_user: e.target.value })} />
-        </Field>
-        <Field
-          id={`${id}-pass`}
-          label="Portal Password"
-          hint={settings.hdfc_portal_password_set ? "A password is saved — leave blank to keep it." : "Not saved yet."}
-          error={fieldErrors.hdfc_portal_password}
-        >
-          <TextInput
-            type="password"
-            autoComplete="new-password"
-            placeholder={settings.hdfc_portal_password_set ? "••••••••" : ""}
-            value={draft.hdfc_portal_password}
-            onChange={(e) => set({ hdfc_portal_password: e.target.value })}
-          />
-        </Field>
-        <Field
-          id={`${id}-mob`}
-          label="Sign-in OTP Mobile (10 digits)"
-          hint="Must match an Employee Phone. Set either mobile OR email."
-          error={fieldErrors.hdfc_portal_otp_mobile}
-        >
-          <TextInput value={draft.hdfc_portal_otp_mobile} onChange={(e) => set({ hdfc_portal_otp_mobile: e.target.value })} />
-        </Field>
-        <Field
-          id={`${id}-email`}
-          label="Sign-in OTP Email"
-          hint="Alternative to OTP Mobile — read from the OTP inbox."
-          error={fieldErrors.hdfc_portal_otp_email}
-        >
-          <TextInput value={draft.hdfc_portal_otp_email} onChange={(e) => set({ hdfc_portal_otp_email: e.target.value })} />
-        </Field>
-        <Field id={`${id}-otpsender`} label="OTP SMS Sender Match">
-          <TextInput value={draft.hdfc_portal_otp_sender} onChange={(e) => set({ hdfc_portal_otp_sender: e.target.value })} />
-        </Field>
         <Field id={`${id}-sender`} label="Card Email Sender Filter">
           <TextInput value={draft.hdfc_sender_filter} onChange={(e) => set({ hdfc_sender_filter: e.target.value })} />
         </Field>
@@ -850,12 +806,6 @@ function HdfcGroup({ settings, onSaved }: { settings: AppSettings; onSaved: (nex
           error={fieldErrors.hdfc_auto_fetch_minutes}
         >
           <NumberInput min={0} max={1440} value={draft.hdfc_auto_fetch_minutes} onChange={(e) => set({ hdfc_auto_fetch_minutes: e.target.value })} />
-        </Field>
-        <Field id={`${id}-wait`} label="Batch Wait Timeout (minutes)" error={fieldErrors.hdfc_batch_wait_minutes}>
-          <NumberInput min={1} max={1440} value={draft.hdfc_batch_wait_minutes} onChange={(e) => set({ hdfc_batch_wait_minutes: e.target.value })} />
-        </Field>
-        <Field id={`${id}-step`} label="Portal Step Timeout (seconds)" error={fieldErrors.hdfc_portal_step_seconds}>
-          <NumberInput min={10} max={300} value={draft.hdfc_portal_step_seconds} onChange={(e) => set({ hdfc_portal_step_seconds: e.target.value })} />
         </Field>
       </div>
     </GroupCard>
@@ -935,6 +885,7 @@ export default function Settings() {
             </Alert>
           ) : null}
           <PerformanceGroup settings={settings} onSaved={onSaved} />
+          <OrderingGroup settings={settings} onSaved={onSaved} />
           <OtpGroup settings={settings} onSaved={onSaved} />
           <HdfcGroup settings={settings} onSaved={onSaved} />
         </>

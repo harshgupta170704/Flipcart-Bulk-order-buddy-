@@ -974,6 +974,7 @@ def test_a_request_without_the_new_fields_records_none_of_them(db, api, started)
         "account_filter",
         "account_count",
         "started_by",
+        "agent",
     }
 
     kwargs = started[0]["kwargs"]

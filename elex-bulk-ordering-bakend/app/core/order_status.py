@@ -116,6 +116,22 @@ def classify(status: str | None) -> str:
     return UNKNOWN
 
 
+#: Wording where Flipkart has an order id, but bank payment has NOT yet been
+#: confirmed (seen live 23 Nov 2026: "Payment not yet confirmed from the bank").
+#: Such an order must stay unconfirmed until Flipkart confirms or fails it —
+#: promoting it to placed falsely reports an unpaid order as bought.
+_PAYMENT_UNCONFIRMED = re.compile(
+    r"\bpayment\s+(?:not\s+(?:yet\s+)?confirmed|pending|awaiting|verification\s+pending|on\s+hold)\b"
+    r"|\bawaiting\s+(?:bank\s+)?payment\b",
+    re.IGNORECASE,
+)
+
+
+def payment_unconfirmed(*wordings: str | None) -> bool:
+    """Whether any platform wording says bank payment is still unconfirmed."""
+    return any(_PAYMENT_UNCONFIRMED.search(text) for text in wordings if text)
+
+
 def never_placed(*wordings: str | None) -> bool:
     """Whether any of these platform wordings says the order was never placed
     — "Order Not Placed", "Payment Failed": the payment did not go through, so

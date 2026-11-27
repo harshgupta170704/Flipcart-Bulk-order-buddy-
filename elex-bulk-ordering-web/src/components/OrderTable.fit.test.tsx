@@ -86,6 +86,7 @@ describe("the ledger's default view", () => {
       "model",
       "status",
       "platform_status",
+      "delivery_otp",
       "qty",
       "amount",
       "invoice",
@@ -99,7 +100,10 @@ describe("the ledger's default view", () => {
 
   it("needs no more width than its columns ask for", () => {
     const table = show([order({})]);
-    expect(Number.parseInt(table.style.minWidth, 10)).toBeLessThanOrEqual(1124);
+    // 1,124 until 26 Nov 2026, when the delivery OTP (80 px) joined the
+    // default view at the operator's request: on a 1,124 px laptop the table
+    // now scrolls those 80 px; on a desktop screen it fits.
+    expect(Number.parseInt(table.style.minWidth, 10)).toBeLessThanOrEqual(1204);
   });
 
   it("keeps the order id and the delivery day in sight without their columns", () => {

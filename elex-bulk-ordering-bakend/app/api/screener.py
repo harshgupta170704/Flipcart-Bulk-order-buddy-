@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.api.products import is_flipkart_link
 from app.automation.product import ProductPreview, add_screener_details, fetch_product_preview
+from app.config import get_settings
 from app.core import app_settings
 from app.core.browser import browser_page
 from app.core.security import require_user
@@ -199,18 +200,26 @@ def delete_screener_item(item_id: int, db: DbSession = Depends(get_db)) -> Respo
     return Response(status_code=204)
 
 
-def _offer_combos_from_preview(preview: ProductPreview, cfg: dict) -> tuple[str | None, float | None, list[dict]]:
+def _offer_combos_from_preview(
+    preview: ProductPreview, cfg: dict, extra_offers: list[str] | None = None
+) -> tuple[str | None, float | None, list[dict]]:
     listed = preview.price
     raw_offers: list[str] = list(getattr(preview, "offers", None) or [])
+    if extra_offers:
+        raw_offers.extend(extra_offers)
     banks = [b.lower() for b in (cfg.get("banks") or [])]
     use_coins = bool(cfg.get("supercoin_offers", True))
     use_coupons = bool(cfg.get("coupon_offers", True))
     combos: list[dict] = []
+    seen_labels: set[str] = set()
     if listed is not None:
         combos.append({"label": "Listed price (no extra offer)", "discount": 0.0, "net_price": round(listed, 2)})
 
     for text in raw_offers:
-        low = text.lower()
+        clean = " ".join(text.split()).strip()
+        if not clean:
+            continue
+        low = clean.lower()
         is_coin = "supercoin" in low or "coin" in low
         is_coupon = "coupon" in low or "extra" in low or "special price" in low
         if is_coin and not use_coins:
@@ -221,22 +230,38 @@ def _offer_combos_from_preview(preview: ProductPreview, cfg: dict) -> tuple[str 
             if not any(b in low for b in banks):
                 continue
         disc = 0.0
-        m_rupee = _RUPEE_RE.search(text)
-        m_pct = _PCT_RE.search(text)
+        m_rupee = _RUPEE_RE.search(clean)
+        m_pct = _PCT_RE.search(clean)
+        # Flipkart shows two distinct phrasings:
+        # 1. Effective net price: "₹759 with Bank offer" or "Buy at ₹759" -> discount = listed - amount
+        # 2. Discount amount:     "₹40 off — Flipkart Axis" / "Get ₹500 cashback" -> discount = amount
+        is_effective_price = bool(
+            re.search(r"\b(buy\s+at|with\s+bank\s+offer|effective\s+price|get\s+at)\b", low)
+        ) and not bool(re.search(r"\b(off|discount|cashback|save)\b", low))
         if m_rupee:
             try:
-                disc = float(m_rupee.group(1).replace(",", ""))
+                val = float(m_rupee.group(1).replace(",", ""))
             except ValueError:
-                disc = 0.0
+                val = 0.0
+            if is_effective_price and listed is not None:
+                if 0 < val < listed:
+                    disc = round(listed - val, 2)
+            elif val > 0:
+                disc = val
         elif m_pct and listed is not None:
             pct = float(m_pct.group(1))
-            disc = round(listed * pct / 100.0, 2)
+            if pct <= 50:  # ignore MRP markdown badges like "73% off"
+                disc = round(listed * pct / 100.0, 2)
         if listed is not None and 0 < disc < listed:
-            combos.append({
-                "label": text[:180],
-                "discount": round(disc, 2),
-                "net_price": round(max(0.0, listed - disc), 2),
-            })
+            label = clean[:180]
+            key = (label.lower(), round(disc, 2))
+            if key not in seen_labels:
+                seen_labels.add(key)
+                combos.append({
+                    "label": label,
+                    "discount": round(disc, 2),
+                    "net_price": round(max(0.0, listed - disc), 2),
+                })
 
     best_label = None
     best_net = listed
@@ -248,16 +273,62 @@ def _offer_combos_from_preview(preview: ProductPreview, cfg: dict) -> tuple[str 
     return best_label, best_net, combos[:8]
 
 
+_OFFER_STOP_SECTIONS = (
+    "delivery details",
+    "similar products",
+    "frequently bought together",
+    "bought together",
+    "you might be interested",
+    "ratings & reviews",
+    "questions and answers",
+    "recently viewed",
+)
+
+
+async def _extract_page_offers(page) -> list[str]:
+    """Best-effort scrape of bank, cashback, coupon, and SuperCoin offer snippets from Flipkart."""
+    try:
+        raw_lines: list[str] = await page.evaluate(
+            """() => (document.body ? document.body.innerText : '')
+                 .split(/\\r?\\n/)
+                 .map(s => s.trim())
+                 .filter(Boolean)
+                 .slice(0, 140)"""
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    offers: list[str] = []
+    for idx, line in enumerate(raw_lines):
+        low = line.lower()
+        if any(low == sec or low.startswith(sec) for sec in _OFFER_STOP_SECTIONS):
+            break
+        # Flipkart's new offer tiles put "₹40 off" on one line and "Flipkart Axis" on the next
+        if re.search(r"₹\s*[0-9,]+\s*off", low):
+            nxt = raw_lines[idx + 1] if idx + 1 < len(raw_lines) else ""
+            if nxt and len(nxt) <= 50 and nxt.lower() not in ("apply", "know more", "t&c"):
+                offers.append(f"{line} — {nxt}")
+            else:
+                offers.append(line)
+        elif re.search(r"\bbuy\s+at\s*₹\s*[0-9,]+", low):
+            offers.append(line)
+        elif any(k in low for k in ("bank offer", "cashback", "instant discount", "supercoin", "coupon")):
+            if _RUPEE_RE.search(line) or _PCT_RE.search(line):
+                offers.append(line)
+    return offers[:20]
+
+
 async def _check_one(db: DbSession, item: ScreenerItem, cfg: dict) -> ScreenerItem:
     eff = app_settings.get_effective(db)
+    page_offers: list[str] = []
     try:
         async with browser_page(
-            headless=bool(eff.get("browser_headless", True)),
+            headless=get_settings().browser_headless,
             proxy=str(eff.get("proxy_server") or "") or None,
         ) as (_ctx, page):
             preview = await fetch_product_preview(page, item.product_url)
             if not preview.error:
                 await add_screener_details(page, preview)
+                page_offers = await _extract_page_offers(page)
     except Exception as exc:  # noqa: BLE001
         log.warning("screener check failed for item %s: %s", item.id, exc)
         item.last_checked_at = naive_utcnow()
@@ -274,13 +345,14 @@ async def _check_one(db: DbSession, item: ScreenerItem, cfg: dict) -> ScreenerIt
         return item
 
     item.last_error = None
-    if preview.title:
-        item.product_title = preview.title[:255]
+    title = getattr(preview, "name", None) or getattr(preview, "title", None)
+    if title:
+        item.product_title = str(title)[:255]
     item.listed_price = preview.price
     item.mrp = getattr(preview, "mrp", None)
     item.in_stock = preview.in_stock
     item.stock_text = "In stock" if preview.in_stock else ("Out of stock" if preview.in_stock is False else "Unknown")
-    best_label, best_net, combos = _offer_combos_from_preview(preview, cfg)
+    best_label, best_net, combos = _offer_combos_from_preview(preview, cfg, extra_offers=page_offers)
     item.best_offer = best_label
     item.offer_applied = best_label or "Listed price"
     item.offer_combos = combos

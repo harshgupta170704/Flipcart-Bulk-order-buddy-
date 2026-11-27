@@ -101,9 +101,16 @@ QTY_APPLY = "//div[@dir='auto' and normalize-space(.)='APPLY']"
 # stable class, so they are found by their wording and their limits. The
 # legacy tool's class-name buttons this replaced matched nothing any more.
 GST_USE_INVOICE_TEXT = "Use GST Invoice"
+GST_CHANGE_BTN = (
+    '//*[normalize-space(text())="GST Invoice"]'
+    '/ancestor::*[.//*[not(*)][normalize-space(text())="Change"]][1]'
+    '//*[not(*)][normalize-space(text())="Change"]'
+)
+GST_ADD_NEW_TEXT = "Add new GST Details"
 GST_GSTIN_INPUT = 'input[maxlength="15"][autocapitalize="characters"]'
 GST_BUSINESS_INPUT = 'input[maxlength="60"]'
 GST_CONFIRM_TEXT = "Confirm and Save"
+GST_CONFIRM_USE_TEXT = "Confirm and Use"
 
 # --- Order summary -----------------------------------------------------------
 # The final payable amount the price-target gate reads (PLAN.md §6a).

@@ -71,6 +71,10 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "email": ("accountemail", "emailid", "email", "account"),
     "expiry": ("expirydate", "expiry", "validthru", "mmyy", "exp"),
     "card_type": ("cardtype", "cardvariant", "cardcategory"),
+    "remaining_amount": ("remainingamount", "remainingbalance", "remaining"),
+    "card_amount": ("cardamount", "openingamount"),
+    "parent_card": ("parentcardnumber", "parentcard", "parentcardno"),
+    "status": ("status", "cardstatus"),
     "password": (
         "cardpassword",
         "password",
@@ -132,6 +136,11 @@ class CardRecord:
     #: The sheet's Card Type column ("HDFC Virtual"), when it has one. A run
     #: given a card type uses only the rows of that type.
     card_type: str = ""
+    #: Optional balance & pool metadata carried by HDFC CorpAssist / BOB virtual
+    #: card exports (which have no email column because virtual cards are pooled).
+    remaining_amount: float | None = None
+    status: str = ""
+    is_virtual_pool: bool = False
 
     def masked(self) -> str:
         """Last four digits only — the most that may ever be displayed."""
@@ -170,10 +179,32 @@ def _cell_text(value: object) -> str | None:
     elif isinstance(value, int):
         text = str(value)
     else:
-        text = str(value)
+        text = _without_text_marker(str(value).strip())
     text = text.strip()
     if text == "" or text.lower() == "none":
         return None
+    return text
+
+
+#: The marks a spreadsheet puts on a cell to keep it as text — a leading
+#: apostrophe ("'0123456", so a password keeps its leading zero), or Excel's
+#: ="0123456" form. They are not part of the value. Card exports (HDFC
+#: CorpAssist's virtual-card CSV, 23 Nov 2026) write them on any column, so
+#: every cell of the sheet loses its mark here, once, whatever its heading.
+#: A plain apostrophe or a curly one (a sheet copied through a word
+#: processor). Nothing else is taken off: a "*" or any other character
+#: inside a password is part of it.
+_LEADING_APOSTROPHE = ("'", "\u2018", "\u2019")
+_EXCEL_TEXT_FORMULA = re.compile(r'^="(.*)"$', re.DOTALL)
+
+
+def _without_text_marker(text: str) -> str:
+    """A cell's text without the spreadsheet's keep-as-text mark, removed once."""
+    wrapped = _EXCEL_TEXT_FORMULA.match(text)
+    if wrapped:
+        return wrapped.group(1)
+    if text[:1] in _LEADING_APOSTROPHE:
+        return text[1:]
     return text
 
 
@@ -222,10 +253,32 @@ def _normalize_year(text: str | None) -> str:
 
 
 def _normalize_cvv(text: str | None) -> str:
-    """Keep as a string so '012' does not become 12."""
+    """Keep as a string so '012' does not become 12. The spreadsheet's
+    keep-as-text apostrophe is already gone (``_cell_text``)."""
     if text is None:
         return ""
     return re.sub(r"\s", "", text)
+
+
+def _normalize_password(text: str | None) -> str:
+    """The password as the sheet holds it. The spreadsheet's keep-as-text
+    apostrophe ("'0123456") is already gone (``_cell_text``, once — a second
+    apostrophe would be part of the password); the rest is kept untouched."""
+    if not text:
+        return ""
+    return text.strip()
+
+
+def _parse_amount(text: str | None) -> float | None:
+    if text is None:
+        return None
+    cleaned = re.sub(r"[₹,\s]", "", text.strip())
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 def _split_expiry(value: object) -> tuple[str, str]:
@@ -242,6 +295,13 @@ def _split_expiry(value: object) -> tuple[str, str]:
         return "", ""
 
     groups = re.findall(r"\d+", text)
+    if len(groups) >= 3:
+        # A full calendar date such as "23-11-2026" (DD-MM-YYYY) or "2026-11-23" (YYYY-MM-DD).
+        a, b, c = groups[0], groups[1], groups[2]
+        if len(a) == 4 and len(b) <= 2:
+            return b, a  # YYYY-MM-DD
+        if len(c) == 4 and len(b) <= 2:
+            return b, c  # DD-MM-YYYY
     if len(groups) >= 2:
         first, second = groups[0], groups[1]
         if len(first) == 4 and len(second) <= 2:
@@ -359,14 +419,21 @@ def _record_from_row(
         )
 
     email = _at(values, mapping.get("email"))
+    remaining = _parse_amount(_at(values, mapping.get("remaining_amount")))
+    if remaining is None:
+        remaining = _parse_amount(_at(values, mapping.get("card_amount")))
+    is_virtual_pool = any(k in mapping for k in ("parent_card", "remaining_amount", "card_amount"))
     return CardRecord(
         number=number,
         month=month,
         year=year,
         cvv=cvv,
         email=email,
-        password=(_at(values, mapping.get("password")) or ""),
+        password=_normalize_password(_at(values, mapping.get("password"))),
         card_type=(_at(values, mapping.get("card_type")) or "").strip(),
+        remaining_amount=remaining,
+        status=(_at(values, mapping.get("status")) or "").strip(),
+        is_virtual_pool=is_virtual_pool,
     )
 
 

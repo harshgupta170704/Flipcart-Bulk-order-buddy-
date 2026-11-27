@@ -185,7 +185,7 @@ describe("OrderTable: units an order report filed", () => {
     // The one empty field is the delivery day of a unit still on its way.
     expect(cells(grid, "Delivered date")).toEqual([NOT_READ_BACK]);
     expect(within(row).getAllByText(NOT_READ_BACK)).toHaveLength(1);
-    expect(cells(grid, "Delivery code")).toEqual(["0123"]);
+    expect(cells(grid, "OTP")).toEqual(["0123"]);
     expect(cells(grid, "Paid by")).toEqual(["Cash On Delivery"]);
     expect(cells(grid, "Billed GST")).toEqual(["09ABCDE1234F1Z5 · Example Trading Pvt Ltd"]);
     expect(cells(grid, "Invoice")).toEqual(["Not fetched yet"]);

@@ -15,12 +15,15 @@ different order is refused rather than filed under the wrong one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import re
 import threading
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from urllib.parse import quote
 
 from sqlalchemy import exists, func, or_, select
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, SQLAlchemyError, StatementError
@@ -36,6 +39,20 @@ from app.io.invoice_store import InvoiceStore, sha256
 log = logging.getLogger("ordering.invoices")
 
 PLATFORM = "flipkart"
+#: Where an order's invoices come from — what the "Download Invoice" button
+#: under Price details calls (mapped live on 27 Nov 2026). The order page has
+#: no ``<a href>`` to an invoice any more: the button is a plain ``div``, so
+#: the old link lookup found nothing and no invoice was ever fetched. The
+#: answer is the ``OD….zip`` of all the order's invoices.
+INVOICE_API = "https://{host}.rome.api.flipkart.com/api/1/self-serve/invoice/download/{order_id}"
+#: Which of Flipkart's API hosts serves an order, by the digit after "OD": its
+#: own page asks host 1 for an OD3… order and host 2 for an OD4… one (seen live
+#: 27 Nov 2026); the other host answers 406. One not listed asks host 2 first.
+_API_HOST_BY_DIGIT = {"3": "1", "4": "2"}
+_API_HOSTS = ("1", "2")
+#: Flipkart's API answers 403 "{}" to a request without its web client's
+#: ``X-User-Agent``; this suffix is the one its website appends.
+FK_CLIENT_SUFFIX = "FKUA/website/42/website/Desktop"
 #: A PDF the platform serves is a few hundred KB; a minute is generous.
 FETCH_TIMEOUT_MS = 60_000
 #: Anything larger is not an invoice.
@@ -146,10 +163,13 @@ def _on_file_by_order_id(db: DbSession, account_id: int, order_ids: Iterable[str
     return found
 
 
-def _fetch_not_needed(db: DbSession, account_id: int, order_ids: Iterable[str], *, now: datetime) -> set[str]:
+def _fetch_not_needed(
+    db: DbSession, account_id: int, order_ids: Iterable[str], *, now: datetime, force: bool = False
+) -> set[str]:
     """The orders whose invoice link need not be asked now (see
     :data:`REFETCH_AFTER_HOURS`): asked within the day; or a product invoice on
-    file and the first download ten days old; or a dozen invoices held."""
+    file and the first download ten days old; or a dozen invoices held.
+    ``force`` drops the "within the day" rules: only complete orders are left."""
     wanted = sorted({key for key in (_key(v) for v in order_ids) if key})
     held: dict[str, list[tuple[str, datetime | None]]] = {}
     for start in range(0, len(wanted), _CHUNK):
@@ -166,7 +186,7 @@ def _fetch_not_needed(db: DbSession, account_id: int, order_ids: Iterable[str], 
     skip: set[str] = set()
     for order_id in wanted:
         asked = _last_asked.get((account_id, order_id))
-        if asked is not None and now - asked < timedelta(hours=REFETCH_AFTER_HOURS):
+        if not force and asked is not None and now - asked < timedelta(hours=REFETCH_AFTER_HOURS):
             skip.add(order_id)
             continue
         rows = held.get(order_id)
@@ -177,7 +197,7 @@ def _fetch_not_needed(db: DbSession, account_id: int, order_ids: Iterable[str], 
             continue
         stamps = [stamp.replace(tzinfo=None) for _kind, stamp in rows if stamp is not None]
         newest, oldest = (max(stamps), min(stamps)) if stamps else (None, None)
-        if newest is not None and naive_now - newest < timedelta(hours=REFETCH_AFTER_HOURS):
+        if not force and newest is not None and naive_now - newest < timedelta(hours=REFETCH_AFTER_HOURS):
             skip.add(order_id)
             continue
         has_product = any(kind == KIND_PRODUCT for kind, _stamp in rows)
@@ -226,11 +246,59 @@ def pdfs_in_zip(data: bytes, *, label: str) -> list[bytes]:
     return found
 
 
-async def fetch_missing(context, account_id: int, scraped: Sequence[object]) -> dict[str, list[bytes]]:
+def invoice_api_url(order_id: str, host: str | None = None) -> str:
+    """The URL that answers with the zip of an order's invoices — on the API
+    host that serves this order (:data:`_API_HOST_BY_DIGIT`) unless ``host``."""
+    key = str(order_id).strip().upper()
+    chosen = host or _API_HOST_BY_DIGIT.get(key[2:3], "2")
+    return INVOICE_API.format(host=chosen, order_id=quote(key, safe=""))
+
+
+def _other_host_url(url: str) -> str | None:
+    """The same invoice URL on Flipkart's other API host, for an order whose
+    host the digit rule got wrong (it answered 406); None for any other URL."""
+    found = re.match(r"^https://(\d)\.rome\.api\.flipkart\.com(/.*)$", url)
+    if not found:
+        return None
+    others = [host for host in _API_HOSTS if host != found.group(1)]
+    return f"https://{others[0]}.rome.api.flipkart.com{found.group(2)}" if others else None
+
+
+async def _request_headers(context, url: str) -> dict[str, str]:
+    """What Flipkart's API wants beside the cookies: its web client's
+    ``X-User-Agent`` (the browser's own agent plus the website suffix) and the
+    site as referrer. Nothing for any other URL."""
+    if "rome.api.flipkart.com" not in url:
+        return {}
+    agent = ""
+    for page in list(getattr(context, "pages", None) or [])[:1]:
+        with contextlib.suppress(Exception):
+            agent = str(await page.evaluate("navigator.userAgent") or "")
+    agent = agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    return {
+        "X-User-Agent": f"{agent} {FK_CLIENT_SUFFIX}",
+        "Referer": "https://www.flipkart.com/",
+        "Origin": "https://www.flipkart.com",
+    }
+
+
+async def fetch_missing(
+    context,
+    account_id: int,
+    scraped: Sequence[object],
+    *,
+    force: bool = False,
+    problems: dict[str, str] | None = None,
+) -> dict[str, list[bytes]]:
     """Download the invoices of every observed order that offers a link and
     still needs them (:func:`_fetch_not_needed`). ``context`` is the signed-in
     browser context; its request client carries the session's cookies. Returns
     ``{order_id: [pdf, …]}``.
+
+    ``force`` (the operator's "Fetch invoices", not the timer) asks again
+    whatever was asked in the last day; an order whose invoices are complete
+    is still left alone. ``problems``, when given, is filled with why each
+    order asked brought nothing, for the run's summary.
 
     A link answers with one PDF or — Flipkart's own way — a zip of all the
     order's invoices, unpacked here in memory. Until 11 Nov 2026 a zip was
@@ -256,27 +324,41 @@ async def fetch_missing(context, account_id: int, scraped: Sequence[object]) -> 
 
     now = utcnow()
     with SessionLocal() as db:
-        skip = _fetch_not_needed(db, account_id, links, now=now)
+        skip = _fetch_not_needed(db, account_id, links, now=now, force=force)
 
     fetched: dict[str, list[bytes]] = {}
+    headers_for: dict[str, dict[str, str]] = {}
     for order_id, urls in links.items():
         if order_id in skip:
             continue
         _remember_asked(account_id, order_id, now)
         pdfs: list[bytes] = []
+        why = ""
         for url in urls:
+            host = url.split("/")[2] if "//" in url else ""
+            if host not in headers_for:
+                headers_for[host] = await _request_headers(context, url)
             try:
-                response = await context.request.get(url, timeout=FETCH_TIMEOUT_MS)
+                extra = {"headers": headers_for[host]} if headers_for[host] else {}
+                response = await context.request.get(url, timeout=FETCH_TIMEOUT_MS, **extra)
+                # 406: the other API host serves this order (_API_HOST_BY_DIGIT).
+                other = _other_host_url(url) if getattr(response, "status", None) == 406 else None
+                if other:
+                    response = await context.request.get(other, timeout=FETCH_TIMEOUT_MS, **extra)
                 body = await response.body()
             except Exception as exc:  # noqa: BLE001 — logged, the read-back carries on
                 log.warning("invoice for %s could not be fetched: %s", order_id, type(exc).__name__)
+                why = f"could not be fetched ({type(exc).__name__})"
                 continue
             if not getattr(response, "ok", False):
-                log.warning("invoice for %s: the link answered %s", order_id, getattr(response, "status", "?"))
+                status = getattr(response, "status", "?")
+                log.warning("invoice for %s: the link answered %s", order_id, status)
+                why = f"Flipkart answered {status}"
                 continue
             if body.startswith(_ZIP_SIGNATURE):
                 if len(body) > MAX_ZIP_BYTES:
                     log.warning("invoices for %s: a zip of %d bytes is too large", order_id, len(body))
+                    why = "the zip is too large"
                     continue
                 pdfs.extend(pdfs_in_zip(body, label=order_id))
                 continue
@@ -284,13 +366,17 @@ async def fetch_missing(context, account_id: int, scraped: Sequence[object]) -> 
                 # A web page here is nearly always Flipkart's sign-in page.
                 what = "a web page (the account may be signed out)" if body.lstrip()[:1] == b"<" else "not a PDF"
                 log.warning("invoice for %s: the link answered with %s (%d bytes)", order_id, what, len(body))
+                why = f"Flipkart answered with {what}"
                 continue
             if len(body) > MAX_PDF_BYTES:
                 log.warning("invoice for %s: %d bytes is too large to be an invoice", order_id, len(body))
+                why = "the PDF is too large"
                 continue
             pdfs.append(body)
         if pdfs:
             fetched[order_id] = pdfs
+        elif problems is not None:
+            problems[order_id] = why or "no invoice in Flipkart's answer"
     return fetched
 
 
@@ -994,6 +1080,55 @@ def data_selection(
     return DataSelection(invoice_ids=ids, rows=rows)
 
 
+def _product_titles(db: DbSession, order_pks: Iterable[int]) -> dict[int, str]:
+    """``{order_pk: title}`` — the first line title of each order's earliest
+    product invoice on file."""
+    wanted = sorted(set(order_pks))
+    titles: dict[int, str] = {}
+    for start in range(0, len(wanted), _CHUNK):
+        rows = db.execute(
+            select(Invoice.order_pk, Invoice.lines)
+            .where(Invoice.order_pk.in_(wanted[start : start + _CHUNK]), Invoice.kind == KIND_PRODUCT)
+            .order_by(Invoice.invoice_date.asc().nulls_last(), Invoice.id.asc())
+        ).all()
+        for order_pk, lines in rows:
+            if order_pk in titles:
+                continue
+            for line in lines or []:
+                title = line.get("title") if isinstance(line, dict) else None
+                if title and str(title).strip():
+                    titles[order_pk] = str(title).strip()
+                    break
+    return titles
+
+
+def _billed_businesses(db: DbSession, orders: Iterable[Order]) -> dict[int, tuple[str | None, str | None]]:
+    """``{order_pk: (business name, GSTIN)}`` the order was billed to: what its
+    page's GST details said (on its units, from a read-back), else the GST on
+    the register the run billed it under (``Order.gstin``)."""
+    from app.db.models import Gst
+
+    by_pk = {order.id: order for order in orders}
+    found: dict[int, tuple[str | None, str | None]] = {}
+    wanted = sorted(by_pk)
+    for start in range(0, len(wanted), _CHUNK):
+        rows = db.execute(
+            select(OrderUnit.order_pk, OrderUnit.billed_business_name, OrderUnit.billed_gstin)
+            .where(OrderUnit.order_pk.in_(wanted[start : start + _CHUNK]), OrderUnit.billed_business_name.is_not(None))
+            .order_by(OrderUnit.id.asc())
+        ).all()
+        for order_pk, name, gstin in rows:
+            if order_pk not in found and name and name.strip():
+                found[order_pk] = (name.strip(), (gstin or "").strip() or None)
+    missing = {pk: order.gstin for pk, order in by_pk.items() if pk not in found and order.gstin}
+    if missing:
+        names = dict(db.execute(select(Gst.gstin, Gst.business_name).where(Gst.gstin.in_(set(missing.values())))).all())
+        for pk, gstin in missing.items():
+            if names.get(gstin):
+                found[pk] = (names[gstin], gstin)
+    return found
+
+
 def data_pairs(db: DbSession, selection: DataSelection, *, chunk: int | None = None) -> Iterator[tuple[Invoice, Order]]:
     """``(invoice, order)`` for every invoice of the selection, in its order,
     read ``chunk`` invoices at a time as the CSV is written — so the file's
@@ -1001,6 +1136,13 @@ def data_pairs(db: DbSession, selection: DataSelection, *, chunk: int | None = N
 
     An invoice gone since it was selected is left out; one changed since is
     written as it now is.
+
+    Each order also carries plain attributes (not columns) the owner's
+    reference file needs: ``invoice_product_title``, the product's title as
+    its product invoice prints it, which a fee or credit-note row names as its
+    product — looked up whether or not "Product" was ticked; and
+    ``invoice_buyer_name`` / ``invoice_buyer_gstin``, the business it was
+    billed to (:func:`_billed_businesses`), the buyer on every row.
     """
     size = max(1, int(chunk or DATA_CHUNK))
     ids = selection.invoice_ids
@@ -1012,6 +1154,12 @@ def data_pairs(db: DbSession, selection: DataSelection, *, chunk: int | None = N
                 select(Invoice, Order).join(Order, Order.id == Invoice.order_pk).where(Invoice.id.in_(batch))
             ).all()
         }
+        orders = {order.id: order for _invoice, order in found.values()}
+        titles = _product_titles(db, orders)
+        buyers = _billed_businesses(db, orders.values())
+        for order in orders.values():
+            order.invoice_product_title = titles.get(order.id)
+            order.invoice_buyer_name, order.invoice_buyer_gstin = buyers.get(order.id, (None, None))
         for invoice_id in batch:
             pair = found.get(invoice_id)
             if pair is not None:

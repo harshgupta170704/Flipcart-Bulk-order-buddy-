@@ -12,7 +12,10 @@ import { usesCard, usesGiftCards } from "./types";
 import type {
   Account,
   AccountFilterInput,
+  CardCheck,
   CardPreview,
+  CardPreviewLeaveOut,
+  RetryPlan,
   AccountInput,
   AccountPage,
   AccountPatch,
@@ -29,6 +32,7 @@ import type {
   ChangesPage,
   ChangesSeen,
   CompileStartResult,
+  InvoiceFetchStartResult,
   CompileStatus,
   CompiledArchivePage,
   CouponJobInput,
@@ -46,18 +50,16 @@ import type {
   BulkOrderRun,
   BulkOrderRunFilters,
   BalanceTotals,
+  CaptchaHistoryRow,
+  CaptchaKey,
+  CaptchaList,
   DashboardScope,
   FleetStatus,
   GiftVoucher,
-  HdfcBatch,
-  HdfcBatchRowInput,
-  HdfcBatchSend,
   HdfcCardFilters,
   HdfcChildCard,
   HdfcFetchResult,
-  HdfcPortalStatus,
-  HdfcPortalSyncResult,
-  HdfcPortalTestResult,
+  HdfcNetSafeStatus,
   HdfcUserId,
   OtpPhone,
   OtpPhoneBulkResult,
@@ -67,6 +69,10 @@ import type {
   OrderPhoneNumber,
   ScreenerConfig,
   ScreenerItem,
+  EmailSwapCheck,
+  EmailSwapRow,
+  EmailSwapSummary,
+  EmailSwapUploadResult,
   InventoryBatch,
   InventoryStockRow,
   InventoryTransfer,
@@ -92,6 +98,8 @@ import type {
   PasswordChangedResponse,
   ProductPreview,
   ProductSearchAnswer,
+  RunCheckInput,
+  RunCheckResult,
   SettingsUpdate,
   Stats,
   SyncJobInput,
@@ -672,6 +680,19 @@ export function checkUnitLimits(input: LimitCheckInput): Promise<LimitUsage[]> {
   });
 }
 
+/**
+ * The same check for one order as the run will judge it: how many IDs cannot
+ * buy (no room under a limit, too little room for one order, or left out by
+ * "Exclude IDs"), which a Smart ID run sets aside before it starts, and the
+ * units the rest can really still buy. Nothing is written.
+ */
+export function checkRun(input: RunCheckInput): Promise<RunCheckResult> {
+  return request<RunCheckResult>("/unit-limits/run-check", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 /* --- settings ------------------------------------------------------------- */
 
 export function getSettings(): Promise<AppSettings> {
@@ -752,6 +773,18 @@ export function startOrderJob(input: OrderJobInput): Promise<Job> {
   if (input.gst_mandatory) form.append("gst_mandatory", "true");
   appendIfSet(form, "exclude_ordered_days", input.exclude_ordered_days);
   if (input.smart_selection) form.append("smart_selection", "true");
+  // Sent every time, on or off, unlike the yes-or-no fields around it: the
+  // server reads a missing smart_id as off (a caller from before the switch
+  // runs as before), so leaving out a true one would turn Smart ID Selection
+  // off without anyone asking, and each run's history says which it was.
+  form.append("smart_id", input.smart_id === true ? "true" : "false");
+  // This order's changes to the unit limits, as JSON text, only when there are
+  // any: none means the saved limits, exactly as before.
+  if (input.limit_overrides && input.limit_overrides.length > 0) {
+    form.append("limit_overrides", JSON.stringify(input.limit_overrides));
+  }
+  if (input.skip_bought_product) form.append("skip_bought_product", "true");
+  appendIfSet(form, "retry_of", input.retry_of);
   if (input.ref_code && input.ref_code.trim()) form.append("ref_code", input.ref_code.trim());
   if (input.execution_version) form.append("execution_version", input.execution_version);
   if (input.isolated_agents) form.append("isolated_agents", "true");
@@ -762,6 +795,7 @@ export function startOrderJob(input: OrderJobInput): Promise<Job> {
   if (input.use_wallet) form.append("use_wallet", "true");
   if (input.apply_additional_offer) form.append("apply_additional_offer", "true");
   if (usesCard(input.payment_mode)) {
+    if (input.card_exclude_used) form.append("card_exclude_used", "true");
     appendIfSet(form, "card_cooldown_days", input.card_cooldown_days);
     appendIfSet(form, "card_least_used_days", input.card_least_used_days);
     appendIfSet(form, "card_max_uses", input.card_max_uses);
@@ -846,16 +880,46 @@ export function previewOrderCards(input: {
   card_type?: string;
   /** As the run: HDFC child cards with less than this left are not paired. */
   card_min_remaining?: number | null;
+  /** As the run: pool cards (no email column) these rules keep out go to no account. */
+  card_exclude_used?: boolean;
+  card_cooldown_days?: number | null;
+  card_exclude_failed_days?: number | null;
+  card_exclude_failed_codes?: string[];
+  /** A retry's preview: its cooldown covers every order since that run began. */
+  retry_of?: number | null;
+  /** Who the run will pass over before it tries anyone: a pool sheet gives
+   *  them no card, so the preview pairs exactly as the run will. */
+  leave_out?: CardPreviewLeaveOut | null;
 }): Promise<CardPreview> {
   const form = new FormData();
   if (input.card_type && input.card_type.trim()) form.append("card_type", input.card_type.trim());
   appendIfSet(form, "card_min_remaining", input.card_min_remaining);
+  if (input.card_exclude_used) form.append("card_exclude_used", "true");
+  appendIfSet(form, "card_cooldown_days", input.card_cooldown_days);
+  appendIfSet(form, "card_exclude_failed_days", input.card_exclude_failed_days);
+  if (input.card_exclude_failed_codes && input.card_exclude_failed_codes.length) {
+    form.append("card_exclude_failed_codes", input.card_exclude_failed_codes.join(","));
+  }
+  appendIfSet(form, "retry_of", input.retry_of);
+  if (input.leave_out) form.append("leave_out", JSON.stringify(input.leave_out));
   form.append("account_ids", input.account_ids === null ? "" : input.account_ids.join(","));
   if (input.account_filter !== undefined) {
     form.append("account_filter", JSON.stringify(input.account_filter));
   }
   form.append("cards_file", input.cards_file);
   return request<CardPreview>("/jobs/order/card-preview", { method: "POST", body: form });
+}
+
+/**
+ * "Validate card file": the server reads the sheet exactly as a run would and
+ * answers what it fixed (CVVs given back their leading zeros), the rows set
+ * aside, and the rows to check — by row and last four digits only. Nothing is
+ * kept; Start sends the sheet again and the run applies the same fixes.
+ */
+export function checkCardSheet(file: File): Promise<CardCheck> {
+  const form = new FormData();
+  form.append("cards_file", file);
+  return request<CardCheck>("/jobs/order/card-check", { method: "POST", body: form });
 }
 
 /**
@@ -957,10 +1021,6 @@ export interface HdfcUserIdInput {
   mobile?: string | null;
   /** Only its last four digits are kept. */
   parent_card?: string | null;
-  /** The parent card's Alternate A/c No.; the API keeps its digits (8 to 32). */
-  aan?: string | null;
-  /** HDFC's own Virtual Card User ID. */
-  portal_user_id?: string | null;
   active?: boolean;
 }
 
@@ -989,6 +1049,7 @@ function hdfcCardQuery(filters: HdfcCardFilters): string {
   const params = new URLSearchParams();
   if (filters.user_id) params.set("user_id", String(filters.user_id));
   if (filters.status) params.set("status", filters.status);
+  if (filters.fetch_status) params.set("fetch_status", filters.fetch_status);
   if (filters.min_remaining?.trim()) params.set("min_remaining", filters.min_remaining.trim());
   if (filters.created_from) params.set("created_from", filters.created_from);
   if (filters.created_to) params.set("created_to", filters.created_to);
@@ -1005,79 +1066,17 @@ export function downloadHdfcChildCards(filters: HdfcCardFilters = {}): Promise<v
   return downloadFile(`/hdfc/child-cards.csv${hdfcCardQuery(filters)}`, "hdfc_child_cards.csv");
 }
 
+/** Read these failed cards from NetSafe again, while their links last. */
+export function retryHdfcChildCards(ids: number[]): Promise<{ changed: number }> {
+  return request<{ changed: number }>("/hdfc/child-cards/retry", { method: "POST", body: JSON.stringify({ ids }) });
+}
+
+export function getHdfcNetSafe(): Promise<HdfcNetSafeStatus> {
+  return request<HdfcNetSafeStatus>("/hdfc/netsafe");
+}
+
 export function actOnHdfcChildCards(ids: number[], action: "cancel" | "activate" | "delete"): Promise<{ changed: number }> {
   return request<{ changed: number }>("/hdfc/child-cards/action", { method: "POST", body: JSON.stringify({ ids, action }) });
-}
-
-/** Ask HDFC for new virtual cards: on the portal, or as a bulk sheet to upload by hand. */
-export function createHdfcBatch(rows: HdfcBatchRowInput[], send: HdfcBatchSend): Promise<HdfcBatch> {
-  return request<HdfcBatch>("/hdfc/batches", { method: "POST", body: JSON.stringify({ rows, send }) });
-}
-
-export function listHdfcBatches(): Promise<HdfcBatch[]> {
-  return request<HdfcBatch[]>("/hdfc/batches");
-}
-
-export function getHdfcBatch(id: number): Promise<HdfcBatch> {
-  return request<HdfcBatch>(`/hdfc/batches/${id}`);
-}
-
-/** HDFC's bulk sheet for this batch, as a CSV. */
-export function downloadHdfcBatchSheet(id: number): Promise<void> {
-  return downloadFile(`/hdfc/batches/${id}.csv`, `hdfc_batch_${id}.csv`);
-}
-
-export function retryHdfcBatch(id: number): Promise<HdfcBatch> {
-  return request<HdfcBatch>(`/hdfc/batches/${id}/retry`, { method: "POST" });
-}
-
-export function cancelHdfcBatch(id: number): Promise<HdfcBatch> {
-  return request<HdfcBatch>(`/hdfc/batches/${id}/cancel`, { method: "POST" });
-}
-
-export function getHdfcPortal(): Promise<HdfcPortalStatus> {
-  return request<HdfcPortalStatus>("/hdfc/portal");
-}
-
-export function testHdfcPortalLogin(): Promise<HdfcPortalTestResult> {
-  return request<HdfcPortalTestResult>("/hdfc/portal/test-login", { method: "POST" });
-}
-
-export interface HdfcCaptcha {
-  /** `data:image/png;base64,...` of HDFC's captcha. */
-  image: string;
-  expires_in: number;
-}
-
-/** Open HDFC's sign-in page (user and password filled) and get its captcha to read. */
-export function startHdfcCaptcha(): Promise<HdfcCaptcha> {
-  return request<HdfcCaptcha>("/hdfc/portal/captcha", { method: "POST" });
-}
-
-/** Sign in with the captcha a person typed; `needs_otp` when HDFC then wants an OTP typed. */
-export function submitHdfcCaptcha(text: string): Promise<HdfcPortalTestResult & { needs_otp: boolean }> {
-  return request<HdfcPortalTestResult & { needs_otp: boolean }>("/hdfc/portal/captcha/submit", {
-    method: "POST",
-    body: JSON.stringify({ text }),
-  });
-}
-
-/** Finish the captcha sign-in with the OTP read from HDFC's message. */
-export function submitHdfcOtp(code: string): Promise<HdfcPortalTestResult> {
-  return request<HdfcPortalTestResult>("/hdfc/portal/otp/submit", {
-    method: "POST",
-    body: JSON.stringify({ code }),
-  });
-}
-
-/** Set this user's email on the HDFC portal to the one saved here (the shared inbox). */
-export function pointHdfcUserEmail(id: number): Promise<HdfcUserId> {
-  return request<HdfcUserId>(`/hdfc/user-ids/${id}/point-email`, { method: "POST" });
-}
-
-/** Import HDFC's Virtual Card Users as user ids. */
-export function syncHdfcPortalUsers(): Promise<HdfcPortalSyncResult> {
-  return request<HdfcPortalSyncResult>("/hdfc/portal/sync-users", { method: "POST" });
 }
 
 /* --- employee phones (SMS relay) ------------------------------------------ */
@@ -1116,6 +1115,53 @@ export function deleteOtpPhone(id: number): Promise<void> {
 /** The last day's texts this phone forwarded, newest first. */
 export function listOtpPhoneMessages(id: number): Promise<OtpPhoneMessage[]> {
   return request<OtpPhoneMessage[]>(`/otp-phones/${id}/messages`);
+}
+
+/* --- captchas a person answers --------------------------------------------- */
+
+/** The captchas waiting now, the last hour's counts and the settings. */
+export function listCaptchas(): Promise<CaptchaList> {
+  return request<CaptchaList>("/captchas");
+}
+
+/**
+ * The captcha picture, or with `live` the whole browser window as it is now.
+ * An <img src> cannot carry the bearer token, so it comes back as a blob for
+ * an object URL.
+ */
+export async function getCaptchaImage(id: number, live: boolean): Promise<Blob> {
+  const res = await fetchDownload(`/captchas/${id}/image?live=${live ? "true" : "false"}`);
+  return res.blob();
+}
+
+/** Type the characters into the captcha box and submit. 422: no box found, use the live view. */
+export function answerCaptcha(id: number, text: string): Promise<void> {
+  return request<void>(`/captchas/${id}/answer`, { method: "POST", body: JSON.stringify({ text }) });
+}
+
+/** Click the live view at a point given as fractions (0–1) of its width and height. */
+export function clickCaptcha(id: number, x: number, y: number): Promise<void> {
+  return request<void>(`/captchas/${id}/click`, { method: "POST", body: JSON.stringify({ x, y }) });
+}
+
+/** Type text, or press one key, in the live view. */
+export function sendCaptchaKeys(id: number, input: { text?: string; key?: CaptchaKey }): Promise<void> {
+  return request<void>(`/captchas/${id}/keys`, { method: "POST", body: JSON.stringify(input) });
+}
+
+/** Solved in the live view: the server looks at the page again and carries on. */
+export function captchaDone(id: number): Promise<void> {
+  return request<void>(`/captchas/${id}/done`, { method: "POST" });
+}
+
+/** Give up on this account; the run goes on with the others. */
+export function skipCaptcha(id: number): Promise<void> {
+  return request<void>(`/captchas/${id}/skip`, { method: "POST" });
+}
+
+/** The latest captchas and their outcomes, newest first. */
+export function captchaHistory(limit = 50): Promise<CaptchaHistoryRow[]> {
+  return request<CaptchaHistoryRow[]>(`/captchas/history?limit=${limit}`);
 }
 
 /* --- gift vouchers and order phone numbers --------------------------------- */
@@ -1180,6 +1226,11 @@ export function getJob(id: number): Promise<JobDetail> {
   return request<JobDetail>(`/jobs/${id}`);
 }
 
+/** What "Retry failed" orders on for this run, and what it leaves out. Read only. */
+export function getRetryPlan(id: number): Promise<RetryPlan> {
+  return request<RetryPlan>(`/jobs/${id}/retry`);
+}
+
 export function cancelJob(id: number): Promise<Job> {
   return request<Job>(`/jobs/${id}/cancel`, { method: "POST" });
 }
@@ -1235,6 +1286,7 @@ export function orderParams(filters: OrderFilters = {}): URLSearchParams {
   many("order_id", filters.order_ids);
   many("email", filters.emails);
   many("tracking_id", filters.tracking_ids);
+  many("product_id", filters.product_ids);
   many("platform", filters.platforms);
   if (filters.bob === true || filters.bob === false) params.set("bob", String(filters.bob));
   if (filters.card?.trim()) params.set("card", filters.card.trim());
@@ -1377,6 +1429,16 @@ export async function downloadInvoiceData(filters: OrderFilters, types: string[]
    page uses, so the archive covers exactly the rows on screen.
 -------------------------------------------------------------------------- */
 
+/**
+ * Download, store and read every invoice of the orders matching the ledger
+ * filter, straight from Flipkart (one zip per order). The ledger's invoice
+ * filters are ignored for the fetch — they match invoices on file — and apply
+ * to the CSV afterwards.
+ */
+export function startInvoiceFetch(filters: OrderFilters): Promise<InvoiceFetchStartResult> {
+  return request<InvoiceFetchStartResult>(`/invoices/fetch?${orderParams(filters).toString()}`, { method: "POST" });
+}
+
 export function startCompile(filters: OrderFilters, prefix: string): Promise<CompileStartResult> {
   return request<CompileStartResult>(`/invoices/compile?${orderParams(filters).toString()}`, {
     method: "POST",
@@ -1444,6 +1506,36 @@ export function importOrderReport(file: File): Promise<OrderReportImportResult> 
   const form = new FormData();
   form.append("file", file);
   return request<OrderReportImportResult>("/orders/import-report", { method: "POST", body: form });
+}
+
+/** What filling a multi-track sheet found: its shipment rows, and how many the ledger knew. */
+export interface MultiTrackResult {
+  rows: number;
+  matched: number;
+}
+
+/**
+ * E-Kart's multi_track sheet, saved back as the same file with Account,
+ * Delivery OTP, Last 6 Digits Of Phone and Flipkart Status added at the end.
+ */
+export async function fillMultiTrack(file: File): Promise<MultiTrackResult> {
+  const form = new FormData();
+  form.append("file", file);
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/orders/multi-track`, { method: "POST", headers: authHeaders(), body: form });
+  } catch {
+    throw new ApiError(0, "Could not reach the server. Check that it is running and try again.");
+  }
+  if (!res.ok) {
+    handleUnauthorized(res.status);
+    throw await failureFrom(res);
+  }
+  const rows = Number(res.headers.get("X-Rows") ?? 0);
+  const matched = Number(res.headers.get("X-Matched") ?? 0);
+  const stem = file.name.replace(/\.[^.]+$/, "");
+  await saveAsFile(res, `${stem} - with OTP and phone${/\.csv$/i.test(file.name) ? ".csv" : ".xlsx"}`);
+  return { rows, matched };
 }
 
 /** The order report's header row, to fill in. */
@@ -1704,6 +1796,47 @@ export function bulkImportOtpPhones(input: { corporate_id?: string | null; csv_t
 }
 
 /* --- Product Screener 20-slot Watchlist (BOB parity) ---------------------- */
+
+/* --- Swap Email Address --------------------------------------------------- */
+
+export function uploadEmailSwaps(csv: string, batch?: string): Promise<EmailSwapUploadResult> {
+  return request<EmailSwapUploadResult>("/email-swap/upload", {
+    method: "POST",
+    body: JSON.stringify({ csv, batch: batch ?? null }),
+  });
+}
+
+export function listEmailSwaps(batch?: string): Promise<EmailSwapRow[]> {
+  const q = batch ? `?batch=${encodeURIComponent(batch)}` : "";
+  return request<EmailSwapRow[]>(`/email-swap/items${q}`);
+}
+
+export function getEmailSwapSummary(): Promise<EmailSwapSummary> {
+  return request<EmailSwapSummary>("/email-swap/summary");
+}
+
+export function runEmailSwaps(): Promise<EmailSwapSummary> {
+  return request<EmailSwapSummary>("/email-swap/run", { method: "POST" });
+}
+
+export function retryFailedEmailSwaps(): Promise<EmailSwapSummary> {
+  return request<EmailSwapSummary>("/email-swap/retry-failed", { method: "POST" });
+}
+
+/** Can this one account be swapped to `newEmail`? Opens the inboxes for real. */
+export function checkEmailSwap(oldEmail: string, newEmail?: string): Promise<EmailSwapCheck> {
+  const qs = new URLSearchParams({ old_email: oldEmail });
+  if (newEmail) qs.set("new_email", newEmail);
+  return request<EmailSwapCheck>(`/email-swap/check?${qs.toString()}`);
+}
+
+/** Queue one account's swap (refused with the reasons unless the check passes). */
+export function swapOneEmail(oldEmail: string, newEmail: string): Promise<EmailSwapRow> {
+  return request<EmailSwapRow>("/email-swap/one", {
+    method: "POST",
+    body: JSON.stringify({ old_email: oldEmail, new_email: newEmail }),
+  });
+}
 
 export function getScreenerConfig(): Promise<ScreenerConfig> {
   return request<ScreenerConfig>("/screener/config");

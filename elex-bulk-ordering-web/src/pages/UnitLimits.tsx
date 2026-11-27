@@ -314,7 +314,7 @@ export default function UnitLimits() {
 
       <Card
         title="Limits"
-        description="One row per cap. Scope is what the platform counts — a category, a brand, a model or a single variant — and a blank value means every value in that scope."
+        description="One row per cap. Scope is what the platform counts — a category, a brand, a model or a single variant — and a blank value means every value in that scope. A variant limit always names one product id: the part after pid= in the product link."
         actions={
           isAdmin ? (
             <Button

@@ -112,6 +112,7 @@ export function viewFilters(applied: OrderFilters, now = new Date()): Partial<Or
   if (applied.order_ids?.length) out.order_ids = applied.order_ids;
   if (applied.emails?.length) out.emails = applied.emails;
   if (applied.tracking_ids?.length) out.tracking_ids = applied.tracking_ids;
+  if (applied.product_ids?.length) out.product_ids = applied.product_ids;
   if (applied.card?.trim()) out.card = applied.card.trim();
   if (applied.billed_gst?.trim()) out.billed_gst = applied.billed_gst.trim();
   if (applied.invoice_number?.trim()) out.invoice_number = applied.invoice_number.trim();
@@ -176,6 +177,8 @@ export function restoredFilters(raw: unknown, now = new Date()): Partial<OrderFi
   if (emails.length) out.emails = emails;
   const tracking = strings(v.tracking_ids);
   if (tracking.length) out.tracking_ids = tracking;
+  const productIds = strings(v.product_ids);
+  if (productIds.length) out.product_ids = productIds;
   if (typeof v.card === "string" && v.card.trim() && v.card.length <= CARD_MAX_LENGTH) out.card = v.card.trim();
   const billed = oneText(v.billed_gst, GSTIN_MAX_LENGTH);
   if (billed) out.billed_gst = billed;

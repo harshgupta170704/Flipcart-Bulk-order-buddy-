@@ -862,15 +862,35 @@ def test_a_banks_page_that_never_shows_a_password_box_is_unconfirmed():
 
 def test_the_bank_form_is_submitted_by_enter_when_its_submit_button_is_not_unique():
     """Two submit buttons can be Submit and the bank's Cancel: neither is
-    guessed at; Enter in the password box submits its form."""
+    guessed at. With no single button on the page saying Submit either, Enter
+    in the password box submits its form (it has submit controls, so Enter
+    presses its own, as a person's Enter does)."""
     page = _bank_page()
-    submit = "ancestor::form[1]//*[(self::button or self::input) and @type='submit']"
+    submit = order_flow._BANK_FORM_SUBMIT.split("xpath=", 1)[1]
     page.counts[submit] = 2
+    page.counts[order_flow._BANK_SUBMIT_BY_WORDS.split("xpath=", 1)[1]] = 0
 
     result = _run(page, mode=PAYMENT_CARD, card=CARD_WITH_PASSWORD)
 
     assert result["status"] == OrderStatus.placed
     assert f"key:Enter@{PASSWORD_FIELD}" in page.clicks
+    assert submit not in page.clicks
+
+
+def test_with_two_submit_buttons_in_the_form_the_one_saying_submit_on_the_page_is_pressed():
+    """Submit and Cancel both submit the form: the page's one button whose
+    words say Submit is pressed, and Enter (which would press the form's
+    first, possibly Cancel) is not."""
+    page = _bank_page()
+    submit = order_flow._BANK_FORM_SUBMIT.split("xpath=", 1)[1]
+    worded = order_flow._BANK_SUBMIT_BY_WORDS.split("xpath=", 1)[1]
+    page.counts[submit] = 2
+
+    result = _run(page, mode=PAYMENT_CARD, card=CARD_WITH_PASSWORD)
+
+    assert result["status"] == OrderStatus.placed
+    assert page.clicks.count(worded) == 1
+    assert f"key:Enter@{PASSWORD_FIELD}" not in page.clicks
     assert submit not in page.clicks
 
 

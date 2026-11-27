@@ -1,7 +1,8 @@
 """Swap Email Address API — bulk-change Flipkart login emails from a CSV.
 
 Upload a CSV whose first column is the account's current (old) login email and
-second column is the new email to move it to. Each pair becomes an
+second column is the new email to move it to — or pick one account on the page
+(``/check`` then ``/one``). Each pair becomes an
 ``email_swaps`` row (status ``pending``). A single background worker then, one
 row at a time, signs the account in with its stored session, drives Flipkart's
 profile email change, and fills the verification code(s) the modal asks for —
@@ -30,7 +31,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.api.products import is_flipkart_link  # noqa: F401  (kept for parity; unused directly)
 from app.automation.email_swap import run_email_swap
-from app.automation.otp import get_otp_reader
+from app.automation.otp import RoutedOtpReader, get_otp_reader
 from app.config import get_settings
 from app.core import app_settings, session_store
 from app.core.browser import browser_page
@@ -139,6 +140,130 @@ def upload_swaps(payload: UploadIn, db: DbSession = Depends(get_db)) -> UploadOu
     return UploadOut(batch=batch, created=created, skipped=skipped, errors=errors[:50])
 
 
+class AddressCheck(BaseModel):
+    email: str
+    #: Which inbox reads this address's codes ("InstAddr vikramten (m.kuku.lu)",
+    #: "Microsoft 365 prem@askcaayush.com (every @askcaayush.com account)", …).
+    inbox: str | None = None
+    readable: bool
+    problem: str | None = None
+
+
+class SwapCheckOut(BaseModel):
+    account_id: int | None
+    account_status: str | None
+    has_session: bool
+    old: AddressCheck
+    new: AddressCheck | None = None
+    #: Another account already logs in with the new email.
+    new_in_use: bool = False
+    #: A swap for this account is already pending or running.
+    already_queued: bool = False
+    ok: bool
+    reasons: list[str] = Field(default_factory=list)
+
+
+class SwapOneIn(BaseModel):
+    old_email: str = Field(..., min_length=3, max_length=255)
+    new_email: str = Field(..., min_length=3, max_length=255)
+
+
+async def _check_address(reader, address: str) -> AddressCheck:
+    """Which inbox serves ``address`` and whether it can really be read now —
+    the same check the worker makes before asking Flipkart for codes."""
+    label = None
+    if isinstance(reader, RoutedOtpReader):
+        _, label = reader.reader_for(address)
+    problem = await reader.probe(address)
+    return AddressCheck(email=address, inbox=label, readable=problem is None, problem=problem)
+
+
+async def _swap_check(db: DbSession, old_email: str, new_email: str | None) -> SwapCheckOut:
+    old_email = old_email.strip().lower()
+    new_email = (new_email or "").strip().lower() or None
+    reader = get_otp_reader(get_settings())
+    account = db.scalar(select(Account).where(func.lower(Account.email) == old_email))
+    reasons: list[str] = []
+    has_session = bool(account and session_store.stored_cookies(db, account))
+    if account is None:
+        reasons.append(f"no account has the email {old_email}")
+    elif not has_session:
+        reasons.append("the account has no saved Flipkart session — sign it in first")
+
+    old = await _check_address(reader, old_email)
+    if not old.readable:
+        reasons.append(f"the code for the old address cannot be read: {old.problem}")
+
+    new = None
+    new_in_use = False
+    if new_email:
+        if "@" not in new_email:
+            reasons.append("the new email is not an email address")
+        elif new_email == old_email:
+            reasons.append("the new email is the same as the old one")
+        new_in_use = bool(
+            db.scalar(select(func.count(Account.id)).where(func.lower(Account.email) == new_email))
+        )
+        if new_in_use:
+            reasons.append(f"another account already uses {new_email}")
+        new = await _check_address(reader, new_email)
+        if not new.readable:
+            reasons.append(f"the code for the new address cannot be read: {new.problem}")
+    else:
+        reasons.append("enter the new email")
+
+    already_queued = bool(
+        db.scalar(
+            select(func.count(EmailSwap.id)).where(
+                EmailSwap.old_email == old_email, EmailSwap.status.in_(("pending", "running"))
+            )
+        )
+    )
+    if already_queued:
+        reasons.append("a swap for this account is already queued or running")
+    return SwapCheckOut(
+        account_id=account.id if account else None,
+        account_status=(account.status.value if hasattr(account.status, "value") else str(account.status))
+        if account
+        else None,
+        has_session=has_session,
+        old=old,
+        new=new,
+        new_in_use=new_in_use,
+        already_queued=already_queued,
+        ok=not reasons,
+        reasons=reasons,
+    )
+
+
+@router.get("/check", response_model=SwapCheckOut)
+async def check_swap(old_email: str, new_email: str | None = None, db: DbSession = Depends(get_db)) -> SwapCheckOut:
+    """Before swapping one account: does it exist with a session, is the new
+    email free, and can BOTH codes be read (the inbox is really opened)?"""
+    return await _swap_check(db, old_email, new_email)
+
+
+@router.post("/one", response_model=SwapRowOut)
+async def swap_one(payload: SwapOneIn, db: DbSession = Depends(get_db)) -> SwapRowOut:
+    """Swap a single account picked on the page. Refused, with every reason,
+    unless the same checks as ``/check`` pass — so a click never asks
+    Flipkart for a code nobody can read."""
+    check = await _swap_check(db, payload.old_email, payload.new_email)
+    if not check.ok:
+        raise HTTPException(status_code=422, detail="; ".join(check.reasons))
+    row = EmailSwap(
+        batch=f"single-{uuid.uuid4().hex[:8]}",
+        old_email=payload.old_email.strip().lower(),
+        new_email=payload.new_email.strip().lower(),
+        status="pending",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    _ensure_worker()
+    return SwapRowOut.model_validate(row)
+
+
 @router.get("/items", response_model=list[SwapRowOut])
 def list_swaps(batch: str | None = None, limit: int = 500, db: DbSession = Depends(get_db)) -> list[SwapRowOut]:
     q = select(EmailSwap).order_by(EmailSwap.id.desc())
@@ -223,6 +348,22 @@ async def _process_one(swap_id: int) -> None:
             return
         proxy = str(app_settings.get_effective(db).get("proxy_server") or "") or None
         account_id = account.id
+
+    # Flipkart mails a code to BOTH addresses. Check each can really be read
+    # before asking for them: a code nobody can read only wastes the attempt.
+    problems = [
+        f"{which} {address}: {problem}"
+        for which, address in (("old", old_email), ("new", new_email))
+        if (problem := await reader.probe(address))
+    ]
+    if problems:
+        with SessionLocal() as db:
+            swap = db.get(EmailSwap, swap_id)
+            if swap:
+                swap.status, swap.stage = "failed", "otp_unreadable"
+                swap.message = ("cannot read the code for " + "; ".join(problems))[:500]
+                db.commit()
+        return
 
     # Drive the browser outside the DB session.
     try:

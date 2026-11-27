@@ -477,3 +477,103 @@ def test_the_card_preview_pairs_corpassist_cards_by_balance_with_the_runs_minimu
     assert narrowed["paired"] == 1 and narrowed["accounts"][0]["card_last4"] == CARD_B[-4:]
     refused = preview(card_min_remaining="9000")
     assert refused.status_code == 422 and "none has money left" in refused.json()["detail"]
+
+
+def test_bob_corpassist_csv_pairs_by_balance_without_email_and_strips_password_apostrophe(client, auth_headers, db):
+    """External BOB hdfc_corpassist_cards_*.csv exports have no email column,
+    prefix PANs with 'C', prefix passwords with an Excel apostrophe, and carry
+    parent_card_number + remaining_amount. Multi-account preview & runs must
+    accept them directly without requiring the cards in hdfc_child_cards first."""
+    import io
+    from app.db.models import Account, AccountStatus
+    from app.io.cards import parse_card_sheet
+
+    accounts = [Account(email=f"bob{i}@test.com", status=AccountStatus.session_valid) for i in (1, 2)]
+    db.add_all(accounts)
+    db.commit()
+    ids = ",".join(str(a.id) for a in accounts)
+
+    sheet = (
+        "name,card_number,expiry_month,expiry_year,cvv,password,card_amount,parent_card_number,status,remaining_amount\n"
+        f"CorpAssist demo,C{CARD_A},11,2026,123,'0123456,15000,C4000000000009999,completed,5000\n"
+        f"CorpAssist demo,C{CARD_B},11,2026,'045,'0987654,15000,C4000000000009999,completed,15000\n"
+        f"CorpAssist demo,C{CARD_C},11,2026,999,'1111111,15000,C4000000000009999,cancelled,15000\n"
+    ).encode()
+
+    parsed = parse_card_sheet(io.BytesIO(sheet))
+    assert [r.number for r in parsed.records] == [CARD_A, CARD_B, CARD_C]
+    assert [r.password for r in parsed.records] == ["0123456", "0987654", "1111111"]
+    assert parsed.records[1].cvv == "045"
+    assert all(r.is_virtual_pool for r in parsed.records)
+
+    resp = client.post(
+        "/jobs/order/card-preview",
+        data={"account_ids": ids},
+        files={"cards_file": ("hdfc_corpassist_cards_2026-11-23.csv", sheet, "text/csv")},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["paired_by"] == "balance"
+    assert body["paired"] == 2
+    assert [row["card_last4"] for row in body["accounts"]] == [CARD_B[-4:], CARD_A[-4:]]
+    assert all(row["has_password"] is True for row in body["accounts"])
+
+    narrowed = client.post(
+        "/jobs/order/card-preview",
+        data={"account_ids": ids, "card_min_remaining": "10000"},
+        files={"cards_file": ("hdfc_corpassist_cards_2026-11-23.csv", sheet, "text/csv")},
+        headers=auth_headers,
+    )
+    assert narrowed.status_code == 200 and narrowed.json()["paired"] == 1
+    assert narrowed.json()["accounts"][0]["card_last4"] == CARD_B[-4:]
+
+
+def test_split_expiry_handles_three_part_calendar_dates():
+    from app.io.cards import _split_expiry
+
+    assert _split_expiry("05-11-2026") == ("11", "2026")
+    assert _split_expiry("23-11-2026") == ("11", "2026")
+    assert _split_expiry("2026-11-23") == ("11", "2026")
+    assert _split_expiry("11/26") == ("11", "26")
+
+
+def test_sync_keeps_payment_not_confirmed_from_bank_as_unconfirmed(db):
+    from types import SimpleNamespace
+    from app.core import order_status
+    from app.db.models import Account, AccountStatus, Order, OrderStatus
+    from app.jobs.sync_tasks import _adopt_unconfirmed, _apply
+
+    assert order_status.payment_unconfirmed("Payment not yet confirmed from the bank") is True
+    assert order_status.payment_unconfirmed("Order Confirmed") is False
+
+    acct = Account(email="bankcheck@catbar.net", status=AccountStatus.session_valid)
+    db.add(acct)
+    db.flush()
+    row = Order(
+        account_id=acct.id,
+        status=OrderStatus.unconfirmed,
+        model="vivo T5 Lite 44W 5G",
+        amount=16419.0,
+        qty=1,
+    )
+    db.add(row)
+    db.commit()
+
+    obs_pending = SimpleNamespace(
+        order_id="OD999000111222333",
+        model="vivo T5 Lite 44W 5G",
+        amount=16419.0,
+        platform_status="Payment not yet confirmed from the bank",
+    )
+    adopted = _adopt_unconfirmed(db, acct.id, obs_pending)
+    assert adopted is not None
+    assert adopted.order_id == "OD999000111222333"
+    assert adopted.status == OrderStatus.unconfirmed
+
+    # Once Flipkart later confirms the order, sync promotes it to placed.
+    obs_confirmed = SimpleNamespace(platform_status="Order Confirmed")
+    _apply(adopted, obs_confirmed)
+    assert adopted.status == OrderStatus.placed
+
+

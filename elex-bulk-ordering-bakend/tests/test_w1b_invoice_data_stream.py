@@ -36,7 +36,6 @@ from app.core.security import create_access_token
 from app.db.base import SessionLocal, engine
 from app.db.models import Account, AccountStatus, Invoice, Order, OrderStatus
 from app.io import invoice_data_csv
-from app.io.orders_csv import safe_row
 from app.io.invoice_pdf import PARSER_VERSION
 
 TYPES = ["Product", "Secure Packaging Fee", "Offer Handling Fee", 'Odd, "quoted" Fee', "Credit Note"]
@@ -61,22 +60,32 @@ def _old_data_rows(db, flt, types):
             Invoice.id.asc(),
         )
     )
-    return [(invoice, order) for invoice, order in db.execute(stmt).all()]
+    pairs = [(invoice, order) for invoice, order in db.execute(stmt).all()]
+    # What data_pairs gives each order since 27 Nov 2026 (the owner's
+    # reference layout), looked up here for every order at once.
+    orders_by_pk = {order.id: order for _invoice, order in pairs}
+    titles = invoices._product_titles(db, orders_by_pk)
+    buyers = invoices._billed_businesses(db, orders_by_pk.values())
+    for order in orders_by_pk.values():
+        order.invoice_product_title = titles.get(order.id)
+        order.invoice_buyer_name, order.invoice_buyer_gstin = buyers.get(order.id, (None, None))
+    return pairs
 
 
 def _old_stream(pairs):
     """app.io.invoice_data_csv.stream as it was: one piece per invoice. Each
     line passes the same last formula guard the real one gives every line
     (orders_csv.safe_row, 27 Oct 2026): this test is about the streaming,
-    which must leave the file byte for byte as it was."""
+    which must leave the file byte for byte as it was. (Since 27 Nov 2026 the
+    reference layout: no BOM, and the guard that keeps tab-IMEIs as they are.)"""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\r\n")
     writer.writerow(invoice_data_csv.HEADERS)
-    yield "﻿" + buffer.getvalue()
+    yield buffer.getvalue()
     for invoice, order in pairs:
         buffer.seek(0)
         buffer.truncate()
-        writer.writerows(safe_row(row) for row in invoice_data_csv.rows_for(invoice, order))
+        writer.writerows([invoice_data_csv.guard(cell) for cell in row] for row in invoice_data_csv.rows_for(invoice, order))
         yield buffer.getvalue()
 
 
@@ -95,8 +104,8 @@ def _new_csv(flt, types, *, chunk: int | None = None) -> tuple[str, int]:
 
 
 def _data_rows(text: str) -> list[list[str]]:
-    assert text.startswith("﻿")
-    return list(csv.reader(io.StringIO(text[1:])))[1:]
+    assert not text.startswith("﻿")
+    return list(csv.reader(io.StringIO(text)))[1:]
 
 
 # --- a few hundred rows ------------------------------------------------------------------------

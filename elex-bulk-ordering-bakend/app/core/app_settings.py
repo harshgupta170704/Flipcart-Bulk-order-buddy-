@@ -2,10 +2,13 @@
 
 ``app.config.Settings`` is read once from the environment at import time, which
 is right for deployment-level values (database URL, JWT secret) but wrong for
-the knobs the operator changes from the UI mid-flight — concurrency, headless,
-proxy, OTP inbox (PLAN.md §6 "Settings"). The business block (GSTIN, name,
-address, pin) that once sat beside them moved to the Address Book; its keys are
-no longer editable, and :func:`get_overrides` drops them from an older saved row.
+the knobs the operator changes from the UI mid-flight — concurrency, proxy, OTP
+inbox (PLAN.md §6 "Settings"). The business block (GSTIN, name, address, pin)
+that once sat beside them moved to the Address Book; its keys are no longer
+editable, and :func:`get_overrides` drops them from an older saved row. So did
+``browser_headless`` on 24 Nov 2026: hidden or shown is each machine's own
+choice, in its own .env (``ORDERING_BROWSER_HEADLESS``), never a value saved
+here for every machine on the database at once.
 
 Those live in one ``app_settings`` row keyed ``app`` as a JSON object, and
 ``get_effective`` merges them over the env values. Everything that needs a knob
@@ -34,7 +37,6 @@ SETTINGS_KEY = "app"
 #: The only keys the UI/API may write. Order is the display order in the UI.
 EDITABLE_FIELDS: tuple[str, ...] = (
     "max_concurrency",
-    "browser_headless",
     "proxy_server",
     "sync_every_hours",
     "track_every_minutes",
@@ -194,7 +196,7 @@ def _coerce(key: str, value: Any) -> Any:
         return _coerce_int(key, value, minimum=OTP_POLL_RANGE[0], maximum=OTP_POLL_RANGE[1])
     if key == "otp_fetch_timeout":
         return _coerce_int(key, value, minimum=OTP_WAIT_RANGE[0], maximum=OTP_WAIT_RANGE[1])
-    if key in ("browser_headless", "otp_imap_use_ssl", "employee_phones_assume_online"):
+    if key in ("otp_imap_use_ssl", "employee_phones_assume_online"):
         return _coerce_bool(key, value)
     if key == "proxy_server":
         return _coerce_proxy(key, value)
@@ -272,7 +274,8 @@ def set_overrides(db: DbSession, values: dict) -> dict:
 
 
 def get_effective(db: DbSession) -> dict:
-    """Env defaults for every editable field, overlaid with saved overrides."""
+    """Env defaults for every editable field, overlaid with saved overrides.
+    ``browser_headless`` is not among them: read ``get_settings()`` for it."""
     settings = get_settings()
     effective = {field: getattr(settings, field) for field in EDITABLE_FIELDS}
     effective.update(get_overrides(db))

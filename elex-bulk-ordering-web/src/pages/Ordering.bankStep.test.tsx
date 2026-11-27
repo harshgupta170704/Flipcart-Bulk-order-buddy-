@@ -34,6 +34,8 @@ vi.mock("../components/RunAccounts", () => ({
   useRunAccounts: () => ({ accounts: [], loading: false, error: null, reload: () => undefined, total: 0, truncated: false }),
 }));
 
+vi.mock("../lib/auth", () => ({ useAuth: () => ({ isAdmin: true }) }));
+
 import Ordering from "./Ordering";
 
 const TITLE = "You finish the bank's step in this run";

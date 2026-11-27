@@ -55,6 +55,14 @@ export interface AccountPickerProps {
   idsOnly?: boolean;
   /** Tags, subscriptions and domains as checkbox lists (the order form's Email ID Filters). */
   checklists?: boolean;
+  /**
+   * The ticks say exactly what will run (Smart Bulk Order). "All matching"
+   * shows every row ticked on every page under a "Select all" box; unticking
+   * a row from there drops only that row; unticking everything leaves NONE
+   * selected (an empty ids selection the host must refuse to start) instead
+   * of quietly meaning "all". Ignored for an `idsOnly` host.
+   */
+  explicitTicks?: boolean;
   disabled?: boolean;
   className?: string;
 }
@@ -66,9 +74,12 @@ export function AccountPicker({
   label = "Accounts",
   idsOnly = false,
   checklists = false,
+  explicitTicks = false,
   disabled = false,
   className = "",
 }: AccountPickerProps) {
+  /** Ticks mean "will run", and "nothing ticked" means nothing. */
+  const explicit = explicitTicks && !idsOnly;
   /* Hosts pass `["session_valid"]` inline, so a fresh array arrives on every
      render. Key it by value: everything below memoises off it, and an array
      that changed identity but not content would otherwise rebuild the filter
@@ -149,23 +160,29 @@ export function AccountPicker({
   const tickedSet = useMemo(() => new Set(tickedIds), [tickedIds]);
   const pageIds = useMemo(() => q.items.map((account) => account.id), [q.items]);
 
+  /** Explicit ticks: "all matching" is every row ticked, on every page. */
+  const allMatchingTicked = explicit && value.mode === "filter";
+  const isTicked = (id: number) => allMatchingTicked || tickedSet.has(id);
+
   const setIds = useCallback(
     (ids: number[]) => {
       // Never emit an empty ids selection: "nothing ticked" has a meaning, and
       // that meaning is the default selection, stated with its real count.
-      onChangeRef.current(ids.length === 0 ? defaultSelection : { mode: "ids", ids });
+      // With explicit ticks it means none, and the host refuses to start.
+      if (ids.length === 0) {
+        onChangeRef.current(explicit ? { mode: "ids", ids: [] } : defaultSelection);
+        return;
+      }
+      // Every match ticked by hand is the same set as "all matching", and
+      // saying it as the filter keeps the Select all box honest.
+      if (explicit && q.total > 0 && ids.length >= q.total) {
+        onChangeRef.current(defaultSelection);
+        return;
+      }
+      onChangeRef.current({ mode: "ids", ids });
     },
-    [defaultSelection],
+    [defaultSelection, explicit, q.total],
   );
-
-  const toggleRow = (id: number) => {
-    if (disabled) return;
-    setIds(tickedSet.has(id) ? tickedIds.filter((x) => x !== id) : [...tickedIds, id]);
-  };
-
-  const allPageTicked = pageIds.length > 0 && pageIds.every((id) => tickedSet.has(id));
-
-  /* --- "all N matching" -------------------------------------------------- */
 
   const [resolving, setResolving] = useState(false);
   const [resolveError, setResolveError] = useState<string | null>(null);
@@ -176,6 +193,59 @@ export function AccountPicker({
       alive.current = false;
     };
   }, []);
+
+  /* The filter on screen right now, so an answer that comes back after the
+     user changed the filter is dropped instead of landing on the new one. */
+  const currentFilterKey = useRef("");
+  useEffect(() => {
+    currentFilterKey.current = filterKey(q.filter);
+  }, [q.filter]);
+
+  /** Every match's id (up to one run's worth), or null after saying why not. */
+  const resolveMatching = async (): Promise<number[] | null> => {
+    const asked = currentFilterKey.current;
+    setResolving(true);
+    try {
+      const resolved = await listAccountIds(q.filter, RUN_ACCOUNT_CEILING);
+      if (!alive.current || currentFilterKey.current !== asked) return null;
+      if (resolved.truncated) {
+        setResolveError(
+          `${formatCount(resolved.total)} accounts match — more than the ${formatCount(RUN_ACCOUNT_CEILING)} a single run can take. Narrow the filter further.`,
+        );
+        return null;
+      }
+      return resolved.ids;
+    } catch (err) {
+      if (alive.current) setResolveError(errorMessage(err));
+      return null;
+    } finally {
+      if (alive.current) setResolving(false);
+    }
+  };
+
+  const toggleRow = async (id: number) => {
+    if (disabled || resolving) return;
+    if (allMatchingTicked) {
+      // Unticking one row out of "all": every other match stays ticked, on
+      // every page, so the set has to be named id by id from here on.
+      setResolveError(null);
+      const ids = await resolveMatching();
+      if (ids !== null) setIds(ids.filter((x) => x !== id));
+      return;
+    }
+    setIds(tickedSet.has(id) ? tickedIds.filter((x) => x !== id) : [...tickedIds, id]);
+  };
+
+  const allPageTicked = pageIds.length > 0 && pageIds.every((id) => isTicked(id));
+
+  /* The Select all box shows a dash while only some accounts are ticked. */
+  const selectAllBox = useRef<HTMLInputElement>(null);
+  const someTicked = explicit && value.mode === "ids" && value.ids.length > 0;
+  useEffect(() => {
+    if (selectAllBox.current) selectAllBox.current.indeterminate = someTicked;
+  }, [someTicked]);
+
+  /* --- "all N matching" -------------------------------------------------- */
 
   /** Only a host that can carry a filter gets the filter straight through. */
   const overCeiling = idsOnly && q.narrowed && q.total > RUN_ACCOUNT_CEILING;
@@ -226,6 +296,15 @@ export function AccountPicker({
   const runCount = value.mode === "ids" ? value.ids.length : value.count;
 
   const summary = (() => {
+    if (explicit) {
+      if (value.mode === "filter") {
+        return `All ${countLabel(runCount, "account")} selected, on every page — all of them will run.`;
+      }
+      if (value.ids.length === 0) {
+        return "No account ticked — nothing will run. Tick some, or Select all.";
+      }
+      return `${formatCount(value.ids.length)} of ${countLabel(q.total, "account")} ticked — exactly those will run.`;
+    }
     if (value.mode === "ids") {
       return `${countLabel(value.ids.length, "account")} ticked — exactly those will run.`;
     }
@@ -278,9 +357,9 @@ export function AccountPicker({
                 <input
                   id={rowId}
                   type="checkbox"
-                  checked={tickedSet.has(account.id)}
-                  disabled={disabled}
-                  onChange={() => toggleRow(account.id)}
+                  checked={isTicked(account.id)}
+                  disabled={disabled || resolving}
+                  onChange={() => void toggleRow(account.id)}
                   className="size-4 shrink-0 accent-accent"
                 />
                 <label htmlFor={rowId} className="min-w-0 flex-1 cursor-pointer">
@@ -345,6 +424,42 @@ export function AccountPicker({
         />
       ) : null}
 
+      {explicit ? (
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="mr-2 flex cursor-pointer items-center gap-2 text-[13px] font-medium text-ink">
+          <input
+            ref={selectAllBox}
+            type="checkbox"
+            name="select_all_matching"
+            checked={allMatchingTicked}
+            disabled={disabled || resolving || q.total === 0}
+            onChange={() => {
+              setResolveError(null);
+              if (allMatchingTicked) setIds([]);
+              else void selectAllMatching();
+            }}
+            className="size-4 shrink-0 accent-accent"
+          />
+          {resolving ? "Selecting…" : `Select all ${formatCount(q.total)} (every page)`}
+        </label>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={disabled || resolving || q.items.length === 0 || allPageTicked}
+          onClick={() => setIds(Array.from(new Set([...tickedIds, ...pageIds])))}
+        >
+          Tick this page
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={disabled || resolving || (value.mode === "ids" && value.ids.length === 0)}
+          onClick={() => setIds([])}
+        >
+          Untick all
+        </Button>
+      </div>
+      ) : (
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
@@ -375,6 +490,7 @@ export function AccountPicker({
           Clear ticks
         </Button>
       </div>
+      )}
 
       <p className="text-[12px] leading-snug text-ink-2" aria-live="polite">
         {summary}
@@ -407,8 +523,9 @@ export function AccountPicker({
 
       {value.mode === "filter" && q.total > 0 ? (
         <p className="text-[12px] leading-snug text-muted">
-          Every account the filter matches is in the run, including the ones on other pages. Tick
-          rows below to narrow it to just those.
+          {explicit
+            ? "Every account on every page is ticked. Untick any you want to leave out."
+            : "Every account the filter matches is in the run, including the ones on other pages. Tick rows below to narrow it to just those."}
         </p>
       ) : null}
 

@@ -104,6 +104,8 @@ export interface RunAccountPickerProps {
   emptyAction?: ReactNode;
   /** Tags, subscriptions and domains as checkbox lists. */
   checklists?: boolean;
+  /** Ticks say exactly what will run; see AccountPicker's `explicitTicks`. */
+  explicitTicks?: boolean;
   className?: string;
 }
 
@@ -129,6 +131,7 @@ export function RunAccountPicker({
   disabled,
   emptyAction,
   checklists,
+  explicitTicks = false,
   className = "",
 }: RunAccountPickerProps) {
   const idsOnly = onSelectionChange === undefined;
@@ -192,7 +195,10 @@ export function RunAccountPicker({
           Showing the accounts that last loaded — the refresh failed: {state.error}
         </p>
       ) : null}
-      {state.truncated ? (
+      {/* A host with explicit ticks sends the selection itself (a filter or
+          ids), never "the accounts this page loaded", so the note is untrue
+          there. */}
+      {state.truncated && !explicitTicks ? (
         <p role="status" className="text-[12px] text-ink-2">
           This page's own tables and totals cover the first {formatCount(state.accounts.length)} of{" "}
           {formatCount(state.total)} accounts, while the picker counts and filters all{" "}
@@ -208,6 +214,7 @@ export function RunAccountPicker({
         label={label}
         idsOnly={idsOnly}
         checklists={checklists}
+        explicitTicks={explicitTicks}
         disabled={disabled}
       />
     </div>
