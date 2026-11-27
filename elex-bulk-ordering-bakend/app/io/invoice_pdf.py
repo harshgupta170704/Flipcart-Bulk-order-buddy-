@@ -71,7 +71,12 @@ _clock = time.monotonic
 #: "… Fee"), "GT Charges" for Flipkart India's delivery/transport invoice,
 #: "<what it reverses> Credit Note" — and the seller of a "Billed From" block
 #: printed on a line of its own (Flipkart's layout of Nov 2026).
-PARSER_VERSION = 4
+#: 5 (27 Nov 2026): a credit note whose "Original Invoice Number:" and
+#: "Reason Of Issuance:" labels stand alone in a column, the values lines
+#: below beside the address column (read before as "Phone" / "State Code: …").
+#: The original number is the first invoice-style number after its label; the
+#: reason, as in the owner's reference file, "Place of Supply: <STATE>".
+PARSER_VERSION = 5
 
 KIND_PRODUCT = "product"
 KIND_FEE = "fee"
@@ -150,7 +155,30 @@ _GRAND_TOTAL = re.compile(r"Grand Total\s*₹?\s*(" + _NUM + ")", re.IGNORECASE)
 _ORIGINAL_INVOICE = re.compile(
     r"Original Invoice(?:\s+(?:Number|No\.?))?\s*[#:]\s*([A-Z0-9][A-Z0-9/-]*)", re.IGNORECASE
 )
-_REASON = re.compile(r"^[^\S\n]*Reason(?:\s+(?:of|for)\s+[^:\n]*)?\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_ORIGINAL_INVOICE_LABEL = re.compile(r"Original Invoice(?:\s+(?:Number|No\.?))?\s*[#:]", re.IGNORECASE)
+#: An invoice / credit-note number: two letters, then letters and digits
+#: (LIAAJYY270010016, MXACX27009450558, FASUUT2500113513). Told apart from an
+#: FSN (MOBHKHPY6XQGZXNK) by its digits — see :func:`_is_invoice_number`.
+_INVOICE_LIKE = re.compile(r"\b[A-Z]{2}[A-Z0-9]{10,18}\b")
+#: Same line only: "Reason Of Issuance:" with nothing after it must not take
+#: the next line (it did, and read the address column as the reason).
+_REASON = re.compile(
+    r"^[^\S\n]*Reason(?:[^\S\n]+(?:of|for)[^\S\n]+[^:\n]*)?[^\S\n]*:[^\S\n]*(\S.*?)[^\S\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PLACE_OF_SUPPLY = re.compile(r"^\s*Place of Supply\s*:\s*(.*)$", re.IGNORECASE)
+#: For a "Place of Supply" state broken over two lines ("UTTAR" / "PRADESH").
+_INDIAN_STATES = frozenset(
+    s.upper()
+    for s in (
+        "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh", "Goa", "Gujarat", "Haryana",
+        "Himachal Pradesh", "Jharkhand", "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur",
+        "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana",
+        "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal", "Andaman and Nicobar Islands", "Chandigarh",
+        "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Jammu and Kashmir", "Ladakh", "Lakshadweep",
+        "Puducherry",
+    )
+)
 _CREDIT_NOTE = re.compile(r"\bCredit\s+Note\b", re.IGNORECASE)
 _BILL_TO = re.compile(r"\bBill(?:ing)?\s+(?:To|Address)\b", re.IGNORECASE)
 _SHIP_TO = re.compile(r"\bShip(?:ping)?\s+(?:To|Address)\b", re.IGNORECASE)
@@ -489,6 +517,57 @@ def _buyer_name(lines: list[str]) -> str | None:
     return None
 
 
+def _is_invoice_number(token: str | None) -> bool:
+    """An invoice number carries many digits; an FSN or a label word does not,
+    and an order id (OD + digits) is not one."""
+    if not token:
+        return False
+    if token.startswith("OD") and token[2:].isdigit():
+        return False
+    return sum(ch.isdigit() for ch in token) >= 6
+
+
+def _original_invoice(flat: str, own_number: str | None) -> str | None:
+    """The invoice a credit note reverses.
+
+    On the label's own line when Flipkart prints it there ("Original Invoice
+    Number # FASUUT…"); otherwise the label stands alone and the number comes
+    a line or two later, next to the address column — the first
+    invoice-style number after the label that is not the note's own.
+    """
+    inline = _first(_ORIGINAL_INVOICE, flat)
+    if _is_invoice_number(inline):
+        return inline
+    label = _ORIGINAL_INVOICE_LABEL.search(flat)
+    if label is None:
+        return None
+    for token in _INVOICE_LIKE.findall(flat[label.end():]):
+        if token != own_number and _is_invoice_number(token):
+            return token
+    return None
+
+
+def _place_of_supply(lines: list[str]) -> str | None:
+    """"Place of Supply: UTTAR PRADESH" — what the owner's reference file holds
+    as a credit note's "Reason Of Issuance" when the reason box is empty —
+    with a state broken over two lines put back together."""
+    for index, raw in enumerate(lines):
+        match = _PLACE_OF_SUPPLY.match(raw.split("\t")[0])
+        if match is None:
+            continue
+        state = _collapse(match.group(1)).upper()
+        if state not in _INDIAN_STATES:
+            # The rest of the name can sit a line or two below, with another
+            # label ("Reason Of Issuance:") printed in between.
+            for following in lines[index + 1 : index + 4]:
+                joined = _collapse(f"{state} {following.split(chr(9))[0]}").upper()
+                if joined in _INDIAN_STATES:
+                    state = joined
+                    break
+        return f"Place of Supply: {state}" if state else None
+    return None
+
+
 def parse_invoice_text(text: str) -> ParsedInvoice:
     """Read one invoice from its text. Pure: no file, no PDF library."""
     out = ParsedInvoice()
@@ -522,8 +601,8 @@ def parse_invoice_text(text: str) -> ParsedInvoice:
     if is_credit_note:
         out.kind = KIND_CREDIT_NOTE
         out.invoice_type = TYPE_CREDIT_NOTE
-        out.original_invoice = _first(_ORIGINAL_INVOICE, flat)
-        out.reason = _first(_REASON, flat)
+        out.original_invoice = _original_invoice(flat, out.invoice_number)
+        out.reason = _first(_REASON, flat) or _place_of_supply(lines)
 
     header_at = columns = None
     for index, raw in enumerate(lines):
