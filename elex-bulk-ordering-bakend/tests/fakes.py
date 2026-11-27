@@ -53,11 +53,15 @@ class FakeLocator:
         limit = self.page.max_chars.get(self.xpath)
         self.page.fills[self.xpath] = typed if limit is None else typed[:limit]
 
-    async def press(self, key: str, delay: int | None = None, timeout: int | None = None) -> None:
+    async def press(
+        self, key: str, delay: int | None = None, timeout: int | None = None, no_wait_after: bool | None = None
+    ) -> None:
         """A key pressed in this box (Enter to submit a form)."""
+        if f"key:{key}@{self.xpath}" in self.page.fail_clicks_on:
+            raise RuntimeError(f"key not pressed: {key}")
         self.page.clicks.append(f"key:{key}@{self.xpath}")
 
-    async def click(self, timeout: int | None = None) -> None:
+    async def click(self, timeout: int | None = None, no_wait_after: bool | None = None) -> None:
         # Lets a test simulate an element that isn't on the page (e.g. Flipkart
         # not offering Cash on Delivery for a product/pincode).
         if self.xpath in self.page.fail_clicks_on:

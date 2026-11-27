@@ -31,6 +31,36 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "transfers", label: "Transfer Notes" },
 ];
 
+/** Rows listed per group in the COD cards result; the rest are counted. */
+export const COD_ROWS_SHOWN = 30;
+
+/** What "Update orders" did: the counts, then each row left out and why, and
+ *  the order ids not found — so a refused row is seen, not just counted. */
+export function CodCardsResult({ result }: { result: CodCardsUpdateResult }) {
+  const leftOut = result.skipped.length + result.not_found.length;
+  return (
+    <Alert
+      tone={leftOut ? "warning" : "info"}
+      title={`Updated: ${result.updated} · Not found: ${result.not_found.length} · Skipped: ${result.skipped.length}`}
+    >
+      {result.skipped.length ? (
+        <ul className="mt-1 list-disc pl-5">
+          {result.skipped.slice(0, COD_ROWS_SHOWN).map((line, index) => (
+            <li key={index}>{line}</li>
+          ))}
+          {result.skipped.length > COD_ROWS_SHOWN ? <li>And {result.skipped.length - COD_ROWS_SHOWN} more.</li> : null}
+        </ul>
+      ) : null}
+      {result.not_found.length ? (
+        <p className="mt-1 break-words">
+          Not found: {result.not_found.slice(0, COD_ROWS_SHOWN).join(", ")}
+          {result.not_found.length > COD_ROWS_SHOWN ? ` and ${result.not_found.length - COD_ROWS_SHOWN} more` : ""}.
+        </p>
+      ) : null}
+    </Alert>
+  );
+}
+
 export default function Inventory() {
   const [tab, setTab] = useState<Tab>("active");
   const [search, setSearch] = useState("");
@@ -153,7 +183,7 @@ export default function Inventory() {
     try {
       const res = await updateCodCards(codCsv);
       setCodResult(res);
-      setNotice(`Updated ${res.updated} COD order row(s).`);
+      setNotice(`Updated ${res.updated} Cash-on-Delivery order row(s).`);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -449,7 +479,7 @@ export default function Inventory() {
       <Dialog
         open={codOpen}
         title="Update COD Card Details"
-        description="Upload or paste CSV lines as order_id,card_number to backfill card numbers paid on COD delivery."
+        description="Upload or paste CSV lines as order_id,card_number to record the card a Cash-on-Delivery order was paid with at the door. Only Cash-on-Delivery orders are changed: a card-paid order keeps the card its run recorded."
         onClose={() => setCodOpen(false)}
         width="560px"
         footer={
@@ -481,11 +511,7 @@ export default function Inventory() {
             placeholder={"order_id,card_number\nOD433123456789012300,4111222233334444"}
             className="w-full rounded-control border border-line bg-surface p-2.5 font-mono text-[12.5px] text-ink"
           />
-          {codResult ? (
-            <Alert tone="info">
-              Updated: {codResult.updated} · Not found: {codResult.not_found.length} · Skipped: {codResult.skipped.length}
-            </Alert>
-          ) : null}
+          {codResult ? <CodCardsResult result={codResult} /> : null}
         </form>
       </Dialog>
     </div>

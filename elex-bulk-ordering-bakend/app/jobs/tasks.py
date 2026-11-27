@@ -58,13 +58,14 @@ from sqlalchemy.orm import Session as DbSession
 # here — one definition of "the default", not two that can drift apart.
 from app.api.addresses import default_address
 from app.api.gsts import default_gst
+from app.automation import challenges
 from app.automation.coupons import ERROR as COUPON_ERROR
 from app.automation.coupons import apply_coupon
 from app.automation.login import LoginRefused, NotRegistered, run_login
 from app.automation.mock_ordering import mock_message, mock_order
 from app.jobs.pacing import BatchOutcome, Pacing, accounts_at_once, run_paced
 from app.automation.ordering import CARD_MODES, GIFT_CARD_MODES
-from app.core.account_picking import least_recently_ordered_first, recently_ordered
+from app.core.account_picking import already_bought, least_recently_ordered_first, product_key, recently_ordered
 from app.core.card_pool import CapCounter, CardRules, is_payment_failure
 from app.core.order_outcomes import ErrorCode, classify as classify_order_outcome
 from app.core.step_timer import timing
@@ -202,9 +203,11 @@ async def run_login_job(
 
     async def worker(account_id: int, index: int) -> _Outcome:
         await tracker.item_started(account_id)
+        challenges.working_on(job_id, account_id)
         # When this login began: a session saved after it is another sign-in
         # that finished meanwhile, which a failure here must not undo.
         began = utcnow()
+        captcha_reason: str | None = None
 
         with _session() as db:
             account = db.get(Account, account_id)
@@ -240,6 +243,13 @@ async def run_login_job(
                     not_registered = False
                     cookies = None
                     refused = exc
+                except challenges.ChallengeFailed as exc:
+                    # A captcha nobody answered (or a block page): the reason
+                    # is the account's, and no session is saved.
+                    not_registered = False
+                    cookies = None
+                    refused = None
+                    captcha_reason = str(exc)
                 else:
                     not_registered = False
                     refused = None
@@ -291,7 +301,7 @@ async def run_login_job(
                 account = db.get(Account, account_id)
                 if account is not None:
                     session_store.forget_session(db, account, since=began)
-            return _Outcome(False, _with_steps("login not completed — no session saved", steps))
+            return _Outcome(False, _with_steps(captcha_reason or "login not completed — no session saved", steps))
 
         with _session() as db:
             account = db.get(Account, account_id)
@@ -545,6 +555,9 @@ async def run_order_job(
     exclude_ordered_days: int | None = None,
     # Try never-ordered accounts first, then those that ordered longest ago.
     smart_selection: bool = False,
+    # Pass over accounts with an order of this very product placed (or sent and
+    # not confirmed) at any time (app.core.account_picking.already_bought).
+    skip_bought_product: bool = False,
     # Card pool rules (app.core.card_pool): cooldown, least used first, a
     # hard cap per card, and skipping cards that failed lately. Card runs only.
     card_rules: CardRules | None = None,
@@ -593,8 +606,8 @@ async def run_order_job(
     it through (see ``run_order``).
 
     ``bank_step_by_hand`` hands the bank's step to a person at the computer the
-    tool runs on. This run's browser window is shown whatever the Settings page
-    says, the accounts go one at a time so the person meets one bank page at
+    tool runs on. This run's browser window is shown whatever this machine's
+    ORDERING_BROWSER_HEADLESS says, the accounts go one at a time so the person meets one bank page at
     once, and ``run_order`` gets each card without its bank password, so it
     types nothing on the bank's page: the person enters the password or the
     one-time code there, within the bank's allowance (``bank_otp_fill_wait``).
@@ -604,7 +617,7 @@ async def run_order_job(
         # No bank page in a mock run, so nothing for a person to finish.
         bank_step_by_hand = False
     if bank_step_by_hand:
-        # This run only: every other run keeps the Settings page's choice.
+        # This run only: every other run keeps this machine's .env choice.
         settings.browser_headless = False
     recent: set[int] = set()
     if smart_selection or exclude_ordered_days:
@@ -613,6 +626,15 @@ async def run_order_job(
                 account_ids = least_recently_ordered_first(db, account_ids)
             if exclude_ordered_days:
                 recent = recently_ordered(db, account_ids, exclude_ordered_days)
+    # Accounts that already bought this product are taken out of the run before
+    # cards are handed out and before any worker, batch or attempt is spent on
+    # them; they still get a job item, closed as skipped once the run starts.
+    bought: dict = {}
+    if skip_bought_product:
+        with _session() as db:
+            bought = already_bought(db, account_ids, product_link)
+    passed_over = [a for a in account_ids if a in bought]
+    account_ids = [a for a in account_ids if a not in bought]
     card_rules = card_rules or CardRules()
     card_blocked: dict[int, str] = {}
     card_caps: dict[str, int] = {}
@@ -622,11 +644,15 @@ async def run_order_job(
         account_ids, card_blocked, card_caps = card_plan.order, card_plan.blocked, card_plan.caps
     card_cap = CapCounter(card_rules.max_uses, per_card=card_caps)
     tracker = JobTracker(job_id)
-    tracker.start(account_ids)
+    tracker.start(account_ids + passed_over)
+    for account_id in passed_over:
+        await tracker.item_finished(
+            account_id, ok=False, message=f"{bought[account_id].describe()} — passed over", skipped=True
+        )
     # One browser for the whole run, one isolated window per account (PLAN.md
     # §10): it opens with the first account that asks and closes after the batch.
-    # A person looks at a by-hand run's windows, so their pictures stay on.
-    pool = _pool_for(settings, lean=not bank_step_by_hand)
+    # A person looks at a visible/by-hand run's windows, so their pictures stay on.
+    pool = _pool_for(settings, lean=bool(settings.browser_headless) and not bank_step_by_hand)
     cards = cards or {}
 
     try:
@@ -666,12 +692,36 @@ async def run_order_job(
         )
     #: Why accounts were passed over, for the one summary line at the end.
     skips: Counter[str] = Counter()
+    if skip_bought_product:
+        if passed_over:
+            skips["already bought this product"] += len(passed_over)
+            said = (
+                f"{len(passed_over)} account(s) already bought this product — passed over; "
+                f"{len(account_ids)} left to order on."
+            )
+        else:
+            said = "no account in this run has bought this product before."
+        if not product_key(product_link).readable:
+            said += (
+                " This link carries no product id (pid= or /p/itm…), so only orders"
+                " made with exactly the same link count."
+            )
+        _note_on_job(job_id, f"Skip accounts that already bought this product: {said}")
     #: Units submitted but never confirmed. The budget keeps them spent, so the
     #: summary names them apart rather than calling them placed.
     unconfirmed: Counter[str] = Counter()
     #: Orders that used their account's own GST, by GSTIN: the run shows one
     #: GST, so the job says which orders did not use it.
     own_gst: Counter[str] = Counter()
+    #: Built lazily once per run so InstAddr / IMAP configuration is loaded at
+    #: most once even across hundreds of unsigned-in accounts (e.g. @catbar.net),
+    #: and never touched when every account already has a saved session.
+    otp_reader_cache: list = []
+
+    def _order_otp_reader():
+        if not otp_reader_cache:
+            otp_reader_cache.append(get_otp_reader(settings))
+        return otp_reader_cache[0]
 
     async def worker(account_id: int, index: int) -> _Outcome:
         # The hard cap per card holds a use while the order runs, and gives it
@@ -684,6 +734,7 @@ async def run_order_job(
 
     async def attempt(account_id: int, index: int, held: list[str]) -> _Outcome:
         await tracker.item_started(account_id)
+        challenges.working_on(job_id, account_id)
 
         # The attempt cap is read off the account's position in the run, not off
         # a shared counter: the accounts run concurrently, so a counter would
@@ -705,6 +756,7 @@ async def run_order_job(
             account = db.get(Account, account_id)
             if account is None:
                 return _Outcome(False, "account not found")
+            email = account.email
             cookies = session_store.load_cookies(db, account)
             phone, account_gst = account_billing(account)
             coins = account.supercoins_balance
@@ -715,9 +767,15 @@ async def run_order_job(
                 f"SuperCoins {('not read yet' if coins is None else coins)} — below the minimum of {min_supercoins}",
                 skipped=True,
             )
-        if not cookies:
-            skips["no session"] += 1
-            return _Outcome(False, "no session", skipped=True)
+        needs_login = not cookies
+        if needs_login:
+            reader = None if mock else _order_otp_reader()
+            can_auto_login = reader is not None and (
+                reader.can_read(email) if hasattr(reader, "can_read") else True
+            )
+            if not can_auto_login:
+                skips["no session"] += 1
+                return _Outcome(False, "no session", skipped=True)
 
         # Cash on Delivery needs no card, so a missing one must not skip the
         # account the way it does on a card run.
@@ -852,6 +910,85 @@ async def run_order_job(
             _settle_claim(budget, claimed, result["qty"] if status == OrderStatus.placed else 0)
             return _Outcome(status == OrderStatus.placed, mock_message(result), **_ai_outcome_meta(status, result))
 
+        # On-demand OTP sign-in for accounts with 0 saved sessions (e.g. @catbar.net
+        # via InstAddr) — runs only after card, guard, and unit-budget gates pass
+        # so we never spend OTPs on accounts that will not place an order.
+        if needs_login:
+            began = utcnow()
+            not_registered = False
+            refused: LoginRefused | None = None
+            captcha_reason: str | None = None
+            login_error: str | None = None
+            new_cookies: list[dict] | None = None
+            try:
+                async with browser_page(
+                    headless=settings.browser_headless,
+                    proxy=settings.proxy_server or None,
+                    pool=pool,
+                ) as (_login_context, login_page):
+                    try:
+                        new_cookies = await run_login(
+                            login_page,
+                            email,
+                            _order_otp_reader(),
+                            window_wait=settings.fk_window_wait,
+                            otp_wait=settings.otp_fetch_timeout,
+                        )
+                    except NotRegistered:
+                        not_registered = True
+                    except LoginRefused as exc:
+                        refused = exc
+                    except challenges.ChallengeFailed as exc:
+                        captcha_reason = str(exc)
+                    if not new_cookies and not not_registered:
+                        from app.automation.ordering import _snapshot
+
+                        await _snapshot(login_page, f"order-autologin-failed-account{account_id}")
+            except Exception as exc:  # noqa: BLE001
+                login_error = _redact(str(exc) or exc.__class__.__name__)
+
+            if not_registered:
+                with _session() as db:
+                    acct = db.get(Account, account_id)
+                    if acct is not None:
+                        acct.status = AccountStatus.not_registered
+                        db.commit()
+                _settle_claim(budget, claimed, 0)
+                return _Outcome(
+                    False,
+                    "auto-login: this email is not registered on Flipkart — no OTP is sent",
+                )
+            if refused is not None:
+                with _session() as db:
+                    acct = db.get(Account, account_id)
+                    if acct is not None and session_store.forget_session(db, acct, since=began):
+                        acct.status = AccountStatus(refused.status)
+                        db.commit()
+                _settle_claim(budget, claimed, 0)
+                label = "blocked" if refused.status == "blocked" else "too many sign-in attempts"
+                return _Outcome(False, f"auto-login: {label} — {refused.reason}; no session saved")
+            if not new_cookies:
+                with _session() as db:
+                    acct = db.get(Account, account_id)
+                    if acct is not None:
+                        session_store.forget_session(db, acct, since=began)
+                _settle_claim(budget, claimed, 0)
+                reason = captcha_reason or login_error or "login not completed — no session saved"
+                return _Outcome(False, f"auto-login failed: {reason}")
+
+            with _session() as db:
+                acct = db.get(Account, account_id)
+                if acct is None:
+                    _settle_claim(budget, claimed, 0)
+                    return _Outcome(False, "account not found")
+                session_store.save_session(db, acct, new_cookies)
+            cookies = new_cookies
+            log.info(
+                "auto-logged in account %s before ordering (%d cookies)",
+                account_id,
+                len(cookies),
+            )
+
         #: The row written before the order was sent, if the run got that far.
         reserved: list[dict] = []
 
@@ -954,7 +1091,10 @@ async def run_order_job(
                 )
             else:
                 log.error("order failed for account %s: %s", account_id, reason)
-                _note_card_failure(card, reason, job_id)
+                if not isinstance(exc, challenges.ChallengeFailed):
+                    # A captcha is Flipkart doubting the session, never the
+                    # card: it must not count towards the card's failures.
+                    _note_card_failure(card, reason, job_id)
                 _settle_claim(budget, claimed, 0)
                 save_order_result(
                     account_id,
@@ -1774,12 +1914,14 @@ def _session() -> Iterator[DbSession]:
 def _effective_settings() -> SimpleNamespace:
     """Deployment config overlaid with whatever the Settings UI saved.
 
-    Jobs must honour the saved settings — concurrency, headless, proxy and the
-    OTP inbox — without needing a restart, so the
+    Jobs must honour the saved settings — concurrency, proxy and the OTP
+    inbox — without needing a restart, so the
     user-editable half comes from ``app_settings.get_effective`` (the single
     source of truth, keyed on ``app_settings.SETTINGS_KEY``) rather than from
     ``get_settings()`` alone. Deployment-only values (timeouts, database_url,
-    jwt_secret) are not editable over HTTP and pass through untouched.
+    jwt_secret) are not editable over HTTP and pass through untouched, and so
+    does ``browser_headless``: each machine's own .env, read when the process
+    starts (24 Nov 2026), so changing it needs a restart.
     """
     base = get_settings()
     merged = {name: getattr(base, name) for name in type(base).model_fields}
@@ -1794,7 +1936,7 @@ def _pool_for(settings, *, lean: bool = True) -> BrowserPool:
     launched until the first account asks for a window, so a run that passes
     every account over — or a test that stands in for ``browser_page`` —
     starts no browser at all. The run's settings are fixed here, once: a
-    proxy or headless change saved mid-run applies to the next run.
+    proxy change saved mid-run applies to the next run.
     ``lean=False`` keeps the pictures (and the telemetry) on, for windows a
     person looks at, as ``browser_page`` says."""
     return BrowserPool(

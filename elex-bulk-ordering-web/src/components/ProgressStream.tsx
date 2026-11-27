@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cancelJob, errorMessage } from "../lib/api";
-import { clampProgress, formatDuration, formatSpent, formatTime } from "../lib/format";
+import { clampProgress, countLabel, formatDuration, formatSpent, formatTime } from "../lib/format";
 import type { AiTrackerState, JobItem, JobItemStatus } from "../lib/types";
-import { useJobStream } from "../lib/useJobStream";
+import { jobNotes } from "../lib/types";
+import { useJobStream, type StreamEvent } from "../lib/useJobStream";
 import { AiTrackerCard } from "./AiTrackerCard";
 import { Alert } from "./Alert";
 import { Button } from "./Button";
@@ -48,6 +49,31 @@ const RANK: Record<JobItemStatus, number> = {
   skipped: 1,
   pending: 2,
 };
+
+/** How many IDs an "items_set_aside" event names. */
+function setAsideCount(event: StreamEvent): number {
+  return (event.groups ?? []).reduce(
+    (sum, group) => sum + (Array.isArray(group?.account_ids) ? group.account_ids.length : 0),
+    0,
+  );
+}
+
+/** One line of the "Latest" list: the event's message, else what happened. */
+function eventLine(event: StreamEvent): string {
+  if (event.type === "items_set_aside") {
+    return `${countLabel(setAsideCount(event), "ID")} set aside before the run started`;
+  }
+  if (event.type === "run_notes") {
+    // The note just added is the last one.
+    const notes = Array.isArray(event.notes) ? event.notes : [];
+    return notes.length > 0 ? notes[notes.length - 1] : "note added";
+  }
+  return event.message ?? event.type.replace(/_/g, " ");
+}
+
+/** Said for an order run from before Smart ID Selection, which saved no value
+ *  for it, as the Orders page's run settings say it. */
+const SMART_ID_OLDER_RUN = "Smart ID Selection: not available (older run)";
 
 /** Running first, then the most recent activity, then whatever is still waiting. */
 function byActivity(a: JobItem, b: JobItem): number {
@@ -151,7 +177,16 @@ export function ProgressStream({
   })();
 
   const sorted = items.slice().sort(byActivity);
-  const recent = events.slice(-6).reverse();
+  /* A setting aside that named no ID changed nothing, so it is not news. */
+  const recent = events
+    .filter((event) => event.type !== "items_set_aside" || setAsideCount(event) > 0)
+    .slice(-6)
+    .reverse();
+  /* What the run said about itself (Smart ID Selection on or off, IDs set
+     aside before it started), saved on the run as its notes. An order run
+     from before Smart ID Selection saved no value for it, and says so. */
+  const olderOrderRun = job?.type === "order" && typeof job.payload?.smart_id !== "boolean";
+  const notes = [...(olderOrderRun ? [SMART_ID_OLDER_RUN] : []), ...jobNotes(job?.payload)];
 
   return (
     <section
@@ -221,6 +256,14 @@ export function ProgressStream({
           </div>
         </div>
 
+        {notes.length > 0 ? (
+          <ul aria-label="Run notes" className="flex flex-col gap-0.5 text-[12px] leading-snug text-ink-2">
+            {notes.map((note, index) => (
+              <li key={index}>{note}</li>
+            ))}
+          </ul>
+        ) : null}
+
         {error ? <Alert tone="error">{error}</Alert> : null}
         {cancelError ? <Alert tone="error">{cancelError}</Alert> : null}
         {cancelRequested && !terminal ? (
@@ -245,9 +288,7 @@ export function ProgressStream({
                   <span className="shrink-0 tabular-nums text-muted">
                     {formatTime(event.receivedAt)}
                   </span>
-                  <span className="min-w-0 truncate">
-                    {event.message ?? event.type.replace(/_/g, " ")}
-                  </span>
+                  <span className="min-w-0 truncate">{eventLine(event)}</span>
                 </li>
               ))}
             </ul>

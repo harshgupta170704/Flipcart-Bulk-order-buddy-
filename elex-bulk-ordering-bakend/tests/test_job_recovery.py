@@ -181,3 +181,36 @@ def test_cancelling_the_phantom_does_not_clear_it_but_a_restart_does(db):
         pass
 
     assert _reload(db, job).status == JobStatus.failed
+
+
+def test_another_online_api_agent_protects_its_running_jobs(db):
+    """When two laptops share PostgreSQL, starting one must not kill the
+    other's active job — whether tagged with the other host or untagged."""
+    from app.db.models import Agent, naive_utcnow
+
+    db.add(
+        Agent(
+            name="api@other-macbook",
+            kind="api",
+            host="other-macbook",
+            enabled=True,
+            isolated=False,
+            last_seen_at=naive_utcnow(),
+        )
+    )
+    db.commit()
+
+    other_tagged = _job(db, JobStatus.running, job_type=JobType.order)
+    other_tagged.payload = {"agent": "api@other-macbook"}
+    untagged = _job(db, JobStatus.running, job_type=JobType.login)
+    mine = _job(db, JobStatus.running, job_type=JobType.order)
+    mine.payload = {"agent": "api@this-laptop"}
+    db.commit()
+
+    swept = fail_orphaned_jobs(db, redis_url="", current_agent="api@this-laptop")
+
+    assert swept == [mine.id]
+    assert _reload(db, mine).status == JobStatus.failed
+    assert _reload(db, other_tagged).status == JobStatus.running
+    assert _reload(db, untagged).status == JobStatus.running
+

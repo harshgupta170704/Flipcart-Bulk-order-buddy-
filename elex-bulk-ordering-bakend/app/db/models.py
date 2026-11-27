@@ -1273,3 +1273,35 @@ class InventoryTransfer(Base):
     created_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow)
 
+
+class CaptchaChallenge(Base):
+    """A captcha or "unusual activity" page a browser flow met
+    (app.automation.challenges): Flipkart's sign-in or checkout, or the HDFC
+    CorpAssist sign-in. A person answers it on the Captchas page while the
+    browser waits; the row is the history the page counts and the run's
+    automatic stop reads. No picture of the page is kept here: the image lives
+    in the API process's memory only while the challenge is open.
+    """
+
+    __tablename__ = "captcha_challenges"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: "flipkart" or "hdfc".
+    site: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: "text" (a picture of characters and a box), "click" (a challenge
+    #: solved by clicking: tick boxes, picture grids) or "blocked" (the site
+    #: refused to go on: "unusual activity", "access denied").
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Where the flow was: "sign-in", "request OTP", "checkout"...
+    step: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    #: pending, answered, skipped, expired, blocked.
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    detail: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    #: The signed-in user who answered or skipped it.
+    answered_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=naive_utcnow, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

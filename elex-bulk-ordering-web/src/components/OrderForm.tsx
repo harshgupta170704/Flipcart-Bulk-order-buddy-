@@ -1,24 +1,54 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { accountsByEmails, errorMessage, getJob, listCardFailureCodes, listOrderPhones, previewProduct, startOrderJob } from "../lib/api";
+import {
+  accountsByEmails,
+  checkCardSheet,
+  errorMessage,
+  getJob,
+  getRetryPlan,
+  getSettings,
+  listCardFailureCodes,
+  listOrderPhones,
+  previewProduct,
+  startOrderJob,
+} from "../lib/api";
 import { countLabel, formatBytes, formatCount } from "../lib/format";
+import {
+  changesFromRun,
+  limitOverrides,
+  NO_LIMIT_CHANGES,
+  orderVariant,
+  validateLimitChanges,
+  variantNote,
+  type LimitChanges,
+  type ProductValues,
+} from "../lib/limitChanges";
+import { useRunCheck } from "../lib/useRunCheck";
 import type {
   AccountSelection,
+  AccountStatus,
   Address,
+  ApplicableLimit,
+  CardCheck,
   Gst,
   Job,
+  LimitOverride,
   PaymentMode,
   ProductPreview as ProductPreviewData,
   QtyMode,
+  RetryPlan,
   RunMode,
 } from "../lib/types";
 import { MAX_CARD_FILE_BYTES, MAX_SELLER_CHARS, OFFERED_PAYMENT_MODES, PAYMENT_MODE_LABELS, selectionCount, usesCard, usesGiftCards } from "../lib/types";
 import { AddressGstPicker, type AddressGstChoice } from "./AddressGstPicker";
+import { CardCheckReport } from "./CardCheckReport";
 import { CardPairingPreview } from "./CardPairingPreview";
+import { cardLeaveOut } from "../lib/cardLeaveOut";
 import { Alert } from "./Alert";
 import { Button } from "./Button";
 import { Checkbox, Field, FieldLookProvider, FileInput, NumberInput, Select, TextInput } from "./Field";
 import { LimitUsageSummary } from "./LimitUsageSummary";
+import { OrderLimitsBox } from "./OrderLimitsBox";
 import { OrderPreviewPanel } from "./OrderPreviewPanel";
 import { ProductPreview, sameSeller, sellerSummary } from "./ProductPreview";
 import { ProductSearch } from "./ProductSearch";
@@ -30,6 +60,7 @@ import {
   validateQuantity,
   type QuantityDraft,
 } from "./QuantityFields";
+import { RetryFailedPanel } from "./RetryFailedPanel";
 import { RunAccountPicker, type RunAccountsState } from "./RunAccounts";
 
 export interface OrderFormProps {
@@ -39,6 +70,8 @@ export interface OrderFormProps {
   runActive: boolean;
   /** Called with the job the server created, so the page can stream it. */
   onStarted: (job: Job) => void;
+  /** An admin may loosen a unit limit for one order; anyone may tighten one. */
+  isAdmin?: boolean;
   className?: string;
 }
 
@@ -56,6 +89,12 @@ interface FormErrors {
 }
 
 const LINK_STYLE = "font-medium text-accent underline underline-offset-2";
+
+/** Said on Submit while a line of "Limits for this order" does not pass. */
+const LIMITS_INVALID = "Platform limits invalid: fix the marked lines under Limits for this order.";
+/** Over the greyed saved limits, when this order's changes cannot be made. */
+const LIMITS_OFF_LINE = "Off for this order: each account is still checked at its turn with the saved limits.";
+const LIMITS_AI_LINE = "AI runs use the saved limits: each account is still checked at its turn.";
 
 /**
  * The link is typed or pasted, and reading a preview costs the server a real
@@ -199,7 +238,7 @@ function RunModeSwitch({
   );
 }
 
-export function OrderForm({ accounts, runActive, onStarted, className = "" }: OrderFormProps) {
+export function OrderForm({ accounts, runActive, onStarted, isAdmin = false, className = "" }: OrderFormProps) {
   /* Real places orders; Mock rehearses the whole run without a browser. Back
      to Real after every run, like "No price cap": a dry run is chosen each time. */
   const [runMode, setRunMode] = useState<RunMode>("real");
@@ -214,8 +253,9 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
   };
   /** Nothing is bought: Mock, or an AI rehearsal. */
   const dryRun = mock || (ai && aiDraft.rehearsal);
-  /* Refuse an order whose checkout does not show the GST it bills under. */
-  const [gstMandatory, setGstMandatory] = useState(false);
+  /* Refuse an order whose checkout does not show the GST it bills under.
+     On by default (owner, 24 Nov 2026): every order is meant to bill under GST. */
+  const [gstMandatory, setGstMandatory] = useState(true);
   /* Delivery phone numbers used by the accounts in turn; blank keeps each
      account's own, or the address's own when that box is ticked. */
   const [phonesText, setPhonesText] = useState("");
@@ -223,7 +263,48 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
   /* Which accounts to prefer: skip those that bought recently, and try the
      ones that have gone longest without an order first. */
   const [excludeDays, setExcludeDays] = useState("");
-  const [smartSelection, setSmartSelection] = useState(false);
+  /* "Spread orders across accounts": never-ordered accounts first, then the
+     oldest last order. Sent as smart_selection, its name from before Smart ID
+     Selection existed, so older runs replay as they were. */
+  const [spreadOrders, setSpreadOrders] = useState(false);
+  /* Smart ID Selection: only the IDs that can still buy this product under
+     the unit limits are used, and the rest are set aside before the run
+     starts. It starts from the setting "Smart ID Selection starts on", and
+     shows on until the setting has loaded, and if it cannot be read. */
+  const [smartId, setSmartId] = useState(true);
+  /** The setting's value once read; on until then. */
+  const smartIdDefault = useRef(true);
+  /** Who set the switch last. Only the setting's own say is replaced when the
+   *  setting loads: never a person's choice, nor a run being run again. */
+  const smartIdSource = useRef<"setting" | "person" | "run">("setting");
+  /** Back to the setting: after each Submit, on Reset, or for a run again
+   *  that saved no value. */
+  const smartIdToSetting = () => {
+    smartIdSource.current = "setting";
+    setSmartId(smartIdDefault.current);
+  };
+  useEffect(() => {
+    let alive = true;
+    getSettings().then(
+      (settings) => {
+        if (!alive) return;
+        // A server from before the switch sends no value: on, its default.
+        const on = settings?.smart_id_default_on !== false;
+        smartIdDefault.current = on;
+        if (smartIdSource.current === "setting") setSmartId(on);
+      },
+      // Not readable: the switch stays on.
+      () => undefined,
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+  /* Pass over accounts that already bought this very product (any time). */
+  const [skipBought, setSkipBought] = useState(false);
+  // Card runs: leave out cards that already paid for an order (the owner,
+  // 24 Nov 2026). On by default; untick for cards meant to pay again.
+  const [skipUsedCards, setSkipUsedCards] = useState(true);
   /* Card pool rules, each blank for off. */
   const [cardRules, setCardRules] = useState({ cooldown: "", leastUsed: "", maxUses: "", failed: "", smart: "", minRemaining: "" });
   /* Smart cap on, and the failure codes that count against a card. */
@@ -256,6 +337,13 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
       return "";
     }
   });
+  /* This order's changes to the unit limits (Smart ID on, not an AI run),
+     made for one product link: a different link drops them. */
+  const [limitChanges, setLimitChanges] = useState<LimitChanges>(NO_LIMIT_CHANGES);
+  useEffect(() => {
+    const link = productLink.trim();
+    setLimitChanges((prev) => (prev.forLink === link ? prev : NO_LIMIT_CHANGES));
+  }, [productLink]);
   /* Find the product by its link, or by searching Flipkart for it. */
   const [productTab, setProductTab] = useState<"url" | "search">("url");
   /* A free-text reference carried onto every order of the run. */
@@ -317,6 +405,22 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
   const [bankByHand, setBankByHand] = useState(false);
   const [fileKey, setFileKey] = useState(0);
   const [fileNote, setFileNote] = useState<string | null>(null);
+  /* "Validate card file": the server's report on the chosen sheet — what it
+     fixed (CVVs given back their leading zeros), the rows set aside, and the
+     rows to check. Kept with the file it is about; a new file drops it. */
+  const [cardCheck, setCardCheck] = useState<{ file: File; result: CardCheck } | null>(null);
+  const [cardCheckBusy, setCardCheckBusy] = useState(false);
+  const [cardCheckError, setCardCheckError] = useState<string | null>(null);
+  const cardCheckFor = useRef<File | null>(null);
+
+  /* Include accounts with no saved session yet (status `new` or `session_invalid`,
+     such as @catbar.net on InstAddr); the order run auto-logs them in via OTP
+     before checkout. Defaults off so existing saved-session runs stay unchanged. */
+  const [includeUnsigned, setIncludeUnsigned] = useState(false);
+  const allowedStatuses = useMemo<AccountStatus[]>(
+    () => (includeUnsigned ? ["session_valid", "new", "session_invalid"] : ["session_valid"]),
+    [includeUnsigned],
+  );
 
   /* Starts as "every account with a valid session": a filter, so the run can
      be aimed at thousands of accounts without the browser listing them. The
@@ -328,19 +432,26 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
   });
 
   /* Section 2's source: every matching email id, or the ones in an uploaded file. */
-  const [emailSource, setEmailSource] = useState<"all" | "csv">("all");
+  const [emailSource, setEmailSource] = useState<"all" | "csv" | "retry">("all");
+  /* "Retry failed" (/ordering?retry=<run>): the run's accounts that got no
+     order. While its tab is chosen, the run is sent as a retry of that run. */
+  const [retryPlan, setRetryPlan] = useState<RetryPlan | null>(null);
+  const retrying = emailSource === "retry" && retryPlan !== null;
   const [emailFile, setEmailFile] = useState<{ name: string; matched: number; unmatched: string[]; notEligible: string[] } | null>(null);
   const [emailFileError, setEmailFileError] = useState<string | null>(null);
   const [emailFileKey, setEmailFileKey] = useState(0);
+  const emailFileRaw = useRef<File | null>(null);
   const useAllEmails = () => {
     setEmailSource("all");
     setEmailFile(null);
+    emailFileRaw.current = null;
     setEmailFileError(null);
     setEmailFileKey((key) => key + 1);
-    setSelection({ mode: "filter", filter: { statuses: ["session_valid"] }, count: 0 });
+    setSelection({ mode: "filter", filter: { statuses: allowedStatuses }, count: 0 });
   };
-  const onEmailFile = async (file: File | null) => {
+  const onEmailFile = async (file: File | null, statuses: AccountStatus[] = allowedStatuses) => {
     setEmailFileError(null);
+    emailFileRaw.current = file;
     if (file === null) return;
     const emails = emailsInText(await file.text());
     if (emails.length === 0) {
@@ -350,11 +461,19 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
       return;
     }
     try {
-      const found = await accountsByEmails({ emails, statuses: ["session_valid"] });
+      const found = await accountsByEmails({ emails, statuses });
       setEmailFile({ name: file.name, matched: found.ids.length, unmatched: found.unmatched, notEligible: found.not_eligible });
       setSelection({ mode: "ids", ids: found.ids });
     } catch (err) {
       setEmailFileError(errorMessage(err));
+    }
+  };
+  const onToggleIncludeUnsigned = (next: boolean) => {
+    setIncludeUnsigned(next);
+    setSubmitError(null);
+    const nextStatuses: AccountStatus[] = next ? ["session_valid", "new", "session_invalid"] : ["session_valid"];
+    if (emailSource === "csv" && emailFileRaw.current !== null) {
+      void onEmailFile(emailFileRaw.current, nextStatuses);
     }
   };
 
@@ -394,8 +513,10 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
   }, [selection, accounts.accounts]);
   /** No address chosen: the server would refuse the run, so say so up front. */
   const noAddress = place.address_id === null;
+  /** Every id unticked by hand: the run has nothing, but accounts exist. */
+  const noneTicked = emailSource === "all" && selection.mode === "ids" && selection.ids.length === 0;
   /** Only meaningful once the first page has landed. */
-  const noneEligible = !accounts.loading && accounts.total > 0 && runCount === 0;
+  const noneEligible = !accounts.loading && accounts.total > 0 && runCount === 0 && !noneTicked && !retrying;
 
   /* The attempt ceiling is a ceiling on ACCOUNTS, so it — not the selection —
      is what the plan below multiplies by. */
@@ -525,6 +646,9 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
 
   const shown = showErrors ? errors : {};
   const shownQuantity = showErrors ? quantityErrors : {};
+  /** The "Exclude IDs" window as the run would get it, for the room check:
+   *  null while it is off or not yet a valid number of days. */
+  const excludeWindow = errors.exclude_days === undefined ? numberOrNull(excludeDays) : null;
   /* A picked file that cannot be sent is said at once, not only after Start:
      no pairing preview appears for it, and nothing else would say why. */
   const cardsFileError = showErrors || cardsFile !== null ? errors.cards_file : undefined;
@@ -546,6 +670,65 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
   const chosenOffer = offeredSellers.find((offer) => sameSeller(offer.name, chosenSeller));
   const sellerNotListed = chosenSeller !== "" && offeredSellers.length > 0 && chosenOffer === undefined;
   const sellerCartOnly = chosenOffer?.buy_now === false;
+
+  /* --- this order's unit limits --------------------------------------------
+     The variant the run will record, the saved limits that apply (read by the
+     room check) and this order's changes to them. Changes are made and sent
+     only with Smart ID on and not in an AI run; otherwise each account is
+     checked with the saved limits as they are. */
+  const variant = useMemo(
+    // The form picks no size, so only several products or a link without a
+    // pid leave the order without a variant here.
+    () => orderVariant({ productLink: previewUrl, extraLinks, size: null }),
+    [previewUrl, extraLinks],
+  );
+  const productValues: ProductValues = {
+    brand: quantity.brand,
+    category: quantity.category,
+    seller: chosenSeller,
+    variant: variant.variant,
+    title: preview?.name?.trim() ?? "",
+  };
+  const limitsActive = smartId && !ai;
+  /* Changes made for another link are never shown or sent (the effect above
+     drops them once the link has changed). */
+  const changesNow = limitChanges.forLink === productLink.trim() ? limitChanges : NO_LIMIT_CHANGES;
+  /** The changes as the checks and the order send them: only while they may
+   *  be made. A line the box marks is left out and the rest still go, so the
+   *  preview follows every change that holds (Submit waits for all of them). */
+  const overridesFor = (applicable: ApplicableLimit[] | null): LimitOverride[] | null => {
+    if (!limitsActive) return null;
+    const errors = validateLimitChanges(changesNow, applicable, productValues, isAdmin);
+    const list = limitOverrides(changesNow, applicable, productValues, errors);
+    return list.length > 0 ? list : null;
+  };
+  const runCheck = useRunCheck({
+    brand: quantity.brand,
+    category: quantity.category,
+    // The product's title, so a model limit ("T5x 5G") can match it.
+    model: preview?.name ?? "",
+    seller: chosenSeller,
+    // Variant limits apply only with Smart ID on: off is exactly as before.
+    variant: smartId ? variant.variant : null,
+    selection,
+    unitsPerOrder: plan.unitsPerOrder,
+    qtyMode,
+    totalUnits: plan.totalUnits,
+    excludeDays: excludeWindow,
+    // The run takes out IDs that already bought this product before anything
+    // else, Smart ID on or off; the check does the same, with the same link.
+    // A retry always does it (the box shows ticked), as the order sends it.
+    skipBought: skipBought || retrying,
+    productLink: previewUrl,
+    limitOverrides: overridesFor,
+  });
+  /** The saved limits that apply to this product; null until the check has read them. */
+  const applicableLimits = runCheck.last
+    ? Array.isArray(runCheck.last.applicable_limits)
+      ? runCheck.last.applicable_limits
+      : []
+    : null;
+  const limitErrors = limitsActive ? validateLimitChanges(changesNow, applicableLimits, productValues, isAdmin) : null;
 
   /**
    * Fill Brand and Category from the preview, but only where the user has not
@@ -618,16 +801,23 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
 
   /* "Run again" on the Orders page opens this form as /ordering?from=<run>:
      every setting the run recorded is filled in, and nothing starts until
-     Submit. Card sheets are never stored, so a card run asks for its sheet again. */
+     Submit. Card sheets are never stored, so a card run asks for its sheet again.
+     "Retry failed" opens it as /ordering?retry=<run>: the same, plus exactly
+     that run's accounts that got no order ticked, "Skip IDs that already
+     bought this product" on, and a card cooldown covering every order since
+     the run began (app/core/retry_failed.py; the server holds to all three). */
   const [searchParams] = useSearchParams();
   const fromRun = searchParams.get("from");
+  const retryRun = searchParams.get("retry");
+  const sourceRun = retryRun ?? fromRun;
   const [prefillNote, setPrefillNote] = useState<string | null>(null);
   useEffect(() => {
-    const id = Number(fromRun);
-    if (!fromRun || !Number.isInteger(id) || id < 1) return;
+    const id = Number(sourceRun);
+    if (!sourceRun || !Number.isInteger(id) || id < 1) return;
+    const isRetry = retryRun !== null;
     let alive = true;
-    getJob(id).then(
-      (job) => {
+    Promise.all([getJob(id), isRetry ? getRetryPlan(id) : Promise.resolve(null)]).then(
+      ([job, retry]) => {
         if (!alive) return;
         const p = (job.payload ?? {}) as Record<string, unknown>;
         const text = (key: string) => (p[key] === undefined || p[key] === null ? "" : String(p[key]));
@@ -694,7 +884,26 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
         if (p.gst_mandatory) setGstMandatory(true);
         if (p.use_address_phone) setUseAddressPhone(true);
         if (p.exclude_ordered_days) setExcludeDays(String(p.exclude_ordered_days));
-        if (p.smart_selection) setSmartSelection(true);
+        if (p.smart_selection) setSpreadOrders(true);
+        // Smart ID as that run had it. A run from before the switch saved no
+        // value, so it takes the setting, like a new order.
+        if (typeof p.smart_id === "boolean") {
+          smartIdSource.current = "run";
+          setSmartId(p.smart_id);
+        } else {
+          smartIdToSetting();
+        }
+        // Its limit changes, made for its product link: they come back with
+        // that link, and go as soon as another one is put in.
+        setLimitChanges(changesFromRun(p.limit_overrides, text("product_link")) ?? NO_LIMIT_CHANGES);
+        if (p.skip_bought_product) setSkipBought(true);
+        const savedFilter = p.account_filter as { statuses?: unknown } | undefined;
+        if (
+          Array.isArray(savedFilter?.statuses) &&
+          savedFilter.statuses.some((st) => st === "new" || st === "session_invalid")
+        ) {
+          setIncludeUnsigned(true);
+        }
         if (p.card_type) setCardType(String(p.card_type));
         if (p.address_id || p.gst_id) {
           setPlace({
@@ -712,27 +921,91 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
           minRemaining: text("card_min_remaining"),
         }));
         if (p.card_smart_max_uses) setSmartCap(true);
+        // Recorded on card runs since 24 Nov 2026; older runs keep the default (on).
+        if (typeof p.card_exclude_used === "boolean") setSkipUsedCards(p.card_exclude_used);
         if (Array.isArray(p.card_exclude_failed_codes) && p.card_exclude_failed_codes.length) {
           setExcludeCodesOn(true);
           setExcludeCodes(p.card_exclude_failed_codes.map(String));
         }
-        setPrefillNote(
-          `Filled in from run #${job.id}.${p.payment_mode === "card" && p.mode !== "mock" ? " Upload the card sheet again: card details are never kept." : ""} Check it, then Submit.`,
-        );
+        const sheetAgain =
+          typeof p.payment_mode === "string" && usesCard(p.payment_mode as PaymentMode) && p.mode !== "mock"
+            ? " Upload the card sheet again: card details are never kept."
+            : "";
+        if (retry) {
+          setRetryPlan(retry);
+          setEmailSource("retry");
+          setEmailFile(null);
+          emailFileRaw.current = null;
+          setSelection({ mode: "ids", ids: retry.accounts.map((account) => account.account_id) });
+          setSkipBought(true);
+          const days = retry.card_cooldown_days;
+          if (days) {
+            setCardRules((prev) => ({ ...prev, cooldown: String(Math.max(Number(prev.cooldown) || 0, days)) }));
+          }
+          if (retry.units_missing !== null && retry.units_missing > 0) {
+            setQuantity((prev) => ({ ...prev, totalQuantity: String(retry.units_missing) }));
+          }
+          setPrefillNote(
+            retry.accounts.length
+              ? `Retrying run #${job.id}: ${countLabel(retry.accounts.length, "account")} that got no order ${retry.accounts.length === 1 ? "is" : "are"} ticked.${sheetAgain} Check it, then Submit.`
+              : `Run #${job.id} has nothing left to retry.`,
+          );
+          return;
+        }
+        setPrefillNote(`Filled in from run #${job.id}.${sheetAgain} Check it, then Submit.`);
       },
-      () => alive && setPrefillNote(`Run #${fromRun} could not be read; the form is left as it was.`),
+      (err: unknown) =>
+        alive &&
+        setPrefillNote(
+          isRetry
+            ? `Run #${sourceRun} cannot be retried: ${errorMessage(err)} The form is left as it was.`
+            : `Run #${sourceRun} could not be read; the form is left as it was.`,
+        ),
     );
     return () => {
       alive = false;
     };
-    // Once per "from": the setters are stable.
+    // Once per "from" or "retry": the setters are stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromRun]);
+  }, [sourceRun, retryRun]);
 
   const onFileChange = (file: File | null) => {
     setCardsFile(file);
     setFileNote(null);
     setSubmitError(null);
+    // The last file's report is not this one's.
+    cardCheckFor.current = null;
+    setCardCheck(null);
+    setCardCheckError(null);
+    setCardCheckBusy(false);
+  };
+
+  const onCardFileCleared = () => {
+    cardCheckFor.current = null;
+    setCardCheck(null);
+    setCardCheckError(null);
+    setCardCheckBusy(false);
+  };
+
+  /** Ask the server to read the chosen sheet as the run will, and show what
+   *  it fixed and what to check. Only the newest file's answer is shown. */
+  const validateCardFile = (file: File) => {
+    cardCheckFor.current = file;
+    setCardCheckBusy(true);
+    setCardCheckError(null);
+    checkCardSheet(file).then(
+      (result) => {
+        if (cardCheckFor.current !== file) return;
+        setCardCheck({ file, result });
+        setCardCheckBusy(false);
+      },
+      (err: unknown) => {
+        if (cardCheckFor.current !== file) return;
+        setCardCheck(null);
+        setCardCheckError(errorMessage(err));
+        setCardCheckBusy(false);
+      },
+    );
   };
 
   const setQuantityField = (key: keyof QuantityDraft, value: string) => {
@@ -748,17 +1021,21 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
     setRunMode("real");
     setAiDraft(DEFAULT_AI);
     setQtyMode("upto");
-    setGstMandatory(false);
+    setGstMandatory(true);
     setPhonesText("");
     setUseAddressPhone(false);
     setExcludeDays("");
-    setSmartSelection(false);
+    setSpreadOrders(false);
+    smartIdToSetting();
+    setSkipBought(false);
     setCardRules({ cooldown: "", leastUsed: "", maxUses: "", failed: "", smart: "", minRemaining: "" });
+    setSkipUsedCards(true);
     setSmartCap(false);
     setExcludeCodesOn(false);
     setExcludeCodes([]);
     setCardType("");
     setProductLink("");
+    setLimitChanges(NO_LIMIT_CHANGES);
     setProductTab("url");
     setRefCode("");
     setExtraLinks([]);
@@ -782,6 +1059,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
     setPaymentMode("card");
     setSeller("");
     setCardsFile(null);
+    onCardFileCleared();
     setFileKey((key) => key + 1);
     setFileNote(null);
     setBankByHand(false);
@@ -795,10 +1073,18 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
 
     setShowErrors(true);
     setSubmitError(null);
+    // Said here too: the box may be scrolled out of sight.
+    if (limitErrors !== null) {
+      setSubmitError(LIMITS_INVALID);
+      return;
+    }
     if (Object.keys(errors).length > 0) return;
     if (Object.keys(quantityErrors).length > 0) return;
     if (usesCard(paymentMode) && !mock && cardsFile === null) return;
     if (noAddress) return;
+    // An empty id list reads as "every account" on the server, so a form with
+    // nothing ticked must never be sent (the Submit button is off too).
+    if (runCount === 0) return;
 
     setSubmitting(true);
     try {
@@ -866,7 +1152,16 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
         address_phones: phones,
         use_address_phone: phones.length === 0 && useAddressPhone,
         exclude_ordered_days: numberOrNull(excludeDays),
-        smart_selection: smartSelection,
+        smart_selection: spreadOrders,
+        // Sent on or off, every time (the client never leaves it out).
+        smart_id: smartId,
+        // This order's limit changes; none while Smart ID is off or in AI.
+        limit_overrides: overridesFor(applicableLimits),
+        // A retry always passes over accounts that bought it (the server holds to it too).
+        skip_bought_product: skipBought || retrying,
+        retry_of: retrying ? retryPlan.job_id : null,
+        // Like the other card rules, not in a mock run (it hides the payment step).
+        card_exclude_used: !mock && skipUsedCards,
         card_cooldown_days: mock ? null : numberOrNull(cardRules.cooldown),
         card_least_used_days: numberOrNull(cardRules.leastUsed),
         card_max_uses: numberOrNull(cardRules.maxUses),
@@ -879,6 +1174,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
       // The sheet has been handed to the request. Let go of it immediately:
       // nothing on this client should hold card data a moment longer.
       setCardsFile(null);
+      onCardFileCleared();
       setFileKey((key) => key + 1);
       setFileNote(
         `Sent with run #${job.id} and cleared from this form. Upload the sheet again for another run.`,
@@ -890,6 +1186,17 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
       setBankByHand(false);
       // And a dry run: the next run is real unless Mock is picked again.
       setRunMode("real");
+      // And Smart ID Selection: the next run starts from the setting again,
+      // with the saved limits as they are.
+      smartIdToSetting();
+      setLimitChanges(NO_LIMIT_CHANGES);
+      // A retry is sent once: the next run picks its accounts again, from
+      // nothing ticked, so a second Submit cannot repeat it by accident.
+      if (retrying) {
+        setRetryPlan(null);
+        setEmailSource("all");
+        setSelection({ mode: "ids", ids: [] });
+      }
       setShowErrors(false);
       onStarted(job);
     } catch (err) {
@@ -914,7 +1221,11 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
     : noAddress
       ? "Choose a delivery address — a run cannot start without one."
       : runCount === 0
-        ? "No account selected — nothing to order with yet."
+        ? retrying
+          ? `Run #${retryPlan.job_id} has no account left to retry.`
+          : noneTicked
+            ? "No email ID ticked — tick some, or Select all."
+            : "No account selected — nothing to order with yet."
         : `${
             plan.mode === "total"
               ? `${describePlan(plan)}, across up to ${countLabel(accountsTried, "account")}. `
@@ -1295,7 +1606,27 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                 >
                   Upload CSV
                 </button>
+                {retryPlan ? (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={emailSource === "retry"}
+                    disabled={locked}
+                    onClick={() => {
+                      setEmailSource("retry");
+                      setSelection({ mode: "ids", ids: retryPlan.accounts.map((account) => account.account_id) });
+                      setSkipBought(true);
+                      setSubmitError(null);
+                    }}
+                    className={`rounded-full border px-3 py-1 text-[12px] font-medium ${
+                      emailSource === "retry" ? "border-accent bg-accent/10 text-accent" : "border-line text-ink-2 hover:text-ink"
+                    }`}
+                  >
+                    Retry failed of run #{retryPlan.job_id}
+                  </button>
+                ) : null}
               </div>
+              {retrying ? <RetryFailedPanel plan={retryPlan} cardRun={usesCard(paymentMode) && !mock} /> : null}
               {emailSource === "csv" ? (
                 <div className="flex flex-col gap-2 rounded-control border border-line p-3">
                   <div className="flex flex-wrap items-center gap-2">
@@ -1322,9 +1653,13 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                   </div>
                   {emailFile ? (
                     <p className="text-[12px] text-ink-2">
-                      <span className="font-medium text-ink">{emailFile.name}</span>: {countLabel(emailFile.matched, "account")} with a
-                      valid session will run
-                      {emailFile.notEligible.length ? `, ${formatCount(emailFile.notEligible.length)} without a valid session` : ""}
+                      <span className="font-medium text-ink">{emailFile.name}</span>:{" "}
+                      {includeUnsigned
+                        ? `${countLabel(emailFile.matched, "account")} will run (accounts without a saved session will auto-login via OTP)`
+                        : `${countLabel(emailFile.matched, "account")} with a valid session will run`}
+                      {emailFile.notEligible.length
+                        ? `, ${formatCount(emailFile.notEligible.length)} ${includeUnsigned ? "not eligible" : "without a valid session"}`
+                        : ""}
                       {emailFile.unmatched.length ? `, ${formatCount(emailFile.unmatched.length)} not found` : ""}.
                     </p>
                   ) : (
@@ -1334,23 +1669,55 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                 </div>
               ) : null}
               {noneEligible ? (
-                <Alert tone="warning" title="No account has a valid session">
-                  A run needs a logged-in session per account.{" "}
-                  <Link to="/sessions" className={LINK_STYLE}>
-                    Generate sessions
-                  </Link>{" "}
-                  first — right now there is nothing to order with.
+                <Alert
+                  tone="warning"
+                  title={includeUnsigned ? "No eligible account matches" : "No account has a valid session"}
+                >
+                  {includeUnsigned ? (
+                    <>No account matches this selection yet. Adjust the filters or check your uploaded file.</>
+                  ) : (
+                    <>
+                      A run needs a logged-in session per account.{" "}
+                      <Link to="/sessions" className={LINK_STYLE}>
+                        Generate sessions
+                      </Link>{" "}
+                      first, or tick &ldquo;Include accounts without a saved session&rdquo; below to auto-login OTP-backed
+                      domains such as <code className="font-mono">@catbar.net</code>.
+                    </>
+                  )}
                 </Alert>
               ) : null}
 
               <Checkbox
-                name="smart_selection"
+                name="include_unsigned"
+                label="Include accounts without a saved session (auto-login via OTP)"
+                help="Shows new and signed-out accounts (such as @catbar.net on InstAddr) alongside valid sessions, and signs them into Flipkart automatically via OTP before ordering."
+                checked={includeUnsigned}
+                disabled={locked}
+                onChange={(event) => onToggleIncludeUnsigned(event.target.checked)}
+              />
+
+              <Checkbox
+                name="smart_id"
                 label="Smart ID Selection"
-                help="Try accounts that have never ordered first, then those that ordered longest ago, so buying is spread across accounts."
-                checked={smartSelection}
+                help="Use only the IDs that can still buy this product under the unit limits. IDs with no room, and IDs left out by Exclude IDs, are set aside before the run starts so they do not use up attempts. Off: each ID is checked when its turn comes, as before."
+                checked={smartId}
                 disabled={locked}
                 onChange={(event) => {
-                  setSmartSelection(event.target.checked);
+                  smartIdSource.current = "person";
+                  setSmartId(event.target.checked);
+                  setSubmitError(null);
+                }}
+              />
+
+              <Checkbox
+                name="smart_selection"
+                label="Spread orders across accounts"
+                help="Try accounts that have never ordered first, then those that ordered longest ago, so buying is spread across accounts."
+                checked={spreadOrders}
+                disabled={locked}
+                onChange={(event) => {
+                  setSpreadOrders(event.target.checked);
                   setSubmitError(null);
                 }}
               />
@@ -1359,14 +1726,23 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                 <FieldLookProvider value="stacked">
                   {emailSource === "csv" ? (
                     <p className="text-[12px] text-ink-2">The uploaded file decides the email ids; filters apply to All Email IDs.</p>
+                  ) : emailSource === "retry" ? (
+                    <p className="text-[12px] text-ink-2">
+                      The retry decides the email ids: the accounts above. Filters apply to All Email IDs.
+                    </p>
                   ) : (
                   <RunAccountPicker
                     state={accounts}
                     selection={selection}
                     onSelectionChange={setSelection}
-                    filterStatus={["session_valid"]}
-                    label="Accounts with a valid session"
+                    filterStatus={allowedStatuses}
+                    label={
+                      includeUnsigned
+                        ? "Accounts (valid session or auto-login via OTP)"
+                        : "Accounts with a valid session"
+                    }
                     checklists
+                    explicitTicks
                     disabled={locked}
                     emptyAction={
                       <Link to="/accounts" className={LINK_STYLE}>
@@ -1412,6 +1788,23 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                     />
                   </Field>
                   )}
+                  <FieldLookProvider value="stacked">
+                    <Checkbox
+                      name="skip_bought_product"
+                      label="Skip IDs that already bought this product"
+                      help={
+                        retrying
+                          ? "Always on for a retry: an account whose order turned up since, placed or waiting, is passed over."
+                          : "An account with an order of this same product (same link's product id) placed, or sent and not confirmed, at any time is passed over. Other colours or storage variants, failed attempts and over-price stops do not count."
+                      }
+                      checked={skipBought || retrying}
+                      disabled={locked || retrying}
+                      onChange={(event) => {
+                        setSkipBought(event.target.checked);
+                        setSubmitError(null);
+                      }}
+                    />
+                  </FieldLookProvider>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Checkbox
@@ -1458,7 +1851,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                 </div>
               </Disclosure>
 
-              <Disclosure title="Platform Unit Limits">
+              <Disclosure title="Platform Unit Limits" defaultOpen>
                 <QuantityFields
                   part="facts"
                   draft={quantity}
@@ -1466,6 +1859,24 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                   disabled={locked}
                   accountCount={accountsTried}
                   onChange={setQuantityField}
+                />
+                <OrderLimitsBox
+                  applicable={applicableLimits}
+                  check={runCheck.state}
+                  onRetry={runCheck.retry}
+                  changes={changesNow}
+                  onChange={(next) => {
+                    setLimitChanges({ forLink: productLink.trim(), ...next });
+                    setSubmitError(null);
+                  }}
+                  active={limitsActive}
+                  inactiveLine={smartId ? LIMITS_AI_LINE : LIMITS_OFF_LINE}
+                  isAdmin={isAdmin}
+                  product={productValues}
+                  variantLine={smartId ? variantNote(variant) : null}
+                  errors={limitErrors}
+                  showErrors={showErrors}
+                  disabled={locked}
                 />
                 <Link to="/limits" className={`text-[12px] ${LINK_STYLE}`}>
                   Manage product limits
@@ -1505,6 +1916,7 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                     }
                     if (!usesCard(mode)) {
                       setCardsFile(null);
+                      onCardFileCleared();
                       setFileKey((key) => key + 1);
                       setFileNote(null);
                       setBankByHand(false);
@@ -1635,6 +2047,18 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                       </svg>
                       Template
                     </a>
+                    <button
+                      type="button"
+                      className="inline-flex h-8 items-center gap-1.5 rounded-control border border-ink px-3 text-[12px] font-semibold text-ink hover:bg-page disabled:cursor-not-allowed disabled:opacity-60"
+                      disabled={locked || sendableSheet === null || cardCheckBusy}
+                      title={sendableSheet === null ? "Upload the card file first" : undefined}
+                      onClick={() => sendableSheet && validateCardFile(sendableSheet)}
+                    >
+                      <svg viewBox="0 0 16 16" className="size-3.5" aria-hidden="true">
+                        <path d="M3 8.5l3 3 7-7" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      {cardCheckBusy ? "Validating…" : "Validate card file"}
+                    </button>
                     {sendableSheet ? (
                       <span className="text-[12px] text-ink-2">
                         Ready to send: <span className="font-medium text-ink">{sendableSheet.name}</span>{" "}
@@ -1642,6 +2066,14 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                       </span>
                     ) : null}
                   </div>
+                  {sendableSheet && cardCheckError ? (
+                    <Alert tone="error" title="The card file could not be validated">
+                      {cardCheckError}
+                    </Alert>
+                  ) : null}
+                  {sendableSheet && cardCheck && cardCheck.file === sendableSheet ? (
+                    <CardCheckReport check={cardCheck.result} fileName={sendableSheet.name} skipUsed={skipUsedCards} />
+                  ) : null}
                   {cardsFileError ? (
                     <p role="alert" className="text-[12px] text-ink">
                       <span aria-hidden="true" className="mr-1.5 font-semibold" style={{ color: "var(--status-critical)" }}>
@@ -1653,16 +2085,50 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                   <p className="text-[11.5px] leading-snug text-muted">
                     Cards are used for this run only and are never saved. One row per card: card number, expiry,
                     CVV and the account&rsquo;s email; a password column is typed on the bank&rsquo;s page after
-                    Pay. Only the last four digits are shown here.
+                    Pay. A CVV that lost its leading zeros (7 for 007, 98 for 098) is fixed before ordering —
+                    &ldquo;Validate card file&rdquo; shows which. Only the last four digits are shown here.
                     {fileNote ? <span className="mt-1 block text-ink">{fileNote}</span> : null}
                   </p>
 
                   {/* The pairing the run will use; gone with the file once a run starts. */}
                   {sendableSheet && runCount > 0 ? (
                     <FieldLookProvider value="stacked">
-                      <CardPairingPreview file={sendableSheet} selection={selection} cardType={cardType} minRemaining={numberOrNull(cardRules.minRemaining)} />
+                      <CardPairingPreview
+                        file={sendableSheet}
+                        selection={selection}
+                        cardType={cardType}
+                        minRemaining={numberOrNull(cardRules.minRemaining)}
+                        excludeUsed={skipUsedCards}
+                        cooldownDays={numberOrNull(cardRules.cooldown)}
+                        failedDays={numberOrNull(cardRules.failed)}
+                        failedCodes={excludeCodesOn ? excludeCodes : []}
+                        retryOf={retrying ? retryPlan.job_id : null}
+                        // Who the run passes over before it tries anyone: a
+                        // pool sheet gives them no card (run #960).
+                        leaveOut={cardLeaveOut(runCheck.leaveOut, smartId, ai, {
+                          mock,
+                          spreadOrders,
+                          totalAttempts: numberOrNull(quantity.totalAttempts),
+                          useSupercoins,
+                          minSupercoins: numberOrNull(minSupercoins),
+                        })}
+                      />
                     </FieldLookProvider>
                   ) : null}
+
+                  <FieldLookProvider value="stacked">
+                    <Checkbox
+                      name="card_exclude_used"
+                      label="Skip cards already used in an order"
+                      help="A card that paid for an order in this tool at any time (placed, or sent and not confirmed) is left out. With a pool sheet such as the CorpAssist export, the next unused card pays instead; with an email column, that account is passed over. Orders Flipkart cancelled or never placed do not count. Untick only for cards meant to pay again, such as a corporate card."
+                      checked={skipUsedCards}
+                      disabled={locked}
+                      onChange={(event) => {
+                        setSkipUsedCards(event.target.checked);
+                        setSubmitError(null);
+                      }}
+                    />
+                  </FieldLookProvider>
 
                   <Disclosure title="Cards Filters">
                     <fieldset className="flex flex-col gap-3" disabled={locked}>
@@ -1851,6 +2317,12 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
                   }}
                 />
               </div>
+              {gstMandatory && placeDetails.address !== null && placeDetails.gst === null ? (
+                <Alert tone="warning" title="GST mandatory is on, but this run has no GST">
+                  Accounts without a GST of their own would be stopped at checkout (nothing is charged).
+                  Choose a GST above, or turn &ldquo;GST mandatory&rdquo; off.
+                </Alert>
+              ) : null}
 
               <div className="-mb-1 flex justify-end">
                 <button
@@ -1953,8 +2425,12 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
             gstMandatory={gstMandatory}
             phones={phones.length}
             excludeDays={numberOrNull(excludeDays)}
-            smartSelection={smartSelection}
+            smartId={smartId}
+            spreadOrders={spreadOrders}
+            skipBought={skipBought}
             cardRules={[
+              // A mock run hides the payment step and sends no card rule.
+              skipUsedCards && !mock ? "skip cards already used" : "",
               cardRules.cooldown.trim() ? `skip used in ${cardRules.cooldown} d` : "",
               cardRules.leastUsed.trim() ? `least used (${cardRules.leastUsed} d)` : "",
               cardRules.maxUses.trim() ? `max ${cardRules.maxUses}/card` : "",
@@ -1969,12 +2445,11 @@ export function OrderForm({ accounts, runActive, onStarted, className = "" }: Or
             gst={placeDetails.gst}
             limits={
               <LimitUsageSummary
-                brand={quantity.brand}
-                category={quantity.category}
-                model={preview?.name ?? ""}
-                seller={chosenSeller}
-                selection={selection}
+                check={runCheck.state}
+                onRetry={runCheck.retry}
                 requestedUnits={plan.requestedUnits}
+                smartId={smartId}
+                aiRun={ai}
               />
             }
             footer={

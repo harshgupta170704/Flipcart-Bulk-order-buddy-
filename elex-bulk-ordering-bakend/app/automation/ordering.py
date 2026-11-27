@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -35,6 +36,7 @@ from app.config import get_settings
 
 from playwright.async_api import Page
 
+from app.automation import challenges
 from app.automation.product import read_product_preview
 from app.automation.sellers import (
     choose_pid,
@@ -185,6 +187,430 @@ def per_unit(amount: float | None, units: int | None) -> float | None:
 # --- Page steps --------------------------------------------------------------
 async def _xpath(page: Page, xpath: str):
     return page.locator(f"xpath={xpath}")
+
+
+#: Product-page coupons ("Coupons · ₹500 off · Apply"). Measured live on
+#: 23–24 Nov 2026 (vivo T5 Lite, signed-in catbar accounts): the page arrives
+#: as server-drawn HTML and Flipkart's own code wakes it up 1–4 s later (longer
+#: on a busy machine). A press before that does nothing — no request is sent
+#: and the tile still says "Apply" — and the wake-up then redraws the tile, so
+#: the pressed element vanishes. The first version took "vanished" for
+#: "applied": every order reported a coupon it never got and reached checkout
+#: ₹500 over target. Now the step waits for the button to be live, presses it,
+#: and believes only the pressed tile reading "Remove" afterwards. A live press
+#: is a POST to /api/1/action/view; the tile turns a moment after the answer.
+#:
+#: Time: about 1.5 s with a coupon, 1–2 s without one. No press starts after
+#: COUPON_READY_TIMEOUT_MS — or COUPON_SLOW_PAGE_TIMEOUT_MS while the page's
+#: Buy now is still asleep (a loaded machine; Buy now's own retries run ~70 s)
+#: — and a press then gets at most one confirm window plus the slow-answer
+#: extra. Worst cases: ~32 s on a woken page; 60 s on one that never wakes
+#: (whose Buy now would fail next anyway); a page that wakes late gets
+#: COUPON_AFTER_WAKE_MS after waking.
+COUPON_READY_TIMEOUT_MS = 20_000
+COUPON_SLOW_PAGE_TIMEOUT_MS = 60_000
+#: A page whose Buy now wakes late still gets this long after waking.
+COUPON_AFTER_WAKE_MS = 5_000
+#: How long one press gets to turn the tile when nothing reached Flipkart.
+COUPON_CONFIRM_TIMEOUT_MS = 6_000
+#: Extra time when the press reached Flipkart but its answer has not come back.
+COUPON_SLOW_ANSWER_MS = 6_000
+#: Once Flipkart has answered yes (2xx), how long the tile gets to read
+#: "Remove" before the answer is taken as a no (a coupon this account cannot
+#: have). A no is never pressed again: pressing harder does not change it.
+COUPON_AFTER_ANSWER_MS = 3_000
+#: Presses before giving up when they reach nobody, or Flipkart answers with
+#: an error (busy, 429/5xx, dropped connection) — those are worth repeating.
+COUPON_CLICK_ATTEMPTS = 3
+COUPON_ERROR_PAUSE_MS = 1_000
+COUPON_POLL_MS = 250
+#: A page with no coupon tile is given this long after it is live, in case the
+#: tile is drawn late, before the step stops looking.
+COUPON_LATE_TILE_MS = 1_000
+#: A page with no Flipkart page code at all (a test page) counts as live once
+#: it has finished loading and stayed that way this long.
+COUPON_PLAIN_PAGE_MS = 1_000
+#: "This page has no coupon" is decided only once the page's Buy now / Add to
+#: cart is live. Flipkart marks its root the moment it STARTS waking the page
+#: (~2.0 s), before the coupon button (~2.4 s) or Buy now (~2.9 s) can be
+#: pressed (measured 24 Nov 2026), so that mark alone came too early. A Buy now
+#: that never shows as live holds the decision this long at most.
+COUPON_BUY_WAIT_MS = 8_000
+
+_PRESS_APPLIED = "applied"
+_PRESS_REFUSED = "refused"  # Flipkart answered yes-the-request-worked, the tile still reads "Apply"
+_PRESS_NO_ANSWER = "no_answer"  # sent, no answer in time: never pressed again over it
+_PRESS_NO_EFFECT = "no_effect"  # nothing reached Flipkart, or it answered with an error
+
+_SCAN_PRODUCT_COUPONS_JS = """() => {
+    document.querySelectorAll('[data-bob-coupon]').forEach(el => el.removeAttribute('data-bob-coupon'));
+    // Any React key: React has started on this page (the root gets
+    // __reactContainer the moment waking STARTS). Fiber/props keys: React has
+    // taken this node over, so a press on it is handled.
+    const reactKey = (el) => Object.keys(el).some(k => k.startsWith('__react'));
+    const fiberKey = (el) => Object.keys(el).some(k => k.startsWith('__reactFiber') || k.startsWith('__reactProps'));
+    const live = (el) => {
+        for (let p = el, i = 0; p && i < 4; p = p.parentElement, i++) {
+            if (fiberKey(p)) return true;
+        }
+        return false;
+    };
+    let react = false;
+    const all = document.body ? document.body.getElementsByTagName('*') : [];
+    for (let i = 0, seen = 0; i < all.length && seen < 2000; i++) {
+        const tag = all[i].tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'NOSCRIPT') continue;
+        seen++;
+        if (reactKey(all[i])) { react = true; break; }
+    }
+    const words = new Set(['apply', 'remove', 'applied']);
+    const buttons = [];
+    let idx = 0;
+    for (const el of document.querySelectorAll('div, button, span, a')) {
+        if (el.childElementCount > 0) continue;
+        // textContent first: it is cheap. innerText (what is shown) only for the few that match.
+        if (!words.has((el.textContent || '').trim().toLowerCase())) continue;
+        const state = (el.innerText || '').trim().toLowerCase();
+        if (!words.has(state)) continue;
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) continue;
+        let p = el;
+        let isCoupon = false;
+        let isOther = false;
+        let snippet = '';
+        for (let i = 0; i < 6 && p.parentElement; i++) {
+            p = p.parentElement;
+            const pt = (p.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (pt.length > 450) break;
+            if (/exchange offer|bank offer|no cost emi|credit card|debit card|\\bemi\\b/i.test(pt)) {
+                isOther = true;
+                break;
+            }
+            if (/\\bcoupons?\\b/i.test(pt)) {
+                isCoupon = true;
+                snippet = pt;
+                break;
+            }
+        }
+        if (isCoupon && !isOther) {
+            const tag = String(idx++);
+            el.setAttribute('data-bob-coupon', tag);
+            // The tile's countdown ("Ends in 01d 22m 05s") ticks every second:
+            // keep it out of the coupon's name, which must stay the same.
+            const steady = snippet.replace(/ends in\\s*(?:\\d+\\s*[dhms]\\s*)+/ig, ' ')
+                .replace(/^\\s*coupons?\\s*/i, '').replace(/\\s+/g, ' ').trim();
+            const amount = (steady.match(/(?:₹\\s?[\\d,]+|\\d+(?:\\.\\d+)?\\s?%)\\s*(?:off|cashback)/i) || [''])[0];
+            buttons.push({tag, state, snippet: steady.slice(0, 140), amount, live: live(el)});
+        }
+    }
+    // Buy now / Add to cart: whether the page's main part can be pressed yet
+    // (null when the page has neither, e.g. sold out).
+    let buy = null;
+    for (const el of document.querySelectorAll('div, button, span, a')) {
+        if (el.childElementCount > 0) continue;
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t !== 'buy now' && t !== 'add to cart') continue;
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) continue;
+        buy = live(el);
+        if (buy) break;
+    }
+    return {ready: document.readyState, react, buy, buttons};
+}"""
+
+
+@dataclass
+class CouponResult:
+    """What the product-page coupon step did. Each entry names the coupon by
+    its amount ("₹500 off", "10% off") or, failing that, by its tile's text."""
+
+    applied: list[str] = field(default_factory=list)  # turned on by this step
+    already: list[str] = field(default_factory=list)  # found already on
+    failed: list[str] = field(default_factory=list)  # seen, but not on when the step stopped
+
+    @property
+    def label(self) -> str | None:
+        """The run line's word on the coupon, or None when the page had none."""
+        on = self.applied + [name for name in self.already if name not in self.applied]
+        parts = []
+        if on:
+            parts.append(f"coupon {', '.join(on)} applied")
+        if self.failed:
+            parts.append(f"{'' if on else 'coupon '}{', '.join(self.failed)} NOT applied")
+        return "; ".join(parts) or None
+
+
+def _coupon_name(button: dict) -> str:
+    amount = " ".join(str(button.get("amount") or "").split())
+    return amount or str(button.get("snippet") or "coupon")[:40]
+
+
+def _coupon_key(button: dict) -> str:
+    """Which tile this is, steady across looks: its place among the coupon
+    buttons plus its name, so two tiles with the same amount stay apart."""
+    return f"{button.get('tag')}|{_coupon_name(button)}"
+
+
+def _unique(names) -> list[str]:
+    out: list[str] = []
+    for name in names:
+        if name not in out:
+            out.append(name)
+    return out
+
+
+async def _scan_product_coupons(page: Page) -> dict | None:
+    try:
+        scan = await page.evaluate(_SCAN_PRODUCT_COUPONS_JS)
+    except Exception:  # noqa: BLE001 — best effort, never stops an order or breaks stub pages
+        return None
+    if not isinstance(scan, dict) or not isinstance(scan.get("buttons"), list):
+        return None
+    scan["buttons"] = [b for b in scan["buttons"] if isinstance(b, dict) and "tag" in b]
+    return scan
+
+
+def _coupons_on(scan: dict) -> int:
+    return sum(1 for b in scan["buttons"] if b.get("state") != "apply")
+
+
+def _tile_on(scan: dict, key: str, on_before: int) -> bool:
+    """Whether the pressed tile reads "Remove"/"Applied" now. A tile redrawn
+    out of recognition is judged by the count of coupons that are on."""
+    for button in scan["buttons"]:
+        if _coupon_key(button) == key:
+            return button.get("state") != "apply"
+    return _coupons_on(scan) > on_before
+
+
+def _settle_coupons(
+    result: CouponResult, buttons: list[dict], seen: dict[str, str], applied_keys: list[str]
+) -> CouponResult:
+    """What is on and what is not, from the page's last look. A tile seen
+    earlier but missing now counts as not on (unless this step turned it on),
+    so a coupon that existed always shows in the run line."""
+    state = {_coupon_key(b): b.get("state") for b in buttons}
+    # One this step turned on that reads "Apply" again was replaced by another
+    # coupon: it is no longer on, and it was not refused either.
+    result.applied = _unique(seen[k] for k in applied_keys if state.get(k) != "apply")
+    on_keys = {k for k, s in state.items() if s != "apply"}
+    result.already = _unique(
+        seen[k] for k in seen if k in on_keys and k not in applied_keys and seen[k] not in result.applied
+    )
+    result.failed = _unique(
+        seen[k]
+        for k in seen
+        if k not in on_keys and k not in applied_keys
+        and seen[k] not in result.applied and seen[k] not in result.already
+    )
+    return result
+
+
+async def _press_coupon(page: Page, button: dict, on_before: int, hard_stop: float) -> str:
+    """Press one coupon's Apply and wait for that tile to turn to "Remove".
+    Never presses a button that no longer reads "Apply", and never runs past
+    ``hard_stop`` (event-loop time). Returns one of the ``_PRESS_*`` outcomes."""
+    loop = asyncio.get_running_loop()
+    key = _coupon_key(button)
+    sent: list[str] = []
+    answers: list[tuple[float, int]] = []  # (when, HTTP status; 0 = the request failed)
+
+    def _coupon_call(request) -> bool:  # noqa: ANN001 — Playwright Request
+        try:
+            return request.method == "POST" and urlsplit(request.url).path.endswith("/action/view")
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_request(request) -> None:  # noqa: ANN001
+        if _coupon_call(request):
+            sent.append(request.url)
+
+    def _on_response(response) -> None:  # noqa: ANN001
+        with contextlib.suppress(Exception):
+            if _coupon_call(response.request):
+                answers.append((loop.time(), int(response.status)))
+
+    def _on_failed(request) -> None:  # noqa: ANN001
+        if _coupon_call(request):
+            answers.append((loop.time(), 0))
+
+    def _left_ms(cap: int) -> int:
+        return max(1, min(cap, int((hard_stop - loop.time()) * 1000)))
+
+    listening: list[tuple[str, Callable]] = []
+    for event, handler in (("request", _on_request), ("response", _on_response), ("requestfailed", _on_failed)):
+        with contextlib.suppress(Exception):
+            page.on(event, handler)
+            listening.append((event, handler))
+    try:
+        loc = page.locator(f'[data-bob-coupon="{button["tag"]}"]').first
+        try:
+            with contextlib.suppress(Exception):
+                await loc.scroll_into_view_if_needed(timeout=_left_ms(QUICK_TIMEOUT_MS))
+            # Last look right before the press: a tile that has turned to
+            # "Remove" meanwhile must not be pressed, that would take it off.
+            if (await loc.inner_text(timeout=_left_ms(1_000))).strip().lower() != "apply":
+                return _PRESS_NO_EFFECT
+            await loc.click(timeout=_left_ms(QUICK_TIMEOUT_MS))
+        except Exception as exc:  # noqa: BLE001 — best effort, never stops an order
+            log.warning("could not press product coupon %s (%s)", _coupon_name(button), exc.__class__.__name__)
+            return _PRESS_NO_EFFECT
+        until = min(loop.time() + COUPON_CONFIRM_TIMEOUT_MS / 1000, hard_stop)
+        extended = False
+        while True:
+            await page.wait_for_timeout(COUPON_POLL_MS)
+            scan = await _scan_product_coupons(page)
+            if scan is None:
+                return _PRESS_NO_ANSWER if sent else _PRESS_NO_EFFECT
+            if _tile_on(scan, key, on_before):
+                return _PRESS_APPLIED
+            now = loop.time()
+            if answers:
+                when, status = answers[-1]
+                if not 200 <= status < 300:
+                    # Busy, an error, or a dropped connection: not a no.
+                    log.info("coupon %s: Flipkart answered %s — pressing again", _coupon_name(button), status or "nothing (request failed)")
+                    with contextlib.suppress(Exception):
+                        await page.wait_for_timeout(min(COUPON_ERROR_PAUSE_MS, _left_ms(COUPON_ERROR_PAUSE_MS)))
+                    return _PRESS_NO_EFFECT
+                if now - when >= COUPON_AFTER_ANSWER_MS / 1000:
+                    return _PRESS_REFUSED
+            if now >= until:
+                if sent and not answers and not extended and until < hard_stop:
+                    # The press reached Flipkart; its answer is just slow.
+                    extended = True
+                    until = min(until + COUPON_SLOW_ANSWER_MS / 1000, hard_stop)
+                    continue
+                if answers:
+                    return _PRESS_REFUSED
+                # Never press again over a request that may still land.
+                return _PRESS_NO_ANSWER if sent else _PRESS_NO_EFFECT
+    finally:
+        for event, handler in listening:
+            with contextlib.suppress(Exception):
+                page.remove_listener(event, handler)
+
+
+async def apply_product_coupons(
+    page: Page,
+    *,
+    ready_timeout_ms: int = COUPON_READY_TIMEOUT_MS,
+    slow_page_timeout_ms: int = COUPON_SLOW_PAGE_TIMEOUT_MS,
+) -> CouponResult:
+    """Turn on every Flipkart product-page coupon ("Coupons · ₹500 off · Apply")
+    before Buy now / Add to cart, so the discount is in the order total.
+
+    Waits for the coupon button to be live, presses it with a real pointer
+    click, and counts it only when that tile reads "Remove" afterwards. A press
+    that reached nobody, or that Flipkart answered with an error, is tried
+    again (up to ``COUPON_CLICK_ATTEMPTS``); a "no", or a request still out, is
+    not. Never presses "Remove", and never touches Exchange, Bank or EMI Apply
+    buttons. Best effort: it never stops an order; a coupon left off shows in
+    the run line as "NOT applied", and the price gate decides as before.
+    """
+    result = CouponResult()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    plain_since: float | None = None
+    react_since: float | None = None
+    awake_at: float | None = None
+    empty_since: float | None = None
+    presses: dict[str, int] = {}
+    given_up: set[str] = set()
+    applied_keys: list[str] = []
+    seen: dict[str, str] = {}  # every coupon tile seen in this step: key -> name
+    buttons: list[dict] = []
+    while True:
+        scan = await _scan_product_coupons(page)
+        if scan is None:
+            return _settle_coupons(result, buttons, seen, applied_keys) if seen else result
+        now = loop.time()
+        buttons = scan["buttons"]
+        for button in buttons:
+            seen.setdefault(_coupon_key(button), _coupon_name(button))
+        if scan.get("react") and react_since is None:
+            react_since = now
+        if scan.get("buy") is True:
+            page_live = True
+        elif scan.get("react"):
+            # No Buy now on the page, or one not live yet: the page counts as
+            # live once React has had COUPON_BUY_WAIT_MS to take it over.
+            page_live = scan.get("buy") is None or now - react_since >= COUPON_BUY_WAIT_MS / 1000
+        elif scan.get("ready") == "complete":
+            plain_since = now if plain_since is None else plain_since
+            page_live = now - plain_since >= COUPON_PLAIN_PAGE_MS / 1000
+        else:
+            page_live = False
+        # A page whose Buy now is still asleep is just slow: give it longer,
+        # and once it wakes, at least COUPON_AFTER_WAKE_MS more.
+        if scan.get("buy") is True and awake_at is None:
+            awake_at = now
+        if scan.get("buy") is False:
+            deadline = start + slow_page_timeout_ms / 1000
+        elif awake_at is not None:
+            deadline = max(
+                start + ready_timeout_ms / 1000,
+                min(awake_at, start + slow_page_timeout_ms / 1000) + COUPON_AFTER_WAKE_MS / 1000,
+            )
+        else:
+            deadline = start + ready_timeout_ms / 1000
+        waiting = [b for b in buttons if b.get("state") == "apply"]
+
+        if not buttons:
+            if seen:
+                pass  # a tile seen before is being redrawn: keep looking until the limit
+            elif page_live:
+                empty_since = now if empty_since is None else empty_since
+                if now - empty_since >= COUPON_LATE_TILE_MS / 1000:
+                    return result
+        elif not waiting or any(_coupon_key(b) in applied_keys for b in waiting):
+            # All on — or one this step turned on reads "Apply" again because
+            # another coupon replaced it: keep what is on, never flip between them.
+            settled = _settle_coupons(result, buttons, seen, applied_keys)
+            log.info("product coupon(s): %s", settled.label)
+            return settled
+        else:
+            empty_since = None
+            candidates = [b for b in waiting if _coupon_key(b) not in given_up]
+            if not candidates:
+                settled = _settle_coupons(result, buttons, seen, applied_keys)
+                log.warning("product coupon(s): %s", settled.label)
+                return settled
+            press = next(
+                (b for b in candidates if b.get("live") or (page_live and not scan.get("react"))),
+                None,
+            )
+            if press is not None and now < deadline:
+                key, name = _coupon_key(press), _coupon_name(press)
+                presses[key] = presses.get(key, 0) + 1
+                hard_stop = deadline + (COUPON_CONFIRM_TIMEOUT_MS + COUPON_SLOW_ANSWER_MS) / 1000
+                outcome = await _press_coupon(page, press, _coupons_on(scan), hard_stop)
+                if outcome == _PRESS_APPLIED:
+                    applied_keys.append(key)
+                    log.info("applied product coupon %s (press %d)", name, presses[key])
+                elif outcome == _PRESS_REFUSED:
+                    given_up.add(key)
+                    log.warning("Flipkart took the press but product coupon %s still reads 'Apply' — not for this account?", name)
+                elif outcome == _PRESS_NO_ANSWER:
+                    given_up.add(key)
+                    log.warning("no answer from Flipkart for product coupon %s — not pressing again over it", name)
+                elif presses[key] >= COUPON_CLICK_ATTEMPTS:
+                    given_up.add(key)
+                    log.warning("product coupon %s: %d presses, none went through", name, presses[key])
+                continue
+
+        if loop.time() >= deadline:
+            settled = _settle_coupons(result, buttons, seen, applied_keys)
+            if settled.failed:
+                pressed = sum(presses.values())
+                log.warning(
+                    "product coupon(s) %s still not on after %.0fs — %s",
+                    ", ".join(settled.failed),
+                    loop.time() - start,
+                    f"pressed {pressed} time(s), none went through" if pressed else "the page never let them be pressed",
+                )
+            return settled
+        await page.wait_for_timeout(COUPON_POLL_MS)
 
 
 async def buy_now(page: Page, product_link: str, *, already_open: bool = False) -> None:
@@ -399,16 +825,15 @@ async def _until(predicate, wait_ms: int) -> bool:
 async def fill_gst(page: Page, gst: GstInfo) -> None:
     """Bill the order under ``gst`` on the checkout (audit F-4).
 
-    The checkout as mapped live on 27 Oct 2026 (``selectors`` GST_*): tick
-    "Use GST Invoice", and in the side panel it opens type the GSTIN and the
-    business name and press "Confirm and Save". A checkout already naming the
-    GSTIN is left alone — ticking the box again would untick it — and a panel
-    that lists the GSTIN among the account's saved details has it picked, not
-    typed again. Nothing here raises: the caller reads the GSTIN the checkout
-    then names and refuses an order billed under another one
-    (:func:`gstin_on_checkout`). The legacy class-name buttons this replaced
-    matched nothing any more, so no order was billed under a GST at all
-    (rehearsal of 27 Oct 2026).
+    The checkout as mapped live on 27 Oct 2026 and 23 Nov 2026 (``selectors`` GST_*):
+    - When no GST is selected yet, Flipkart shows a "Use GST Invoice" tick box.
+    - When another GST is already pre-selected on the account, Flipkart replaces
+      that tick box with a "GST Invoice" block carrying a "Change" button, which
+      opens "Select GST Details" (with saved GSTINs, "Add new GST Details", and
+      "Confirm and Use").
+    A checkout already naming ``gst.gstin`` is left alone. Nothing here raises:
+    the caller reads the GSTIN the checkout then names and refuses an order
+    billed under another one (:func:`gstin_on_checkout`).
     """
     wanted = (gst.gstin or "").strip().upper()
     if not wanted:
@@ -416,33 +841,79 @@ async def fill_gst(page: Page, gst: GstInfo) -> None:
     try:
         if await gstin_on_checkout(page) == wanted:
             return
-        await page.get_by_text(S.GST_USE_INVOICE_TEXT, exact=True).first.click(timeout=QUICK_TIMEOUT_MS)
+
+        # Open the GST drawer: either "Use GST Invoice" (no GST yet) or the
+        # "Change" button beside "GST Invoice" (a different GST is selected).
+        use_box = page.get_by_text(S.GST_USE_INVOICE_TEXT, exact=True)
+        change_btn = page.locator(f"xpath={S.GST_CHANGE_BTN}")
+        if await use_box.count() and await use_box.first.is_visible():
+            await use_box.first.click(timeout=QUICK_TIMEOUT_MS)
+        elif await change_btn.count():
+            with contextlib.suppress(Exception):
+                await change_btn.first.scroll_into_view_if_needed(timeout=QUICK_TIMEOUT_MS)
+            await change_btn.first.click(timeout=QUICK_TIMEOUT_MS)
+        else:
+            await use_box.first.click(timeout=QUICK_TIMEOUT_MS)
+
         gstin_box = page.locator(S.GST_GSTIN_INPUT)
         listed = page.get_by_text(wanted, exact=False)
+        add_new = page.get_by_text(S.GST_ADD_NEW_TEXT, exact=True)
 
         async def box_open() -> bool:
             return bool(await gstin_box.count()) and await gstin_box.first.is_visible()
 
+        async def add_new_visible() -> bool:
+            return bool(await add_new.count()) and await add_new.first.is_visible()
+
         async def panel_open() -> bool:
-            return await box_open() or bool(await listed.count())
+            return await box_open() or bool(await listed.count()) or await add_new_visible()
 
         if not await _until(panel_open, GST_PANEL_WAIT_MS):
-            log.error("fill_gst: ticking %r opened no GST panel", S.GST_USE_INVOICE_TEXT)
+            log.error("fill_gst: opening the GST drawer opened no GST panel")
             return
-        if await box_open():
-            await gstin_box.first.fill(wanted, timeout=QUICK_TIMEOUT_MS)
-            await page.locator(S.GST_BUSINESS_INPUT).first.fill((gst.business_name or "")[:60], timeout=QUICK_TIMEOUT_MS)
-        else:
+
+        if await listed.count() and not await box_open():
             await listed.first.click(timeout=QUICK_TIMEOUT_MS)
-        confirm = page.get_by_text(S.GST_CONFIRM_TEXT, exact=True)
-        if await confirm.count():
-            await confirm.first.click(timeout=QUICK_TIMEOUT_MS)
+        else:
+            if not await box_open() and await add_new_visible():
+                await add_new.first.click(timeout=QUICK_TIMEOUT_MS)
+                if not await _until(box_open, GST_PANEL_WAIT_MS):
+                    log.error("fill_gst: clicking %r did not open the GST inputs", S.GST_ADD_NEW_TEXT)
+                    return
+            if await box_open():
+                await gstin_box.first.fill(wanted, timeout=QUICK_TIMEOUT_MS)
+                await page.locator(S.GST_BUSINESS_INPUT).first.fill(
+                    (gst.business_name or "")[:60], timeout=QUICK_TIMEOUT_MS
+                )
+                await page.wait_for_timeout(500)
+
+        for _attempt in range(2):
+            for label in (S.GST_CONFIRM_TEXT, S.GST_CONFIRM_USE_TEXT):
+                btn = page.get_by_text(label, exact=True)
+                if await btn.count() and await btn.first.is_visible():
+                    await btn.first.click(timeout=QUICK_TIMEOUT_MS)
+                    await page.wait_for_timeout(600)
+                    if await gstin_on_checkout(page) == wanted and not await box_open():
+                        break
+            if await gstin_on_checkout(page) == wanted and not await box_open():
+                break
 
         async def named() -> bool:
             return await gstin_on_checkout(page) == wanted and not await box_open()
 
         if not await _until(named, GST_PANEL_WAIT_MS):
-            log.warning("fill_gst: the checkout does not name %s after %r", wanted, S.GST_CONFIRM_TEXT)
+            # If saving a new GST returned to the "Select GST Details" drawer,
+            # confirm using it once more.
+            use_btn = page.get_by_text(S.GST_CONFIRM_USE_TEXT, exact=True)
+            if await use_btn.count() and await use_btn.first.is_visible():
+                if await listed.count():
+                    with contextlib.suppress(Exception):
+                        await listed.first.click(timeout=QUICK_TIMEOUT_MS)
+                await use_btn.first.click(timeout=QUICK_TIMEOUT_MS)
+                await _until(named, GST_PANEL_WAIT_MS)
+
+        if not await named():
+            log.warning("fill_gst: the checkout does not name %s after confirming GST", wanted)
     except Exception as exc:  # noqa: BLE001
         log.error("fill_gst failed: %s", exc)
 
@@ -1265,22 +1736,48 @@ async def add_delivery_address(page: Page, address: AddressInfo) -> tuple[bool, 
     try:
         await texts.nth(0).fill(house)
         await texts.nth(1).fill(address.name)
-        if address.phone:
-            await tels.nth(0).fill(address.phone)
+        phone = re.sub(r"\D", "", address.phone or "")[-10:]
+        if len(phone) == 10:
+            await tels.nth(0).fill(phone)
     except Exception as exc:  # noqa: BLE001
         return False, f"could not fill the address form ({exc})"
 
     kind = S.ADDRESS_TYPE_WORK if _BUSINESS_NAME_RE.search(address.name or "") else S.ADDRESS_TYPE_HOME
     await _click_text(page, kind, timeout_ms=QUICK_TIMEOUT_MS)
 
-    if not await _click_text(page, S.ADDRESS_SAVE):
+    # Flipkart's revamped /address-map Save address button is an RN-Web
+    # responder control that ignores synthetic JS el.click() (verified live
+    # 23 Nov 2026: real Playwright mouse click triggers address-validate -> 200
+    # and returns to /viewcheckout). Fall back to _click_text for stubs.
+    saved_click = False
+    try:
+        save_btn = page.locator(f"xpath={S.ADDRESS_SAVE}").first
+        await save_btn.wait_for(state="visible", timeout=ADDRESS_STEP_TIMEOUT_MS)
+        await save_btn.scroll_into_view_if_needed()
+        await save_btn.click(timeout=ADDRESS_STEP_TIMEOUT_MS)
+        saved_click = True
+    except Exception:  # noqa: BLE001
+        saved_click = await _click_text(page, S.ADDRESS_SAVE)
+    if not saved_click:
         return False, "could not press Save address"
     log.info("saved a new address on the account: %s, %s, %s", address.name, house, address.pin)
 
     try:
         await page.wait_for_url("**/viewcheckout**", timeout=ADDRESS_SAVE_TIMEOUT_MS)
     except Exception:  # noqa: BLE001
-        return False, f"the checkout did not come back after saving (browser is on {(page.url or '')[:80]})"
+        hint = ""
+        try:
+            errs = await page.evaluate(
+                """() => [...document.querySelectorAll('*')]
+                     .filter(e => e.children.length === 0 && e.innerText && e.innerText.trim().length > 2
+                             && getComputedStyle(e).color.startsWith('rgb(227'))
+                     .map(e => e.innerText.trim())"""
+            )
+            if errs:
+                hint = f": {errs[0][:120]}"
+        except Exception:  # noqa: BLE001
+            pass
+        return False, f"the checkout did not come back after saving{hint} (browser is on {(page.url or '')[:80]})"
     for _ in range(5):
         if address_matches(await current_delivery_address(page), address):
             return True, ""
@@ -1726,7 +2223,7 @@ async def await_order_confirmation(
     except Exception:  # noqa: BLE001
         return None, (
             f"Flipkart's order confirmation page did not appear within "
-            f"{timeout_ms // 1000}s (the browser was on {(page.url or '')[:90]})"
+            f"{timeout_ms // 1000}s (the browser was on {_shown_url(page.url or '')})"
         )
 
     reference = reference_from_url(page.url or "")
@@ -1760,7 +2257,7 @@ async def await_order_confirmation(
     # bounce to login). The proof is only good for the page it was read on.
     landed = page.url or ""
     if not _is_confirmation_page(landed) or reference_from_url(landed) != reference:
-        return None, f"the browser left the confirmation page while it was being read (now on {landed[:90]})"
+        return None, f"the browser left the confirmation page while it was being read (now on {_shown_url(landed)})"
 
     text = seen[-1]
     if not proof:
@@ -1795,6 +2292,18 @@ def _foreign_host(url: str) -> str | None:
     if host and host != "flipkart.com" and not host.endswith(".flipkart.com"):
         return host
     return None
+
+
+def _shown_url(url: str) -> str:
+    """An address as a note or a log may show it: Flipkart's as it is (cut to
+    90 characters, as before); any other site's without its query or
+    fragment, which on a bank's page can carry what a form sent — the card's
+    password among it, when a form is sent the plain way (23 Nov 2026)."""
+    url = url or ""
+    if not _foreign_host(url):
+        return url[:90]
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"[:160]
 
 
 def _inner_frames(where: object) -> list:
@@ -1882,15 +2391,23 @@ async def _bank_page(
 _BANK_BLOCKED = re.compile(
     r"request blocked|blocked by (?:our|your) security|access to this endpoint is blocked", re.IGNORECASE
 )
+#: A bare web-server error page where the bank's page was. HDFC's 3-D Secure
+#: ended on "404 Not Found / nginx" on 24 Nov 2026 (job 689), after its
+#: password form had been sent the plain way, without the page's own Submit
+#: step. Read only on a page of a few lines, so a bank page that merely
+#: mentions a number is never taken for one.
+_BANK_ERROR_PAGE = re.compile(r"^\s*([45]\d\d)\s*[-:]?\s*([A-Za-z][A-Za-z' -]{2,40}?)\s*(?:\n|$)")
+#: The longest page text that can still be a bare error page.
+_BANK_ERROR_PAGE_MAX_CHARS = 300
 
 
 async def _bank_authentication_blocked(
     page: Page, popups: list | None = None, ignore: frozenset[str] = frozenset()
 ) -> str:
     """A note when the bank's authentication page shows a "blocked by security"
-    page instead of its form. The order may still have reached Flipkart, so
-    this only explains where the bank step stuck — it never says the order
-    failed. Never raises: it runs after Pay."""
+    page, or a bare server error page, instead of its form. The order may
+    still have reached Flipkart, so this only explains where the bank step
+    stuck — it never says the order failed. Never raises: it runs after Pay."""
     for host, place in _foreign_places(page, popups, ignore):
         try:
             text = await place.locator("xpath=//body").first.inner_text(timeout=QUICK_TIMEOUT_MS)
@@ -1901,60 +2418,513 @@ async def _bank_authentication_blocked(
                 f"the bank's authentication page ({host}) showed 'Request Blocked' — it refused this "
                 "automated browser; the bank step may need a person to finish it in a visible window"
             )
+        error = (
+            _BANK_ERROR_PAGE.match(text)
+            if text and len(text.strip()) <= _BANK_ERROR_PAGE_MAX_CHARS
+            else None
+        )
+        if error:
+            return (
+                f"the bank's page ({host}) ended on a bare error page "
+                f"('{error.group(1)} {error.group(2).strip()}') instead of going back to Flipkart"
+            )
     return ""
 
 
+#: How long a press of the bank's Submit gets to show it reached the bank: a
+#: page load or a request leaving for the bank, its page moving on, or the
+#: password box going away. A sign ends the wait at once; the full wait is
+#: spent only to report that none came. Nothing is pressed again after a
+#: press that went through, sign or not: a second sending of the password can
+#: count as a wrong try, and banks lock the password after three.
+BANK_SUBMIT_SIGN_MS = 10_000
+#: After a press that raised (the control could not be pressed at all), how
+#: long to look for a sign before the next way of submitting may be tried.
+BANK_SUBMIT_RAISED_SIGN_MS = 2_000
+#: After typing, how long to look for the page sending its form by itself (a
+#: page that does so once its box is full) before anything is pressed. The
+#: browser can report that page load a moment after the last key.
+BANK_TYPED_LOOK_MS = 750
+
+#: The password form's own submit controls, found from the password box: a
+#: <button> with no type (in a form, that is a submit) or type="submit", and
+#: an <input> of type submit or image.
+_BANK_FORM_SUBMIT = (
+    "xpath=ancestor::form[1]//*[(self::button and (not(@type) or @type='submit'))"
+    " or (self::input and (@type='submit' or @type='image'))]"
+)
+
+
+#: Words a control the bank step presses must never say.
+_NEVER_WORDS = ("cancel", "resend", "back", "change", "close", "forgot")
+
+
+def _bank_button_by_words() -> str:
+    """A control on the bank's page whose words say it sends the password —
+    Submit, Continue, Verify, Proceed, Confirm, Authenticate — and never
+    Cancel, Resend, Back, Change, Close or Forgot. Its words are its text, or
+    its value, aria-label, alt or title. Buttons the page draws itself count
+    (role="button", an onclick, a "btn" class), but only the innermost: a
+    wrapper around a button is not a second button."""
+    lower = (
+        "translate(concat(normalize-space(.), ' ', @value, ' ', @aria-label, ' ', @alt, ' ', @title), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+    )
+    says = " or ".join(
+        f"contains({lower}, '{word}')"
+        for word in ("submit", "continue", "verify", "proceed", "confirm", "authenticate")
+    )
+    never = " or ".join(f"contains({lower}, '{word}')" for word in _NEVER_WORDS)
+    control = (
+        "self::button or self::a or @role='button' or @onclick"
+        " or (self::input and (@type='submit' or @type='button' or @type='image'))"
+        " or contains(translate(@class, 'BTN', 'btn'), 'btn')"
+    )
+    return f"xpath=//*[({control}) and ({says}) and not({never}) and not(.//*[{control}])]"
+
+
+_BANK_SUBMIT_BY_WORDS = _bank_button_by_words()
+
+#: Whether Enter in the password box would send its form the plain way: the
+#: box sits in a form with no submit control at all, so the browser posts the
+#: form by itself and none of the page's own Submit step runs. With a submit
+#: control, Enter presses that control, as a person's Enter does.
+_ENTER_SENDS_PLAIN_FORM_JS = """(el) => {
+  const form = el.form;
+  if (!form) return false;
+  const submits = Array.from(form.elements).some((e) => e.type === 'submit')
+    || form.querySelector('input[type=image]') !== null;
+  return !submits;
+}"""
+
+#: What the bank's page holds, for the record kept when an order does not
+#: confirm: its forms (where they send, never what), its boxes (type and name,
+#: never a value) and its buttons (their words). Taken before anything is
+#: typed. 24 Nov 2026: the only record of HDFC's page was a picture of the
+#: "404 Not Found" it ended on, which could not say why.
+_BANK_OUTLINE_JS = """() => {
+  const shown = (el) => {
+    const box = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const bare = (url) => { try { const u = new URL(url, location.href); return u.host + u.pathname; } catch (e) { return ''; } };
+  const words = (el) => String(el.innerText || el.getAttribute('value') || el.getAttribute('aria-label')
+    || el.getAttribute('alt') || el.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+  return {
+    address: bare(location.href),
+    title: (document.title || '').slice(0, 80),
+    text: (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').trim().slice(0, 300),
+    forms: Array.from(document.forms).slice(0, 5).map((f) => ({
+      id: f.id || f.getAttribute('name') || '',
+      sends_to: bare(f.getAttribute('action') || location.href),
+      method: (f.getAttribute('method') || 'get').toLowerCase(),
+      submit_controls: Array.from(f.elements).filter((e) => e.type === 'submit').length
+        + f.querySelectorAll('input[type=image]').length,
+    })),
+    boxes: Array.from(document.querySelectorAll('input, select, textarea')).slice(0, 25).map((el) => ({
+      tag: el.tagName.toLowerCase(),
+      type: (el.getAttribute('type') || '').toLowerCase(),
+      name: el.getAttribute('name') || el.id || '',
+      max: el.maxLength > 0 ? el.maxLength : null,
+      shown: shown(el),
+      in_form: !!el.form,
+    })),
+    controls: Array.from(document.querySelectorAll(
+      'button, a, [role=button], [onclick], input[type=submit], input[type=button], input[type=image]'
+    )).slice(0, 30).map((el) => ({
+      tag: el.tagName.toLowerCase(),
+      type: (el.getAttribute('type') || '').toLowerCase(),
+      words: words(el),
+      shown: shown(el),
+      disabled: !!el.disabled,
+      in_form: !!el.form,
+    })),
+  };
+}"""
+
+
+#: The longest any one look at the bank's page may take. While that page is
+#: loading its next page, Playwright's reads of it (count, is_visible, all,
+#: evaluate) wait for the next page with no end of their own — seen in
+#: Chromium, 24 Nov 2026 — and a run must never hang on one.
+BANK_READ_SECONDS = 3.0
+
+
+async def _within(awaitable, seconds: float = BANK_READ_SECONDS):
+    """``awaitable``'s result, or TimeoutError after ``seconds``."""
+    return await asyncio.wait_for(awaitable, seconds)
+
+
+def _bare_url(url: str) -> str:
+    """An address without its query or fragment, for the bank step's record."""
+    parts = urlsplit(url or "")
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"[:160]
+
+
+class _BankTraffic:
+    """What the browser sent after Pay, and what came back: every page load,
+    and anything but a plain picture-or-script fetch to a site that is not
+    Flipkart. Addresses are kept without their query, and nothing a request
+    carries is read, so the record never holds what a form sent. Fed by the
+    request listeners on the page and on any window Pay opened.
+
+    ``count`` is every such request; the press of the bank's Submit marks it
+    before and reads it after, as one sign that the form reached the bank."""
+
+    LIMIT = 80
+
+    def __init__(self, ignore: frozenset[str] = frozenset()) -> None:
+        self.ignore = ignore
+        self.started = time.monotonic()
+        self.count = 0
+        #: Page loads among them: a page that sends its form by itself as the
+        #: password is typed (some do, once the box is full) shows as one.
+        self.documents = 0
+        self.lines: list[str] = []
+
+    def _wanted(self, request) -> bool:
+        kind = (getattr(request, "resource_type", "") or "").lower()
+        if kind == "document":
+            return True
+        host = _foreign_host(getattr(request, "url", "") or "")
+        return bool(host) and host not in self.ignore and (request.method != "GET" or kind in ("xhr", "fetch"))
+
+    def _note(self, line: str) -> None:
+        if len(self.lines) < self.LIMIT:
+            self.lines.append(f"{time.monotonic() - self.started:6.1f}s after Pay  {line}")
+
+    def on_request(self, request) -> None:
+        with contextlib.suppress(Exception):
+            if self._wanted(request):
+                self.count += 1
+                kind = getattr(request, "resource_type", "") or "?"
+                if kind == "document":
+                    self.documents += 1
+                self._note(f"sent     {request.method} {kind} {_bare_url(request.url)}")
+
+    def on_response(self, response) -> None:
+        with contextlib.suppress(Exception):
+            if self._wanted(response.request):
+                self._note(f"answered {response.status} {_bare_url(response.url)}")
+
+    def on_failed(self, request) -> None:
+        with contextlib.suppress(Exception):
+            if self._wanted(request):
+                failure = getattr(request, "failure", None)
+                why = (failure if isinstance(failure, str) else "") or "no answer"
+                self._note(f"failed   {why[:60]} {_bare_url(request.url)}")
+
+    def listeners(self) -> tuple[tuple[str, Callable], ...]:
+        return (("request", self.on_request), ("response", self.on_response), ("requestfailed", self.on_failed))
+
+
+@dataclass
+class BankStep:
+    """What happened on the bank's page. ``problem`` says why the password
+    could not be typed or sent (None when it was); ``how`` says how it was
+    sent and what showed it reached the bank; ``sent`` is whether anything
+    did show that. ``outline`` is the page as it was before typing."""
+
+    problem: str | None = None
+    how: str = ""
+    sent: bool = False
+    outline: dict | None = None
+    tried: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+
+async def _bank_outline(place: object) -> dict | None:
+    """The bank page's outline (``_BANK_OUTLINE_JS``), or None. Never raises."""
+    try:
+        outline = await _within(place.evaluate(_BANK_OUTLINE_JS))
+    except Exception:  # noqa: BLE001 — the record can do without it
+        return None
+    return outline if isinstance(outline, dict) else None
+
+
 async def _enter_bank_password(
-    page: Page, password: str, popups: list | None = None, ignore: frozenset[str] = frozenset()
-) -> str | None:
+    page: Page,
+    password: str,
+    popups: list | None = None,
+    ignore: frozenset[str] = frozenset(),
+    traffic: _BankTraffic | None = None,
+) -> BankStep:
     """Type the card's password into the bank's one password box and submit.
 
     The box is looked for wherever the bank's page is (``_foreign_places``),
     for up to ``BANK_FIELD_WAIT_MS``. More than one box anywhere is refused,
-    not guessed between. None on success, else why not — never the password,
-    and never the driver's error text, which would repeat it.
+    not guessed between. The step's ``problem`` is None on success, else why
+    not — never the password, and never the driver's error text, which would
+    repeat it.
     """
     waited = 0
     while True:
-        for _host, place in _foreign_places(page, popups, ignore):
+        places = _foreign_places(page, popups, ignore)
+        for _host, place in places:
             boxes = place.locator(_PASSWORD_BOX)
             try:
-                count = await boxes.count()
-            except Exception:  # noqa: BLE001 — a frame that went away while being looked at
+                count = await _within(boxes.count())
+            except Exception:  # noqa: BLE001 — a frame that went away, or is loading, while being looked at
                 continue
             if count > 1:
-                return f"expected one password field on the bank's page, found {count}"
+                return BankStep(
+                    problem=f"expected one password field on the bank's page, found {count}",
+                    outline=await _bank_outline(place),
+                )
             if count == 1:
-                return await _type_bank_password(place, boxes.first, password)
+                outline = await _bank_outline(place)
+                step = await _type_and_submit(place, boxes.first, password, traffic)
+                step.outline = outline
+                return step
         if _is_confirmation_page(page.url or ""):
-            return "Flipkart confirmed before the bank's page asked for a password"
+            return BankStep(problem="Flipkart confirmed before the bank's page asked for a password")
         if waited >= BANK_FIELD_WAIT_MS:
-            return "the bank's page showed no password field"
+            return BankStep(
+                problem="the bank's page showed no password field",
+                outline=await _bank_outline(places[0][1]) if places else None,
+            )
         await page.wait_for_timeout(500)
         waited += 500
 
 
 async def _type_bank_password(place: object, box, password: str) -> str | None:
-    """Type into the bank's password box and submit its form: the form's one
-    submit button when it has exactly one, else Enter in the box — never the
-    first of several, which can be the bank's Cancel."""
+    """Type the password and submit the bank's form (:func:`_type_and_submit`):
+    None on success, else why not."""
+    return (await _type_and_submit(place, box, password)).problem
+
+
+async def _type_and_submit(
+    place: object, box, password: str, traffic: _BankTraffic | None = None
+) -> BankStep:
+    """Type into the bank's password box, then submit its form
+    (:func:`_submit_bank_form`)."""
+    step = BankStep()
+    pages_before = traffic.documents if traffic is not None else 0
+    url_before = getattr(place, "url", "") or ""
     try:
         with contextlib.suppress(Exception):
             await box.click(timeout=QUICK_TIMEOUT_MS)
         await box.fill("", timeout=QUICK_TIMEOUT_MS)
         await box.press_sequentially(password, delay=CARD_KEY_DELAY_MS)
     except Exception as exc:  # noqa: BLE001
-        return f"could not fill the bank's password field ({exc.__class__.__name__})"
-    submit = box.locator("xpath=ancestor::form[1]//*[(self::button or self::input) and @type='submit']")
+        step.problem = f"could not fill the bank's password field ({exc.__class__.__name__})"
+        return step
+    moved = await _bank_sign(place, box, traffic, pages_before, url_before, BANK_TYPED_LOOK_MS, pages_only=True)
+    if moved:
+        # The page sent its form by itself as the box filled: pressing
+        # anything now would send the password a second time.
+        step.sent = True
+        step.how = f"the bank's page sent it by itself as it was typed ({moved}; nothing pressed)"
+        return step
+    await _submit_bank_form(place, box, step, traffic)
+    return step
+
+
+async def _shown_controls(locator) -> list:
+    """The matches of ``locator`` that are shown on the page. Never raises."""
     try:
-        if await submit.count() == 1:
-            await submit.first.click(timeout=QUICK_TIMEOUT_MS)
+        found = await _within(locator.all())
+    except Exception:  # noqa: BLE001 — a page that cannot be searched shows nothing
+        return []
+    shown = []
+    for control in found:
+        with contextlib.suppress(Exception):
+            if await _within(control.is_visible()):
+                shown.append(control)
+    return shown
+
+
+#: Words a bank's Submit button can say on its own.
+_SUBMIT_WORDS = frozenset({"submit", "continue", "verify", "proceed", "confirm", "authenticate"})
+_CONTROL_WORDS_JS = """(el) => String(el.innerText || el.value || el.getAttribute('aria-label')
+  || el.getAttribute('alt') || el.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().toLowerCase()"""
+
+
+async def _not_saying_never_words(controls: list) -> list:
+    """``controls`` less any whose words say Cancel, Resend, Back, Change,
+    Close or Forgot. A control that cannot be read is kept (it may be an
+    icon); a page that cannot be read at all keeps them all. Never raises."""
+    kept = []
+    for control in controls:
+        words = ""
+        with contextlib.suppress(Exception):
+            words = str(await _within(control.evaluate(_CONTROL_WORDS_JS)) or "")
+        if not any(word in words for word in _NEVER_WORDS):
+            kept.append(control)
+    return kept
+
+
+async def _saying_only_a_submit_word(controls: list) -> list:
+    """The controls whose whole words are one submit word ("Submit",
+    "CONTINUE"). Never raises; a control that cannot be read is left out."""
+    exact = []
+    for control in controls:
+        with contextlib.suppress(Exception):
+            if str(await _within(control.evaluate(_CONTROL_WORDS_JS)) or "").strip(" .!") in _SUBMIT_WORDS:
+                exact.append(control)
+    return exact
+
+
+async def _bank_sign(
+    place: object,
+    box,
+    traffic: _BankTraffic | None,
+    mark: int,
+    url_before: str,
+    wait_ms: int,
+    *,
+    pages_only: bool = False,
+) -> str:
+    """What showed the bank's form went off after a press, or "" when nothing
+    did within ``wait_ms``: a page load or a request leaving for the bank, the
+    bank's page moving to another address, or the password box going away.
+    ``mark`` is ``traffic.count`` before the press — or, with ``pages_only``,
+    ``traffic.documents``: after typing, only a page load is a sign, as a
+    page may call home on its own while a box is typed in."""
+    owner = getattr(place, "page", None) or place
+    waited = 0
+    while True:
+        seen = (traffic.documents if pages_only else traffic.count) if traffic is not None else mark
+        if seen > mark:
+            return "the browser sent it to the bank"
+        if (getattr(place, "url", "") or "") != url_before:
+            return "the bank's page moved on"
+        try:
+            if not await _within(box.count(), 1.0) or not await _within(box.is_visible(), 1.0):
+                return "the password box went away"
+        except TimeoutError:
+            return "the bank's page is loading its next page"
+        except Exception:  # noqa: BLE001 — the frame itself went away: the page moved on
+            return "the bank's page moved on"
+        if waited >= wait_ms:
+            return ""
+        try:
+            await owner.wait_for_timeout(250)
+        except Exception:  # noqa: BLE001 — a window that closed has moved on
+            return "the bank's window closed"
+        waited += 250
+
+
+async def _submit_bank_form(place: object, box, step: BankStep, traffic: _BankTraffic | None) -> None:
+    """Submit the bank's password form the way a person would, once.
+
+    The ways, in turn — the next only when the one before could not be
+    pressed at all and nothing reached the bank:
+
+    1. the form's one Submit button, when it shows exactly one (never the
+       first of several, which can be the bank's Cancel);
+    2. the one button on the bank's page whose words say Submit / Continue /
+       Verify / Proceed / Confirm — the page's own button, which runs the
+       page's own Submit step even when it is not a submit button of the form;
+    3. Enter in the password box — but never when the box's form has no
+       submit control at all: Enter then makes the browser send the form by
+       itself, skipping the page's own step.
+
+    Every press is made without waiting for the page that follows: the
+    bank's server can take longer to answer than any wait here, which is
+    slow, not refused. What follows a press is looked for instead
+    (:func:`_bank_sign`).
+
+    Seen live: 23 Nov 2026 (job 629) the form's one submit button "timed out"
+    on click; 24 Nov (job 689) HDFC's page showed no submit button of the
+    form, Enter sent the form by itself, HDFC's server did not answer for
+    30 s and its page ended on "404 Not Found".
+    """
+    url_before = getattr(place, "url", "") or ""
+    ways: list[tuple[str, object | None]] = []
+    # A form whose one submit control is Cancel (the real button drawn
+    # outside it) must not have Cancel pressed for Submit.
+    in_form = await _not_saying_never_words(await _shown_controls(box.locator(_BANK_FORM_SUBMIT)))
+    if len(in_form) == 1:
+        ways.append(("the form's Submit button", in_form[0]))
+    worded = await _shown_controls(place.locator(_BANK_SUBMIT_BY_WORDS))
+    if len(worded) > 1:
+        # "Submit" beside a link such as "verify with an OTP instead": the
+        # one control saying a submit word and nothing else is the button.
+        worded = await _saying_only_a_submit_word(worded) or worded
+    if len(worded) == 1:
+        ways.append(("the page's Submit button", worded[0]))
+    elif len(worded) > 1:
+        step.skipped.append(f"{len(worded)} buttons say Submit/Continue/Verify — none was guessed at")
+    sends_plain = False
+    with contextlib.suppress(Exception):
+        sends_plain = bool(await _within(box.evaluate(_ENTER_SENDS_PLAIN_FORM_JS)))
+    if sends_plain:
+        step.skipped.append(
+            "Enter was not pressed: the password's form has no submit control, so Enter would send "
+            "the form without the bank page's own Submit step"
+        )
+    else:
+        ways.append(("Enter in the password box", None))
+
+    for label, control in ways:
+        mark = traffic.count if traffic is not None else 0
+        try:
+            if control is None:
+                await box.press("Enter", timeout=QUICK_TIMEOUT_MS, no_wait_after=True)
+            else:
+                await control.click(timeout=QUICK_TIMEOUT_MS, no_wait_after=True)
+        except Exception as exc:  # noqa: BLE001
+            step.tried.append(f"{label} ({exc.__class__.__name__})")
+            sign = await _bank_sign(place, box, traffic, mark, url_before, BANK_SUBMIT_RAISED_SIGN_MS)
+            if not sign:
+                log.warning(
+                    "could not press %s on the bank's page (%s); nothing reached the bank",
+                    label,
+                    exc.__class__.__name__,
+                )
+                continue
         else:
-            await box.press("Enter")
-    except Exception as exc:  # noqa: BLE001
-        return f"could not submit the bank's password form ({exc.__class__.__name__})"
-    log.info("the card's password was entered on the bank's page")
-    return None
+            sign = await _bank_sign(place, box, traffic, mark, url_before, BANK_SUBMIT_SIGN_MS)
+        step.sent = bool(sign)
+        step.how = (
+            f"sent with {label} ({sign})"
+            if sign
+            else (
+                f"{label} was pressed, but nothing was seen reaching the bank within "
+                f"{BANK_SUBMIT_SIGN_MS // 1000}s (not pressed again)"
+            )
+        )
+        return
+    found = "; ".join([*(f"tried {t}" for t in step.tried), *step.skipped])
+    step.problem = "could not submit the bank's password form — " + (
+        found or "no Submit button was found on the bank's page"
+    )
+
+
+def _save_bank_record(host: str | None, step: BankStep | None, traffic: _BankTraffic | None) -> Path | None:
+    """Keep what the bank step saw, next to the screenshots, when an order
+    does not confirm: the bank's page before typing (its outline), what was
+    pressed, and what the browser sent and got back after Pay. Nothing in it
+    is a value typed or sent. Never raises; None when nothing was saved."""
+    try:
+        lines = [
+            f"bank step after Pay, {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
+            f"bank's page: {host or 'none reached'}",
+        ]
+        if step is not None:
+            lines.append(f"result: {step.problem or step.how}")
+            lines += [f"tried: {t}" for t in step.tried] + [f"not done: {s}" for s in step.skipped]
+            if step.outline:
+                outline = json.dumps(step.outline, ensure_ascii=False, indent=1)
+                lines += ["", "the bank's page before typing (no values):", _LONG_DIGIT_RUN.sub("[digits]", outline)[:8000]]
+        if traffic is not None and traffic.lines:
+            lines += ["", "what the browser sent and got back after Pay (addresses without their query):", *traffic.lines]
+        DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+        _prune_diagnostics()
+        path = DIAGNOSTICS_DIR / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-bank-step.txt"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — a record is never worth failing a run over
+        log.warning("could not save the bank step's record (%s)", exc.__class__.__name__)
+        return None
+    log.info("saved the bank step's record to %s", path)
+    return path
+
+
+#: Eight or more digits in a row (spaces and dashes between allowed): taken
+#: out of the bank page's outline, which can show a masked card or a phone.
+_LONG_DIGIT_RUN = re.compile(r"\d(?:[\d \-]{6,})\d")
 
 
 async def _submit_and_confirm(
@@ -2023,15 +2993,23 @@ async def _submit_and_confirm(
 
     def watch_popup(popup) -> None:
         popups.append(popup)
+        if traffic is not None:
+            for event, handler in traffic.listeners():
+                with contextlib.suppress(Exception):
+                    popup.on(event, handler)
 
+    #: Sites already framed in the payment page before Pay: never the bank's.
+    framed_before = frozenset(host for host, _ in _foreign_places(page))
+    #: What a card run's browser sends after Pay: the sign that the bank's form
+    #: went off, and the record kept when the order does not confirm.
+    traffic = _BankTraffic(framed_before) if payment_mode != PAYMENT_COD else None
     listeners = (
         ("request", watch),
         ("response", watch_answer),
         ("framenavigated", watch_navigation),
         ("popup", watch_popup),
+        *(traffic.listeners() if traffic is not None else ()),
     )
-    #: Sites already framed in the payment page before Pay: never the bank's.
-    framed_before = frozenset(host for host, _ in _foreign_places(page))
     for event, handler in listeners:
         page.on(event, handler)
     try:
@@ -2058,6 +3036,7 @@ async def _submit_and_confirm(
         # the next attempt buys them a second time.
         bank_host: str | None = None
         bank_note = ""
+        bank_step: BankStep | None = None
         confirmation_timeout = ORDER_CONFIRMATION_TIMEOUT_MS
         try:
             if payment_mode != PAYMENT_COD:
@@ -2072,13 +3051,24 @@ async def _submit_and_confirm(
                 if bank_host:
                     confirmation_timeout += max(0, int(get_settings().bank_otp_fill_wait)) * 1000
                     if card is not None and card.password:
-                        problem = await _enter_bank_password(page, card.password, popups, framed_before)
+                        bank_step = await _enter_bank_password(
+                            page, card.password, popups, framed_before, traffic
+                        )
+                        problem = bank_step.problem
                         bank_note = (
-                            f"the card's password was entered on the bank's page ({bank_host})"
+                            f"the card's password was entered on the bank's page ({bank_host}) and {bank_step.how}"
                             if problem is None
                             else f"the card's password could not be entered on the bank's page ({bank_host}): {problem}"
                         )
-                        log.log(logging.INFO if problem is None else logging.ERROR, "%s", bank_note)
+                        log.log(
+                            logging.ERROR
+                            if problem is not None
+                            else logging.INFO
+                            if bank_step.sent
+                            else logging.WARNING,
+                            "%s",
+                            bank_note,
+                        )
                     else:
                         bank_note = (
                             f"no password was typed on the bank's page ({bank_host}), so its "
@@ -2131,6 +3121,8 @@ async def _submit_and_confirm(
                 "account's orders before ordering again: %s",
                 note,
             )
+            if payment_mode != PAYMENT_COD:
+                _save_bank_record(bank_host, bank_step, traffic)
             await _snapshot(page, "unconfirmed")
             return {
                 **outcome,
@@ -2151,6 +3143,10 @@ async def _submit_and_confirm(
         for event, handler in listeners:
             with contextlib.suppress(Exception):
                 page.remove_listener(event, handler)
+        for popup in popups if traffic is not None else ():
+            for event, handler in traffic.listeners():
+                with contextlib.suppress(Exception):
+                    popup.remove_listener(event, handler)
 
 
 #: How long a diagnostic screenshot is kept. They show a checkout — a name, an
@@ -2242,13 +3238,14 @@ async def _secret_boxes_emptied(page: Page) -> bool:
 
 
 def _prune_diagnostics(keep_days: int = DIAGNOSTICS_KEEP_DAYS) -> int:
-    """Delete diagnostic screenshots older than ``keep_days``; returns how many."""
+    """Delete diagnostic screenshots and bank-step records older than
+    ``keep_days``; returns how many."""
     removed = 0
     try:
         if not DIAGNOSTICS_DIR.is_dir():
             return 0
         cutoff = datetime.now(timezone.utc).timestamp() - keep_days * 86_400
-        for file in DIAGNOSTICS_DIR.glob("*.png"):
+        for file in [*DIAGNOSTICS_DIR.glob("*.png"), *DIAGNOSTICS_DIR.glob("*-bank-step.txt")]:
             try:
                 if file.stat().st_mtime < cutoff:
                     file.unlink()
@@ -3181,6 +4178,9 @@ async def run_order(
     """
     await page.goto(product_link, wait_until="domcontentloaded")
     step_mark("open product")
+    # Nothing is bought or paid yet: a captcha nobody answers fails the order
+    # here and its card goes back to the pool (app.automation.challenges).
+    await challenges.guard(page, site=challenges.FLIPKART, step="product page")
 
     # Apparel offers no buy control at all until a size is chosen. A size that
     # cannot be picked stops the run here, before any buy control: going on
@@ -3200,6 +4200,13 @@ async def run_order(
     # Record WHAT is being bought from the product page itself, now, rather
     # than from the account's order list afterwards.
     product = await read_product_preview(page, product_link)
+    step_mark("product page")
+    # Apply any Flipkart on-page product coupon ("Coupons · ₹500 off · Apply")
+    # before heading to checkout so the discount is included in the order total.
+    # The run line says what happened ("coupon ₹500 off applied 1.5s",
+    # "coupon ₹500 off NOT applied", "no coupon") with that step's own time.
+    coupons = await apply_product_coupons(page)
+    step_mark(coupons.label or "no coupon")
 
     # A chosen seller is settled before any buy control is touched: a seller
     # the product's sellers page does not list is refused with nothing pressed,
@@ -3310,6 +4317,7 @@ async def run_order(
             }
 
     step_mark("to checkout")
+    await challenges.guard(page, site=challenges.FLIPKART, step="checkout")
     if ensure_address:
         delivered, why_not = await ensure_delivery_address(page, address)
         if not delivered:
@@ -3515,6 +4523,7 @@ async def run_order(
         }
 
     step_mark("to payment page")
+    await challenges.guard(page, site=challenges.FLIPKART, step="payment page")
     balances_used: dict[str, str] = {}
     # What the order costs before SuperCoins or the wallet pay part of it. The
     # price cap is checked against this, not against what is left to pay: a

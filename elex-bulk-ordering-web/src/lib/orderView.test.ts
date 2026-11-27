@@ -24,6 +24,11 @@ describe("viewFilters", () => {
     });
   });
 
+  it("keeps the product ids, and drops an empty list", () => {
+    expect(viewFilters({ product_ids: ["MOBHNDTD57UJUK9Q"] })).toEqual({ product_ids: ["MOBHNDTD57UJUK9Q"] });
+    expect(viewFilters({ product_ids: [] })).toEqual({});
+  });
+
   it("keeps the card filter as typed, trimmed, and drops a blank one", () => {
     expect(viewFilters({ card: "  4111 1111 " })).toEqual({ card: "4111 1111" });
     expect(viewFilters({ card: "   " })).toEqual({});
@@ -81,6 +86,12 @@ describe("restoredFilters", () => {
     // existed must not break every load until Default View.
     expect(restoredFilters({ card: "4".repeat(33) })).toEqual({});
     expect(restoredFilters({ card: "4".repeat(32) })).toEqual({ card: "4".repeat(32) });
+  });
+
+  it("puts saved product ids back, trimmed, and drops what is not text", () => {
+    expect(restoredFilters({ product_ids: [" MOBHNDTD57UJUK9Q ", 7, ""] })).toEqual({ product_ids: ["MOBHNDTD57UJUK9Q"] });
+    expect(restoredFilters({ product_ids: "MOBHQSFF6MZK4YNP" })).toEqual({ product_ids: ["MOBHQSFF6MZK4YNP"] });
+    expect(restoredFilters({ product_ids: [] })).toEqual({});
   });
 
   it("is empty for anything that is not an object", () => {

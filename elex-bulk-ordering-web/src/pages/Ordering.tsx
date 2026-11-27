@@ -10,6 +10,7 @@ import { Button } from "../components/Button";
 import { OrderForm } from "../components/OrderForm";
 import { ProgressStream } from "../components/ProgressStream";
 import { useRunAccounts } from "../components/RunAccounts";
+import { useAuth } from "../lib/auth";
 
 /** How long each bank page waits, for a run whose bank step a person
  *  finishes (POST /jobs/order `bank_step_by_hand`, with `bank_wait_seconds`):
@@ -30,6 +31,8 @@ export default function Ordering() {
      nothing-yet cases. */
   const accountsState = useRunAccounts();
   const reloadAccounts = accountsState.reload;
+  /* An admin may loosen a unit limit for one order; anyone may tighten one. */
+  const { isAdmin } = useAuth();
 
   const [jobId, setJobId] = useState<number | null>(null);
   const [runActive, setRunActive] = useState(false);
@@ -64,7 +67,7 @@ export default function Ordering() {
   return (
     <div className="mx-auto flex w-full max-w-[1180px] flex-col gap-5">
       <h1 className="sr-only">Smart Bulk Order</h1>
-      <OrderForm accounts={accountsState} runActive={runActive} onStarted={onStarted} />
+      <OrderForm accounts={accountsState} runActive={runActive} onStarted={onStarted} isAdmin={isAdmin} />
 
       {jobId !== null ? (
         <div className="flex flex-col gap-2">

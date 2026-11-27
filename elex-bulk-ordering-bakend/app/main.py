@@ -29,6 +29,7 @@ from starlette.datastructures import MutableHeaders
 from app import __version__
 from app.api import (
     accounts,
+    challenges as captchas_api,
     phones,
     agents,
     master_lists,
@@ -56,6 +57,7 @@ from app.api import (
     users,
     ws,
 )
+from app.automation import challenges
 from app.config import get_settings
 from app.core.archives import reclaim_in_own_session, sweep_in_own_session
 from app.core.invoices import start_backfill_in_background
@@ -194,6 +196,9 @@ async def lifespan(app: FastAPI):
     # endpoints are sync handlers with no event loop, so the worker needs this
     # loop on the main event loop to run on (app.api.email_swap).
     email_swap_loop = asyncio.create_task(email_swap.run_email_swap_scheduler())
+    # Captchas met by this process's browsers are asked of a person on the
+    # Captchas page (app.automation.challenges): only this process can.
+    challenges.set_live(True)
     # Shout at startup if this deployment is still on the default signing key
     # (only dev mode gets this far with it) or a plaintext admin password,
     # rather than quietly accepting them.
@@ -293,6 +298,7 @@ def create_app() -> FastAPI:
     app.include_router(screener.router)
     app.include_router(email_swap.router)
     app.include_router(inventory.router)
+    app.include_router(captchas_api.router)
     app.include_router(master_lists.phone_router)
 
     # --- websocket (authenticates via the "bearer" subprotocol) ---

@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { Link, useNavigate } from "react-router-dom";
 import { cancelJob, errorMessage, getJob, listBulkOrderCreators, listBulkOrders } from "../lib/api";
 import type { AiTrackerState, BulkOrderRun, BulkOrderRunFilters, JobDetail } from "../lib/types";
-import { PAYMENT_MODE_LABELS } from "../lib/types";
+import { jobNotes, PAYMENT_MODE_LABELS } from "../lib/types";
+import { overrideLines } from "../lib/limitChanges";
 import { DASH, formatCount, formatCurrency, formatDateTime, formatLink, truncate } from "../lib/format";
 import { AiTrackerCard } from "../components/AiTrackerCard";
 import { Alert } from "../components/Alert";
@@ -115,6 +116,13 @@ function UnitsCell({ run }: { run: BulkOrderRun }) {
   );
 }
 
+/** "Retry failed" shows on a finished run with accounts that failed or were
+ *  never really tried; the form then reads exactly which ones (GET /jobs/{id}/retry). */
+export function canRetryFailed(run: BulkOrderRun): boolean {
+  if (run.status === "running" || run.status === "queued") return false;
+  return run.failed_items > 0 || run.skipped_items > 0 || run.done_items < run.total_items;
+}
+
 function IconButton({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return (
     <button
@@ -147,6 +155,85 @@ export function runsCsv(runs: BulkOrderRun[]): string {
     paymentLabel(run.payment_mode), timeTaken(run),
   ]);
   return [head, ...rows].map((row) => row.map(cell).join(",")).join("\n") + "\n";
+}
+
+/** Saved settings shown in words by the Run settings dialog, not as raw keys
+ *  (the AI tracker has a card of its own). */
+const WORDED_SETTINGS = new Set([
+  "smart_id",
+  "smart_selection",
+  "notes",
+  "limit_overrides",
+  "ai_tracker",
+  "retry_of",
+  "card_exclude_used",
+  "cards_kept_out",
+]);
+
+function SettingRow({ label, raw = false, children }: { label: string; raw?: boolean; children: ReactNode }) {
+  return (
+    <div className="contents">
+      <dt className="text-ink-2">{label}</dt>
+      <dd className={`${raw ? "break-all" : "break-words"} text-ink`}>{children}</dd>
+    </div>
+  );
+}
+
+/**
+ * A run's saved settings, as the Run settings dialog lists them: Smart ID
+ * Selection, "Spread orders across accounts" and the run's notes in words
+ * first, then every other saved setting as it was saved. A run from before
+ * Smart ID Selection saved no value for it, and says so.
+ */
+export function RunSettingsList({ payload }: { payload: Record<string, unknown> | null }) {
+  const saved = payload ?? {};
+  const smartId =
+    saved.smart_id === true ? "On" : saved.smart_id === false ? "Off" : "not available (older run)";
+  const notes = jobNotes(saved);
+  const limitChanges = overrideLines(saved.limit_overrides);
+  const rest = Object.entries(saved).filter(([key]) => !WORDED_SETTINGS.has(key));
+  return (
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-[13px]">
+      {typeof saved.retry_of === "number" ? (
+        <SettingRow label="Retry of">Run #{saved.retry_of}: its accounts that got no order</SettingRow>
+      ) : null}
+      <SettingRow label="Smart ID Selection">{smartId}</SettingRow>
+      {typeof saved.smart_selection === "boolean" ? (
+        <SettingRow label="Spread orders across accounts">{saved.smart_selection ? "On" : "Off"}</SettingRow>
+      ) : null}
+      {typeof saved.card_exclude_used === "boolean" ? (
+        <SettingRow label="Skip cards already used">{saved.card_exclude_used ? "On" : "Off"}</SettingRow>
+      ) : null}
+      {typeof saved.cards_kept_out === "number" ? (
+        <SettingRow label="Cards left out before pairing">
+          {saved.cards_kept_out} (already used in an order, or kept out by another card rule)
+        </SettingRow>
+      ) : null}
+      {limitChanges.length > 0 ? (
+        <SettingRow label="Limits for this order">
+          <ul className="flex flex-col gap-0.5">
+            {limitChanges.map((line, index) => (
+              <li key={index}>{line}</li>
+            ))}
+          </ul>
+        </SettingRow>
+      ) : null}
+      {notes.length > 0 ? (
+        <SettingRow label="Notes">
+          <ul className="flex flex-col gap-0.5">
+            {notes.map((note, index) => (
+              <li key={index}>{note}</li>
+            ))}
+          </ul>
+        </SettingRow>
+      ) : null}
+      {rest.map(([key, value]) => (
+        <SettingRow key={key} label={key.replace(/_/g, " ")} raw>
+          {typeof value === "object" ? JSON.stringify(value) : String(value)}
+        </SettingRow>
+      ))}
+    </dl>
+  );
 }
 
 function download(name: string, text: string) {
@@ -406,6 +493,16 @@ export default function Orders() {
             >
               View Orders
             </Link>
+            {canRetryFailed(run) ? (
+              <button
+                type="button"
+                title="Order again on this run's accounts that got no order, with cards not used since it began"
+                onClick={() => navigate(`/ordering?retry=${run.id}`)}
+                className="inline-flex h-7 items-center whitespace-nowrap rounded-control border border-line px-2 text-[12px] font-medium text-ink hover:bg-page"
+              >
+                Retry failed
+              </button>
+            ) : null}
             <IconButton label="Run again with these settings" onClick={() => navigate(`/ordering?from=${run.id}`)}>
               <svg viewBox="0 0 16 16" className="size-3.5" aria-hidden="true">
                 <path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.8h-2.8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -588,16 +685,7 @@ export default function Orders() {
               const done = details.job.status === "completed" || details.job.status === "failed";
               return tracker ? <AiTrackerCard tracker={tracker} terminal={done} maxProbes={20} /> : null;
             })()}
-            <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-[13px]">
-              {Object.entries(details.job.payload ?? {})
-                .filter(([key]) => key !== "ai_tracker")
-                .map(([key, value]) => (
-                  <div key={key} className="contents">
-                    <dt className="text-ink-2">{key.replace(/_/g, " ")}</dt>
-                    <dd className="break-all text-ink">{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd>
-                  </div>
-                ))}
-            </dl>
+            <RunSettingsList payload={details.job.payload} />
           </div>
         ) : details ? (
           failures.length === 0 ? (

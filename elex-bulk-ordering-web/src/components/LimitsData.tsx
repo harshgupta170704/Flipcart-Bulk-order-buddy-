@@ -125,47 +125,20 @@ export function limitRule(maxUnits: number, windowDays: number): string {
 
 function wholeCount(raw: unknown): number {
   if (typeof raw === "number" && Number.isFinite(raw)) return Math.max(0, Math.trunc(raw));
-  // A `blocked` that arrives as a flag rather than a count still has to mean
-  // something: one blocked account is the smallest truthful reading of `true`.
-  if (typeof raw === "boolean") return raw ? 1 : 0;
   return 0;
 }
 
-/** How many of the checked accounts have nothing left under this limit. */
-export function blockedAccounts(usage: LimitUsage): number {
-  return wholeCount(usage.blocked);
-}
-
-/** Units still available across the checked accounts under this limit. */
+/**
+ * Units still available across the checked accounts under this limit.
+ *
+ * A row says nothing about how many accounts a limit stops: its `blocked` is
+ * a yes or no for the whole selection. How many IDs a run sets aside, and the
+ * units it can really buy, come from POST /unit-limits/run-check instead
+ * (adding up or taking the smallest of these rows overstates the room when
+ * different limits stop different accounts).
+ */
 export function remainingUnits(usage: LimitUsage): number {
   return wholeCount(usage.remaining);
-}
-
-export interface LimitHeadroom {
-  /**
-   * Units this selection can still order before a limit stops it — the FEWEST
-   * any single limit allows, which is how the server computes an allowance.
-   * null means no limit applies at all.
-   */
-  units: number | null;
-  /**
-   * Accounts already at a limit. The largest single limit's count rather than
-   * the sum: one account can be blocked by several limits at once, and adding
-   * those up would invent accounts that do not exist.
-   */
-  blocked: number;
-}
-
-/** Fold the per-limit rows into the two numbers an operator needs up front. */
-export function headroom(rows: LimitUsage[]): LimitHeadroom {
-  if (rows.length === 0) return { units: null, blocked: 0 };
-  let units = Number.POSITIVE_INFINITY;
-  let blocked = 0;
-  for (const row of rows) {
-    units = Math.min(units, remainingUnits(row));
-    blocked = Math.max(blocked, blockedAccounts(row));
-  }
-  return { units: Number.isFinite(units) ? units : null, blocked };
 }
 
 export default useUnitLimits;

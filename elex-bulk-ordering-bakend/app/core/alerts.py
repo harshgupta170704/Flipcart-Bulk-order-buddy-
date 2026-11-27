@@ -329,14 +329,17 @@ def find_failed_orders(db: DbSession) -> list[Finding]:
         if _never_placed(order):
             # Flipkart gave the attempt an order id and then said "Order Not
             # Placed": the payment did not go through. Not a cancellation, and
-            # nothing to refund — said for what it is (11 Nov 2026).
-            said = (order.platform_status or "").strip()
+            # nothing to refund — said for what it is (11 Nov 2026). Its own
+            # name: until 24 Nov 2026 this reused ``said``, the run lines
+            # looked up above, so the next attempt that never reached
+            # Flipkart met a string and the whole pass failed.
+            flipkart_says = (order.platform_status or "").strip()
             findings.append(
                 Finding(
                     key=f"order_failed:order:{order.id}",
                     message=(
                         f"Order {order.order_id}{label} for {who} was not placed: Flipkart says "
-                        f"\"{said}\" — the payment did not go through, so nothing is on its way. "
+                        f"\"{flipkart_says}\" — the payment did not go through, so nothing is on its way. "
                         "If the card shows a charge, the bank reverses it."
                     ),
                     severity=AlertSeverity.warning,
@@ -348,7 +351,7 @@ def find_failed_orders(db: DbSession) -> list[Finding]:
                         "never_placed": True,
                         "model": order.model,
                         "product_link": order.product_link,
-                        "cancel_reason": said or None,
+                        "cancel_reason": flipkart_says or None,
                     },
                 )
             )

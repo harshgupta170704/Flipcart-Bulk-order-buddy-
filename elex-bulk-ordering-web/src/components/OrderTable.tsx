@@ -66,6 +66,9 @@ interface RowActions {
   /** True when the Delivery date has no column of its own: the status cell
    *  then carries the day under Flipkart's wording. */
   deliveryUnderStatus?: boolean;
+  /** True when the Delivery OTP has no column of its own: the status cell
+   *  then carries the code while the unit is on its way. */
+  otpUnderStatus?: boolean;
 }
 
 /** "OD123… , unit 2 of 3" — the row, named for an accessible label. */
@@ -336,7 +339,7 @@ function deliveryLine(o: Order): string | null {
 }
 
 /** The platform's wording as a badge — or why there is none yet. */
-function statusCell(o: Order, deliveryUnderStatus = false) {
+function statusCell(o: Order, deliveryUnderStatus = false, otpUnderStatus = true) {
   const badge = readBackCell(
     o,
     o.platform_status?.trim(),
@@ -350,7 +353,7 @@ function statusCell(o: Order, deliveryUnderStatus = false) {
   return (
     <span className="block">
       {badge}
-      {o.delivery_otp && onItsWay ? (
+      {otpUnderStatus && o.delivery_otp && onItsWay ? (
         <span className="mt-1 block text-[12px] text-ink-2">
           Delivery code{" "}
           <span className="font-mono text-[13px] font-semibold tracking-wider text-ink tabular-nums">{o.delivery_otp}</span>
@@ -482,16 +485,33 @@ const REGISTRY: (OrderColumnOption & { column: (actions: RowActions) => Column<O
   },
   {
     id: "platform_status", label: "Status", defaultOn: true,
-    column: ({ deliveryUnderStatus }) => ({
+    column: ({ deliveryUnderStatus, otpUnderStatus }) => ({
       key: "platform_status", header: "Status", width: "140px",
       // The open request tags sit under the status whatever the row's state:
       // a unit never read back can still have a cancel asked on it.
       render: (o) => (
         <span className="block">
-          {statusCell(o, deliveryUnderStatus)}
+          {statusCell(o, deliveryUnderStatus, otpUnderStatus)}
           <RequestTags kinds={o.open_request_kinds} />
         </span>
       ),
+    }),
+  },
+  {
+    // Beside the status, on by default: the person at the door needs it the
+    // day the unit is out for delivery.
+    id: "delivery_otp", label: "Delivery OTP", defaultOn: true,
+    column: () => ({
+      key: "delivery_otp", header: "OTP", width: "80px",
+      // Flipkart shows the code only once the unit is out for delivery, so a
+      // dash after a read-back means "not out for delivery yet", not "none".
+      render: (o) =>
+        readBackCell(
+          o,
+          o.delivery_otp,
+          (code) => <span className="font-mono font-semibold tracking-wider tabular-nums">{code}</span>,
+          <span className="text-muted">{DASH}</span>,
+        ),
     }),
   },
   {
@@ -559,21 +579,6 @@ const REGISTRY: (OrderColumnOption & { column: (actions: RowActions) => Column<O
           <span className="text-muted">COD</span>
         ) : (
           DASH
-        ),
-    }),
-  },
-  {
-    id: "delivery_otp", label: "Delivery code (OTP)", defaultOn: false,
-    column: () => ({
-      key: "delivery_otp", header: "Delivery code", width: "130px",
-      // Flipkart shows the code only once the unit is out for delivery, so a
-      // dash after a read-back means "not out for delivery yet", not "none".
-      render: (o) =>
-        readBackCell(
-          o,
-          o.delivery_otp,
-          (code) => <span className="font-mono font-semibold tracking-wider tabular-nums">{code}</span>,
-          <span className="text-muted">{DASH}</span>,
         ),
     }),
   },
@@ -772,6 +777,11 @@ const REGISTRY: (OrderColumnOption & { column: (actions: RowActions) => Column<O
     column: () => ({ key: "category", header: "Category", width: "110px" }),
   },
   {
+    // The exact variant's Flipkart id, read from the product link (pid=…).
+    id: "product_id", label: "Product ID", defaultOn: false,
+    column: () => ({ key: "product_id", header: "Product ID", width: "160px", render: (o) => truncatedCell(o.product_id ?? null, "150px") }),
+  },
+  {
     id: "job_id", label: "Run", defaultOn: false,
     column: () => ({ key: "job_id", header: "Run", width: "70px", render: (o) => (o.job_id === null ? DASH : `#${o.job_id}`) }),
   },
@@ -896,9 +906,10 @@ export function OrderTable({
   const wanted = useMemo(() => new Set(visibleColumns ?? DEFAULT_ORDER_COLUMNS), [visibleColumns]);
   const orderIdUnderProduct = !wanted.has("order_id");
   const deliveryUnderStatus = !wanted.has("delivery_date");
+  const otpUnderStatus = !wanted.has("delivery_otp");
   const rowActions = useMemo<RowActions>(
-    () => ({ onView, onCancel, onInvoiceDownloadError, orderIdUnderProduct, deliveryUnderStatus }),
-    [onView, onCancel, onInvoiceDownloadError, orderIdUnderProduct, deliveryUnderStatus],
+    () => ({ onView, onCancel, onInvoiceDownloadError, orderIdUnderProduct, deliveryUnderStatus, otpUnderStatus }),
+    [onView, onCancel, onInvoiceDownloadError, orderIdUnderProduct, deliveryUnderStatus, otpUnderStatus],
   );
   const columns = useMemo(() => {
     const chosen = REGISTRY.filter((c) => c.id === "actions" || wanted.has(c.id)).map((c) => c.column(rowActions));

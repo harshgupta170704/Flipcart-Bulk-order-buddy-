@@ -265,7 +265,7 @@ def test_order_job_never_persists_card_data(api, db, accounts, monkeypatch) -> N
     # Provenance is fine here; card fields are what must never appear.
     assert set(job.payload) == {
         "product_link", "qty", "target", "payment_mode", "card_rows_skipped",
-        "account_filter", "account_count", "started_by",
+        "account_filter", "account_count", "started_by", "agent",
     }
     assert job.payload["card_rows_skipped"] == []  # rows set aside by number and field only, none here
     persisted = json.dumps({"payload": job.payload, "log": job.log}, default=str)

@@ -3,7 +3,7 @@
  * differ from the server's defaults, so a real "upto" run goes as before.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { startOrderJob } from "./api";
+import { previewOrderCards, startOrderJob } from "./api";
 
 const base = {
   product_link: "https://www.flipkart.com/p/itm1",
@@ -32,6 +32,36 @@ describe("startOrderJob modes", () => {
     await startOrderJob({ ...base, ...(extra as object) });
     expect(sentForm().get("mode")).toBe(mode);
     expect(sentForm().get("qty_mode")).toBe(qtyMode);
+  });
+});
+
+describe("Skip cards already used on the wire", () => {
+  it("goes as card_exclude_used=true with a card run, never when off or with Cash on Delivery", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 1 }), { status: 201 })));
+    await startOrderJob({ ...base, payment_mode: "card", cards_file: new File(["x"], "c.csv"), card_exclude_used: true });
+    expect(sentForm().get("card_exclude_used")).toBe("true");
+    vi.unstubAllGlobals();
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 1 }), { status: 201 })));
+    await startOrderJob({ ...base, payment_mode: "card", cards_file: new File(["x"], "c.csv"), card_exclude_used: false });
+    expect(sentForm().get("card_exclude_used")).toBeNull();
+    vi.unstubAllGlobals();
+
+    // The server refuses card rules on a Cash-on-Delivery run: never sent there.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 1 }), { status: 201 })));
+    await startOrderJob({ ...base, card_exclude_used: true });
+    expect(sentForm().get("card_exclude_used")).toBeNull();
+  });
+
+  it("goes with the card pairing preview when on", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ accounts: [] }), { status: 200 })));
+    await previewOrderCards({ cards_file: new File(["x"], "c.csv"), account_ids: [1], card_exclude_used: true });
+    expect(sentForm().get("card_exclude_used")).toBe("true");
+    vi.unstubAllGlobals();
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ accounts: [] }), { status: 200 })));
+    await previewOrderCards({ cards_file: new File(["x"], "c.csv"), account_ids: [1] });
+    expect(sentForm().get("card_exclude_used")).toBeNull();
   });
 });
 

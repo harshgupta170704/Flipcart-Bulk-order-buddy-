@@ -67,18 +67,55 @@ def may_be_alive_elsewhere(job: Job, redis_url: str) -> bool:
     return bool(redis_url) and job.type in QUEUEABLE_TYPES and (job.payload or {}).get("dispatch") == DISPATCH_ARQ
 
 
-def fail_orphaned_jobs(db: DbSession, *, redis_url: str | None = None) -> list[int]:
+def _other_online_api_agents(db: DbSession, *, current_agent: str) -> set[str]:
+    """Other API hosts sharing this database whose heartbeat is still live."""
+    from app.core import fleet
+    from app.db.models import Agent
+
+    agents = db.scalars(select(Agent).where(Agent.kind == "api")).all()
+    return {
+        agent.name
+        for agent in agents
+        if agent.name != current_agent and fleet.state(agent) == "online"
+    }
+
+
+def _owned_by_other_online_agent(job: Job, *, current_agent: str, other_online: set[str]) -> bool:
+    """True when another live API host may be executing this job right now."""
+    if not other_online:
+        return False
+    owner = (job.payload or {}).get("agent")
+    if isinstance(owner, str) and owner.strip():
+        return owner != current_agent and owner in other_online
+    # Legacy/untagged jobs (e.g. login or sync started by a host on older code):
+    # while another API host is actively heartbeating, do not kill its live run.
+    return True
+
+
+def fail_orphaned_jobs(
+    db: DbSession,
+    *,
+    redis_url: str | None = None,
+    current_agent: str | None = None,
+) -> list[int]:
     """Mark every queued/running job that can only have run here as failed.
 
     Returns the ids it changed. ``redis_url`` defaults to the configured one;
-    tests pass it explicitly.
+    tests pass it explicitly. When another API host sharing the same database
+    is currently online, jobs belonging to that host (or untagged jobs it may
+    be running) are left untouched.
     """
+    from app.core import fleet
+
     if redis_url is None:
         redis_url = get_settings().redis_url
+    this_agent = current_agent or fleet.agent_name("api")
+    other_online = _other_online_api_agents(db, current_agent=this_agent)
     rows = [
         job
         for job in db.scalars(select(Job).where(Job.status.in_(_ACTIVE)).order_by(Job.id)).all()
         if not may_be_alive_elsewhere(job, redis_url)
+        and not _owned_by_other_online_agent(job, current_agent=this_agent, other_online=other_online)
     ]
     if not rows:
         return []

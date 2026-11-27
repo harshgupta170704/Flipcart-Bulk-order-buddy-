@@ -185,6 +185,57 @@ def test_a_failed_attempt_says_why_in_the_runs_own_words(db, account):
     assert f"Order {order.id} " not in alert.message  # never the ledger's own row number
 
 
+def _never_placed_then_failed_attempt(db, account) -> tuple[Order, Order]:
+    """The live data of 23 Nov 2026, in its order: row 56, a card order
+    Flipkart says "Order Not Placed" (run #629), then row 58, an attempt that
+    never reached Flipkart, with its run's own line (run #641)."""
+    never = _order(db, account, order_id=OD, payment_mode="card", placed_at=utcnow() - timedelta(hours=2))
+    _read_back(db, never, "Order Not Placed")
+    never.status = OrderStatus.failed  # as the read-back, or start-up, now leaves it
+    db.commit()
+    job = Job(type=JobType.order, status=JobStatus.completed)
+    db.add(job)
+    db.commit()
+    db.add(
+        JobItem(
+            job_id=job.id,
+            account_id=account.id,
+            status=JobItemStatus.failed,
+            message="not placed (failed): The account's GST could not be changed — nothing was charged",
+        )
+    )
+    attempt = _order(db, account, status=OrderStatus.failed, job_id=job.id, placed_at=None)
+    assert never.id < attempt.id
+    return never, attempt
+
+
+def test_a_never_placed_order_before_a_failed_attempt_keeps_the_pass_going(db, account):
+    """Until 24 Nov 2026 the never-placed branch reused ``said``, the name of
+    the run lines looked up for the attempts: the next attempt met a string,
+    the pass failed, and no alert of any kind was raised or closed."""
+    never, attempt = _never_placed_then_failed_attempt(db, account)
+
+    counts = alerts.evaluate(db)
+
+    assert counts["order_failed"] == 2
+    by_order = {alert.order_id: alert for alert in _open(db, "order_failed")}
+    assert 'Flipkart says "Order Not Placed"' in by_order[never.id].message
+    assert by_order[never.id].details["cancel_reason"] == "Order Not Placed"
+    assert by_order[attempt.id].message == (
+        "The order (Pigeon 3 L) for buyer@test.com was not placed: "
+        "The account's GST could not be changed — nothing was charged"
+    )
+
+
+def test_the_evaluate_button_answers_with_both_kinds_of_failure(db, account, client, auth_headers):
+    _never_placed_then_failed_attempt(db, account)
+
+    response = client.post("/alerts/evaluate", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["order_failed"] == 2
+
+
 def test_a_failed_attempt_with_no_run_line_still_reads_as_a_sentence(db, account):
     _order(db, account, status=OrderStatus.failed, placed_at=None)
     alerts.evaluate(db)

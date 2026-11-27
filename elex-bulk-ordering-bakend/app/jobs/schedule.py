@@ -339,7 +339,7 @@ def tracking_due(db: DbSession, now: datetime | None = None) -> tuple[list[int],
     ordered_due = len(ordered)
     if not due:
         return [], "every account with an order on its way was read back recently"
-    cap = max(1, int(getattr(settings, "max_accounts_per_run", 5000) or 5000))
+    cap = max(1, int(getattr(get_settings(), "max_accounts_per_run", 5000) or 5000))
     ofd_due = sum(1 for account_id in due if account_id in out_for_delivery)
     return due[:cap], (
         f"{len(due)} account(s) with an order on its way not read back recently ({ofd_due} out for delivery)"

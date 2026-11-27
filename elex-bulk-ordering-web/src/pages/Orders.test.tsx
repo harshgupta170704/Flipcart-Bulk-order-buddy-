@@ -53,3 +53,24 @@ describe("Orders page", () => {
     expect(row).toContain("Cash on Delivery");
   });
 });
+
+import { canRetryFailed } from "./Orders";
+
+describe("Retry failed button", () => {
+  const base = {
+    id: 820, type: "order", status: "completed", total_items: 292, done_items: 292, failed_items: 95,
+    skipped_items: 0, unconfirmed_items: 9,
+  } as unknown as BulkOrderRun;
+
+  it("shows on a finished run with failed, untried or unfinished accounts", () => {
+    expect(canRetryFailed(base)).toBe(true);
+    expect(canRetryFailed({ ...base, failed_items: 0, skipped_items: 3 })).toBe(true);
+    expect(canRetryFailed({ ...base, status: "failed", failed_items: 0, done_items: 250 })).toBe(true);
+  });
+
+  it("not while the run is going, nor when every account got an order", () => {
+    expect(canRetryFailed({ ...base, status: "running" })).toBe(false);
+    expect(canRetryFailed({ ...base, status: "queued" })).toBe(false);
+    expect(canRetryFailed({ ...base, failed_items: 0, skipped_items: 0 })).toBe(false);
+  });
+});

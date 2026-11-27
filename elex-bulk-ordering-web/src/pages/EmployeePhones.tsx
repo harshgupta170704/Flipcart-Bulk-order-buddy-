@@ -90,20 +90,27 @@ function TokenDialog({ phone, onClose }: { phone: OtpPhoneCreated | null; onClos
           <CopyField label="Webhook URL" value={origin + phone.webhook_path} />
           <CopyField label="Ping URL" value={origin + phone.ping_path} />
           <div className="text-[12.5px] leading-relaxed text-ink-2">
-            <p className="font-medium text-ink">SMS forwarder (GawkAr, Play Store)</p>
+            <p className="font-medium text-ink">MacroDroid (Play Store)</p>
             <ol className="mt-1 list-decimal space-y-0.5 pl-5">
-              <li>Menu → Settings: turn on “Through our server”.</li>
-              <li>Synchronization → + → Advanced Settings: turn on “Forward OTP from banks”, then Next.</li>
+              <li>Add Macro → Trigger: Notification Received → application: Messages → any content, ignore ongoing.</li>
               <li>
-                + → Sync with “URL”: paste the URL above. Request template: leave the body as it is, paste the request
-                headers above, Save.
+                Action: HTTP Request → POST → the Webhook URL above → content type application/json → body{" "}
+                <code className="font-mono">{'{"from": "…", "text": "…"}'}</code>, inserting the notification title and
+                the notification text with the “…” button (typed names are sent as plain words).
               </li>
-              <li>Next through the remaining steps, then ✓.</li>
-              <li>Phone settings → Apps → SMS forwarder: battery Unrestricted, unrestricted data, and “pause if unused” off.</li>
+              <li>Save the macro, and allow MacroDroid notification access.</li>
+              <li>Phone settings → Apps → MacroDroid: battery Unrestricted, and “pause if unused” off.</li>
+              <li>
+                Android 15 and later hide OTP notifications from apps. Once, from a computer with USB debugging on:{" "}
+                <code className="font-mono">
+                  adb shell appops set --uid com.arlosoft.macrodroid RECEIVE_SENSITIVE_NOTIFICATIONS allow
+                </code>
+                , then turn MacroDroid’s notification access off and on.
+              </li>
             </ol>
             <p className="mt-2">
-              Dual SIM: add each number here as its own phone, and give each its own filter in the app, set to that SIM.
-              Other forwarder apps: POST each text to the webhook URL as JSON, e.g.{" "}
+              Check it: text the phone “Your OTP is 123456”; Last OTP here should show 123456. Dual SIM: add each number
+              here as its own phone. Other forwarder apps: POST each text to the webhook URL as JSON, e.g.{" "}
               <code className="font-mono">{'{"from": "%from%", "text": "%text%"}'}</code>.
             </p>
           </div>

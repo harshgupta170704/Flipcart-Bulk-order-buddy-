@@ -37,6 +37,8 @@ class SettingsOut(BaseModel):
     """
 
     max_concurrency: int
+    #: Read-only: this server's own ORDERING_BROWSER_HEADLESS (true = hidden).
+    #: Each machine decides it in its .env; nothing saved on this page beats it.
     browser_headless: bool
     proxy_server: str
     #: Automatic read-backs every N hours; 0 = only when someone presses the button.
@@ -81,6 +83,8 @@ class SettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_concurrency: int | None = Field(default=None, ge=1)
+    #: Set aside, never saved: accepted only so a Settings page from before
+    #: 24 Nov 2026, which still sends its browser switch, can save the rest.
     browser_headless: bool | None = None
     proxy_server: str | None = None
     sync_every_hours: int | None = Field(default=None, ge=0, le=168)

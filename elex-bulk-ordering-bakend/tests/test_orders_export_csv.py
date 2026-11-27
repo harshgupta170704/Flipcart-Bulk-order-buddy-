@@ -222,6 +222,38 @@ def test_the_owners_two_sheets_have_exactly_their_columns(api, db, seeded):
     assert api.get("/orders/export.csv", params={"sheet": "nonsense"}).status_code == 422
 
 
+def test_the_phones_last_six_come_from_the_delivery_address_first(api, db, seeded):
+    """Almost no account has a phone of its own, so the sheets' last-six
+    column came out blank (26 Nov 2026). The delivery address Flipkart shows
+    ends with the phone the unit goes to: that comes first, then the order's
+    account's own phone, then the order's billing phone."""
+    account = seeded["account"]
+    account.phone = None
+    placed = seeded["placed"]
+    placed.billing_phone = None
+    unit = placed.units[0]
+    unit.delivery_address = "Aarav Sharma, Plot 42, Andheri East, Mumbai, Maharashtra - 400093, 9876543210"
+    db.commit()
+
+    def last_six():
+        rows = _rows(api.get("/orders/export.csv", params={"sheet": "out_for_delivery", "status": "placed"}))
+        return rows[0]["Last 6 Digits Of Phone"]
+
+    assert last_six() == '="543210"'
+    full = _rows(api.get("/orders/export.csv", params={"status": "placed"}))
+    assert full[0]["Phone Last 6"] == '="543210"'
+
+    unit.delivery_address = None
+    placed.billing_phone = "9009122239"
+    account.phone = "08957768866"
+    db.commit()
+    assert last_six() == '="768866"'  # no address: the account's own, as before
+
+    account.phone = None
+    db.commit()
+    assert last_six() == '="122239"'  # nothing else: the order's billing phone
+
+
 def test_a_cancelled_unit_shows_no_estimated_delivery_date(api, db, seeded):
     """Flipkart's timeline for a cancelled order ends "Cancelled, Oct 24" and
     that date is what the read-back keeps (seen live on 25 Oct 2026). It is

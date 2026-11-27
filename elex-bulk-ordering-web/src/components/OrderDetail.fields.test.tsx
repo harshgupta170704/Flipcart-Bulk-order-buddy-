@@ -116,6 +116,17 @@ function row(label: string): HTMLElement {
 }
 
 describe("OrderDetail: the unit's stored fields", () => {
+  it("shows the variant's product id, and a dash for an order whose link named none", () => {
+    render(<OrderDetail order={order({ product_id: "MOBHNDTD57UJUK9Q" })} onClose={vi.fn()} />);
+    expect(row("Product ID").textContent).toBe("Product IDMOBHNDTD57UJUK9Q");
+    const labels = screen.getAllByRole("term").map((term) => term.textContent);
+    expect(labels.indexOf("Product ID")).toBe(labels.indexOf("Category") + 1);
+
+    cleanup();
+    render(<OrderDetail order={order({ product_id: null })} onClose={vi.fn()} />);
+    within(row("Product ID")).getByText(DASH);
+  });
+
   it("shows the GSTIN the run billed under next to the business name", () => {
     render(<OrderDetail order={order()} onClose={vi.fn()} />);
 

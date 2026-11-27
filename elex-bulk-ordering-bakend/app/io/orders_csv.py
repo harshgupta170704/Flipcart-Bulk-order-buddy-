@@ -259,9 +259,28 @@ def identifier_cell(value: str | None) -> str:
     return f'="{text}"' if _ANY_DIGITS.match(text) or _PHONE_SHAPED.match(text) else text_guard(text)
 
 
+#: The ten-digit phone Flipkart prints at the end of a delivery address
+#: ("..., Mumbai, Maharashtra - 400093, 9876543210").
+_ADDRESS_PHONE = re.compile(r"(\d{10})\D*$")
+
+
+def unit_phone(unit: OrderUnit, order: Order, account_phone: str | None) -> str | None:
+    """The phone a unit is delivered to: the one on its read-back delivery
+    address, else the account's own (the column's source until 26 Nov 2026),
+    else the order's billing phone.
+
+    The sheets' "last 6 digits" used to read the account's phone alone, which
+    almost no account has (17 of 492 on 26 Nov 2026), so the column came out
+    blank; the delivery address carries it for every unit read back."""
+    found = _ADDRESS_PHONE.search(unit.delivery_address or "")
+    if found:
+        return found.group(1)
+    return account_phone or order.billing_phone
+
+
 def phone_last_6(phone: str | None) -> str:
-    """The last six digits of the account's phone, as the owner's sheets carry
-    it — kept as text, since a leading zero would otherwise vanish."""
+    """The last six digits of a phone, as the owner's sheets carry it — kept
+    as text, since a leading zero would otherwise vanish."""
     digits = "".join(ch for ch in (phone or "") if ch.isdigit())
     return identifier_cell(digits[-6:]) if digits else ""
 
@@ -598,7 +617,7 @@ def row_for(
         order.payment_mode or "",
         state,
         identifier_cell(unit.delivery_otp),
-        phone_last_6(phone),
+        phone_last_6(unit_phone(unit, order, phone)),
         order.brand or "",
         order.category or "",
         "" if order.job_id is None else str(order.job_id),
@@ -640,7 +659,7 @@ def out_for_delivery_row(row: ExportRow) -> list[str]:
         text_guard(order.order_id),
         identifier_cell(unit.delivery_otp),
         text_guard(unit.tracking_id),
-        phone_last_6(row.phone),
+        phone_last_6(unit_phone(unit, order, row.phone)),
     ]
 
 
@@ -661,7 +680,7 @@ def order_data_row(row: ExportRow) -> list[str]:
         promise,
         identifier_cell(unit.delivery_otp),
         text_guard(unit.tracking_id),
-        phone_last_6(row.phone),
+        phone_last_6(unit_phone(unit, order, row.phone)),
     ]
 
 

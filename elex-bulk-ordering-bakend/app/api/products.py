@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session as DbSession
 from app.automation.product import ProductPreview, add_screener_details, fetch_product_preview
 from app.automation.search import MAX_QUERY_CHARS, MIN_QUERY_CHARS, NoResultsInTime, query_text, read_search_results
 from app.automation.sellers import read_seller_offers
+from app.config import get_settings
 from app.core import app_settings
 from app.core.browser import browser_page
 from app.core.security import require_user
@@ -131,7 +132,7 @@ async def preview_product(payload: PreviewRequest, db: DbSession = Depends(get_d
         # fires one per keystroke must not start fifty of them.
         async with _PREVIEWS_AT_ONCE:
             async with browser_page(
-                headless=bool(effective.get("browser_headless", True)),
+                headless=get_settings().browser_headless,
                 proxy=str(effective.get("proxy_server") or "") or None,
             ) as (_context, page):
                 preview: ProductPreview = await fetch_product_preview(page, url)
@@ -214,7 +215,7 @@ async def search_products(q: str = Query(..., max_length=1000), db: DbSession = 
     try:
         async with _PREVIEWS_AT_ONCE:
             async with browser_page(
-                headless=bool(effective.get("browser_headless", True)),
+                headless=get_settings().browser_headless,
                 proxy=str(effective.get("proxy_server") or "") or None,
             ) as (_context, page):
                 results = await asyncio.wait_for(read_search_results(page, query), timeout=_SEARCH_SECONDS)

@@ -24,8 +24,9 @@ const proxy = {
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  // ".devtunnels.ms": the shareable Dev Tunnels link (devtunnel host -p 5173).
-  server: { port: 5173, proxy, allowedHosts: [".devtunnels.ms"] },
+  // Shareable tunnel links: ".devtunnels.ms" (devtunnel host -p 5173) and
+  // ".trycloudflare.com" (cloudflared tunnel --url http://localhost:5173).
+  server: { port: 5173, proxy, allowedHosts: [".devtunnels.ms", ".trycloudflare.com"] },
   preview: { port: 4173, proxy },
   build: {
     outDir: "dist",

@@ -786,6 +786,51 @@ async def import_order_report(
     )
 
 
+# --- the courier's multi-track sheet, filled in -------------------------------------
+#: The answer to a multi-track sheet the reader cannot open: one fixed sentence.
+UNREADABLE_MULTI_TRACK = (
+    "Could not read the sheet: it is not a readable .csv or .xlsx file — save it again from Excel and retry."
+)
+
+
+@router.post("/multi-track")
+async def fill_multi_track(request: Request, db: DbSession = Depends(get_db)) -> StreamingResponse:
+    """E-Kart's multi_track sheet, sent back as the same file with four columns
+    added after its own: Account, Delivery OTP, Last 6 Digits Of Phone and
+    Flipkart Status (app.io.multi_track). Rows are matched by tracking ID, else
+    by a one-unit order's ID. ``X-Rows`` and ``X-Matched`` say how many were
+    found. Nothing in the ledger changes."""
+    from urllib.parse import quote
+
+    from app.io import multi_track
+
+    upload = await uploads.read_sheet(request)
+    name = upload.filename
+    if not name.lower().endswith((".csv", ".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="Upload the multi_track .xlsx (or a .csv of it)")
+    try:
+        outcome = await asyncio.to_thread(multi_track.fill, db, upload.data, name)
+    except multi_track.MultiTrackError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 — a fixed sentence, never the parser's words
+        log.warning("multi-track sheet unreadable: %s", type(exc).__name__)
+        raise HTTPException(status_code=422, detail=UNREADABLE_MULTI_TRACK) from None
+    is_csv = name.lower().endswith(".csv")
+    stem = name.rsplit(".", 1)[0] or "multi_track"
+    out_name = f"{stem} - with OTP and phone.{'csv' if is_csv else 'xlsx'}"
+    ascii_name = re.sub(r"[^A-Za-z0-9 ._+()-]", "_", out_name)
+    return StreamingResponse(
+        iter([outcome.data]),
+        media_type="text/csv; charset=utf-8" if is_csv else _XLSX_MIME,
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(out_name)}",
+            "X-Rows": str(outcome.rows),
+            "X-Matched": str(outcome.matched),
+            "Access-Control-Expose-Headers": "X-Rows, X-Matched, Content-Disposition",
+        },
+    )
+
+
 @router.get("/report-template.csv")
 def order_report_template() -> StreamingResponse:
     """The order report's header row, to fill in: one row per unit below it."""

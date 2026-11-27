@@ -126,6 +126,7 @@ export function isNarrowed(f: OrderFilters): boolean {
       (f.order_ids?.length ?? 0) > 0 ||
       (f.emails?.length ?? 0) > 0 ||
       (f.tracking_ids?.length ?? 0) > 0 ||
+      (f.product_ids?.length ?? 0) > 0 ||
       (f.platforms?.length ?? 0) > 0 ||
       f.bob === true ||
       f.bob === false ||
@@ -322,6 +323,17 @@ export function OrderUnitsFilters({
             placeholder="TRK… TRK…"
             values={draft.tracking_ids}
             onValues={(tracking_ids) => onChange({ tracking_ids })}
+          />
+        </Field>
+        <Field
+          id={`${idPrefix}-product-ids`}
+          label="Product ID"
+          help="The exact variant: the part after pid= in the product link. Several allowed."
+        >
+          <MultiValueInput
+            placeholder="MOBHNDTD57UJUK9Q…"
+            values={draft.product_ids}
+            onValues={(product_ids) => onChange({ product_ids })}
           />
         </Field>
         {/* Sent as typed; the server matches on the digits alone, and a value with

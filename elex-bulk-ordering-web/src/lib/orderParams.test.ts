@@ -51,6 +51,12 @@ describe("orderParams", () => {
     expect(params.get("date_to")).toBe("2026-10-24");
   });
 
+  it("repeats product_id for each product id, trimmed, leaving out blanks", () => {
+    const params = orderParams({ product_ids: ["MOBHNDTD57UJUK9Q", " mobhqsff6mzk4ynp ", " "] });
+    expect(params.getAll("product_id")).toEqual(["MOBHNDTD57UJUK9Q", "mobhqsff6mzk4ynp"]);
+    expect(orderParams({ product_ids: [] }).has("product_id")).toBe(false);
+  });
+
   it("sends the card filter as typed, only trimmed — the server picks the digits out", () => {
     // Spaces between the groups stay; so would letters. Which characters count
     // is the server's rule (app.core.order_filter.card_digits), not repeated here.

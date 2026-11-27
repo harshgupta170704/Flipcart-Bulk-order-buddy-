@@ -149,12 +149,12 @@ def test_an_older_saved_row_with_the_retired_keys_does_not_leak_them(db):
 def test_booleans_and_ints_are_coerced(admin, api_client, auth):
     resp = api_client.put(
         "/settings",
-        json={"browser_headless": False, "otp_imap_port": "143", "otp_imap_use_ssl": "no"},
+        json={"employee_phones_assume_online": "yes", "otp_imap_port": "143", "otp_imap_use_ssl": "no"},
         headers=auth,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["browser_headless"] is False
+    assert body["employee_phones_assume_online"] is True
     assert body["otp_imap_port"] == 143
     assert body["otp_imap_use_ssl"] is False
 
@@ -264,7 +264,7 @@ def test_set_overrides_rejects_bad_values(db):
         {"max_concurrency": 0},
         {"max_concurrency": "many"},
         {"otp_imap_port": 99999},
-        {"browser_headless": "maybe"},
+        {"employee_phones_assume_online": "maybe"},
         {"proxy_server": {"a": 1}},
     ):
         with pytest.raises(app_settings.SettingsValidationError):

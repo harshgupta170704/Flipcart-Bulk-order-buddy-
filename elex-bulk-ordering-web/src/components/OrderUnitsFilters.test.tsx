@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { OrderFilterOptions, OrderFilters } from "../lib/types";
-import { OrderUnitsFilters } from "./OrderUnitsFilters";
+import { isNarrowed, OrderUnitsFilters } from "./OrderUnitsFilters";
 
 // Without globals, Testing Library cannot register its own cleanup: a render
 // left behind doubles every label ("Date Date") for the next test.
@@ -68,6 +68,18 @@ describe("OrderUnitsFilters", () => {
 
     expect(box.value).toBe("OD1 OD2");
     expect(drafts.at(-1)?.order_ids).toEqual(["OD1", "OD2"]);
+  });
+
+  it("lets several product ids be typed, and counts them as narrowing the list", () => {
+    const drafts: OrderFilters[] = [];
+    render(<Harness onDraft={(d) => drafts.push(d)} />);
+    const box = screen.getByLabelText("Product ID") as HTMLInputElement;
+
+    fireEvent.change(box, { target: { value: "MOBHNDTD57UJUK9Q, mobhqsff6mzk4ynp" } });
+
+    expect(drafts.at(-1)?.product_ids).toEqual(["MOBHNDTD57UJUK9Q", "mobhqsff6mzk4ynp"]);
+    expect(isNarrowed({ product_ids: ["MOBHNDTD57UJUK9Q"] })).toBe(true);
+    expect(isNarrowed({ product_ids: [] })).toBe(false);
   });
 
   it("groups the wordings the way the spec's picker does", () => {

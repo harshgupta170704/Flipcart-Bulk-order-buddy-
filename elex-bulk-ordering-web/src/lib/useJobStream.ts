@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getToken, jobStreamUrl } from "./api";
-import type { Job, JobItem, JobItemStatus, JobStreamMessage } from "./types";
+import type { Job, JobItem, JobItemStatus, JobStreamMessage, SetAsideGroup } from "./types";
 
 /** An incoming message plus the moment we saw it, so logs can be ordered. */
 export interface StreamEvent extends JobStreamMessage {
@@ -60,6 +60,48 @@ function upsertItem(
   const next = items.slice();
   next[index] = { ...next[index], ...patch, updated_at: now };
   return next;
+}
+
+/**
+ * Smart ID Selection's setting aside, applied in one pass: each listed
+ * account's line becomes skipped with its group's message. One pass rather
+ * than one `upsertItem` per account, because a run can set aside hundreds.
+ */
+function setAside(items: JobItem[], groups: SetAsideGroup[]): JobItem[] {
+  const messages = new Map<number, string>();
+  for (const group of groups) {
+    if (!group || !Array.isArray(group.account_ids)) continue;
+    for (const accountId of group.account_ids) {
+      if (typeof accountId === "number") messages.set(accountId, String(group.message ?? ""));
+    }
+  }
+  if (messages.size === 0) return items;
+  const now = new Date().toISOString();
+  const next = items.map((item) => {
+    const message = messages.get(item.account_id);
+    if (message === undefined) return item;
+    messages.delete(item.account_id);
+    return { ...item, status: "skipped" as const, message, seconds: null, updated_at: now };
+  });
+  // Lines the snapshot did not carry yet, as item_started adds them.
+  for (const [accountId, message] of messages) {
+    next.push({
+      account_id: accountId,
+      email: "",
+      status: "skipped",
+      message,
+      updated_at: now,
+      started_at: null,
+      finished_at: null,
+      seconds: null,
+    });
+  }
+  return next;
+}
+
+/** A count from the event, or the one already held when it sent none. */
+function count(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 /**
@@ -143,6 +185,37 @@ export function useJobStream(jobId: number | null): JobStream {
               }
             : prev,
         );
+        return;
+      }
+
+      if (msg.type === "items_set_aside") {
+        // Smart ID Selection set these IDs aside before the run started: each
+        // line is skipped with its group's message, and the run's counts are
+        // the server's, as sent (progress was taken above).
+        const groups = Array.isArray(msg.groups) ? msg.groups : [];
+        const notes = Array.isArray(msg.notes) ? msg.notes : null;
+        setItems((prev) => setAside(prev, groups));
+        setJob((prev) =>
+          prev
+            ? {
+                ...prev,
+                done_items: count(msg.done_items, prev.done_items),
+                skipped_items: count(msg.skipped_items, prev.skipped_items),
+                total_items: count(msg.total_items, prev.total_items),
+                // The run's notes as saved with the setting aside, so a page
+                // that connected before it shows them without a reload.
+                ...(notes ? { payload: { ...(prev.payload ?? {}), notes } } : {}),
+              }
+            : prev,
+        );
+        return;
+      }
+
+      if (msg.type === "run_notes") {
+        // A note about the whole run (Smart ID off, IDs already bought…),
+        // shown as the notes now stand without a reload.
+        const notes = Array.isArray(msg.notes) ? msg.notes : null;
+        if (notes) setJob((prev) => (prev ? { ...prev, payload: { ...(prev.payload ?? {}), notes } } : prev));
         return;
       }
 

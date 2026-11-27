@@ -21,7 +21,9 @@ import GiftVouchers from "./pages/GiftVouchers";
 import CorpAssist from "./pages/CorpAssist";
 import EmployeePhones from "./pages/EmployeePhones";
 import Inventory from "./pages/Inventory";
+import SwapEmail from "./pages/SwapEmail";
 import OrderPhones from "./pages/OrderPhones";
+import Captchas from "./pages/Captchas";
 import { ConfigsTabs } from "./components/ConfigsTabs";
 import ChangePassword from "./pages/ChangePassword";
 import ForgotPassword from "./pages/ForgotPassword";
@@ -84,11 +86,13 @@ export default function App() {
               <Route path="products" element={<ProductScreener />} />
               <Route path="screener" element={<ProductScreener />} />
               <Route path="inventory" element={<Inventory />} />
+              <Route path="swap-email" element={<SwapEmail />} />
               <Route path="orders" element={<Orders />} />
               <Route path="order-units" element={<OrderUnits />} />
               <Route path="alerts" element={<Alerts />} />
               <Route path="requests" element={<Requests />} />
               <Route path="agents" element={<Agents />} />
+              <Route path="captchas" element={<Captchas />} />
               <Route path="change-password" element={<ChangePassword />} />
               {/* Admin-only pages: the API refuses an operator too; this is the courteous half. */}
               <Route element={<RequireAdmin fallback={<AdminsOnly />} />}>

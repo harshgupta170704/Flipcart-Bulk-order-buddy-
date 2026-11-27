@@ -135,7 +135,9 @@ def test_a_copy_is_taken_before_start_up_and_empties_and_repeats_are_not(monkeyp
     _add_address(scratch, "one")
     first = db_base.backup_sqlite(now=datetime(2026, 10, 25, 1, 0, 0))
     assert first == str(folder / "ordering-20261025-010000.db")
-    with sqlite3.connect(first) as copy:
+    import contextlib
+
+    with contextlib.closing(sqlite3.connect(first)) as copy:
         assert copy.execute("SELECT COUNT(*) FROM addresses").fetchone()[0] == 1
     # Unchanged since: a restart does not make another copy.
     assert db_base.backup_sqlite(now=datetime(2026, 10, 25, 1, 5, 0)) is None

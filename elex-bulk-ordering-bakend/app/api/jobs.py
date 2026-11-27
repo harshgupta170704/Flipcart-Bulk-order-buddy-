@@ -179,8 +179,11 @@ MultiPartParser.spool_max_size = max(MultiPartParser.spool_max_size, MAX_CARD_FI
 MAX_SHEET_FILE_BYTES = 25 * 1024 * 1024
 SHEET_FILE_TOO_LARGE = "The sheet is too large — at most 25 MB is read."
 #: The routes a whole sheet is posted to (the proxies strip "/api"): the
-#: account import, the order ids to track, and the order report.
-SHEET_UPLOAD_PATHS = frozenset({"/accounts/import", "/orders/import-ids", "/orders/import-report"})
+#: account import, the order ids to track, the order report, and the courier's
+#: multi-track sheet to fill in.
+SHEET_UPLOAD_PATHS = frozenset(
+    {"/accounts/import", "/orders/import-ids", "/orders/import-report", "/orders/multi-track"}
+)
 #: The most a sheet upload may declare, and so the most of it that is ever
 #: in memory: the sheet at its cap, and the multipart framing around it.
 SHEET_UPLOAD_LIMIT = MAX_SHEET_FILE_BYTES + FORM_FIELDS_ALLOWANCE
@@ -773,11 +776,16 @@ def _create_job(
     endpoint, so no run can be recorded without them; ``started_by`` is the
     signed-in user's email, kept on the run for good (spec FR-058).
     """
+    from app.core.fleet import agent_name
+
+    payload = {**params, **selection.provenance, "started_by": started_by}
+    if not payload.get("agent"):
+        payload["agent"] = agent_name("api")
     job = Job(
         type=job_type,
         status=JobStatus.queued,
         total_items=len(selection.ids),
-        payload={**params, **selection.provenance, "started_by": started_by},
+        payload=payload,
     )
     db.add(job)
     db.commit()
@@ -1177,17 +1185,43 @@ def card_failure_codes() -> list[dict]:
     return [{"code": code, "name": name} for code, name in FAILURE_CODE_NAMES.items()]
 
 
+_INACTIVE_CARD_STATUSES = frozenset({"cancelled", "canceled", "inactive", "expired", "failed", "blocked"})
+
+
 def _pair_by_corpassist(
     db: DbSession | None, sheet: card_sheets.CardSheet, accounts: list, min_remaining: float | None
 ) -> dict[int, card_sheets.CardRecord] | None:
     """A sheet with no email column whose cards are all CorpAssist child cards
-    is paired by what each card has left (app.core.corpassist.pair_by_balance);
-    None for any other sheet."""
-    if db is None or any(record.email for record in sheet.records):
+    is paired by what each card has left (app.core.corpassist.pair_by_balance,
+    or directly from a BOB/CorpAssist virtual-card CSV carrying parent_card_number
+    / remaining_amount); None for any other sheet."""
+    if any(record.email for record in sheet.records):
         return None
-    from app.core.corpassist import pair_by_balance
+    pairs: dict[int, card_sheets.CardRecord] | None = None
+    if db is not None:
+        from app.core.corpassist import pair_by_balance
 
-    pairs = pair_by_balance(db, sheet.records, accounts, min_remaining=min_remaining)
+        pairs = pair_by_balance(db, sheet.records, accounts, min_remaining=min_remaining)
+
+    # Fallback for external BOB / HDFC CorpAssist virtual-card pool CSVs whose
+    # cards are not yet synced into hdfc_child_cards (e.g. hdfc_corpassist_cards_*.csv):
+    # every row carries virtual-card pool columns (parent_card_number / remaining_amount).
+    if pairs is None and sheet.records and all(record.is_virtual_pool for record in sheet.records):
+        usable: list[tuple[float, int, card_sheets.CardRecord]] = []
+        seen: set[str] = set()
+        for idx, card in enumerate(sheet.records):
+            if card.number in seen:
+                continue
+            seen.add(card.number)
+            if card.status.strip().lower() in _INACTIVE_CARD_STATUSES:
+                continue
+            left = card.remaining_amount
+            if left is not None and (left <= 0 or (min_remaining and left < min_remaining)):
+                continue
+            usable.append((left if left is not None else float("-inf"), idx, card))
+        usable.sort(key=lambda item: (-item[0], item[1]))
+        pairs = {account.id: card for account, (_, _, card) in zip(accounts, usable)}
+
     if pairs is not None and not pairs:
         raise HTTPException(
             status_code=422,
@@ -1338,6 +1372,9 @@ async def start_order_job(
     exclude_ordered_days: int | None = Form(None, ge=1, le=365),
     # Try never-ordered accounts first, then those that ordered longest ago.
     smart_selection: bool = Form(False),
+    # Pass over accounts that already bought this product (placed or sent and
+    # not confirmed, any time; app.core.account_picking.already_bought).
+    skip_bought_product: bool = Form(False),
     # Card pool rules (card runs only; app.core.card_pool).
     card_cooldown_days: int | None = Form(None, ge=1, le=365),
     card_least_used_days: int | None = Form(None, ge=1, le=365),
@@ -1481,6 +1518,7 @@ async def start_order_job(
         **({"use_address_phone": True} if use_address_phone and not phones else {}),
         **({"exclude_ordered_days": exclude_ordered_days} if exclude_ordered_days else {}),
         **({"smart_selection": True} if smart_selection else {}),
+        **({"skip_bought_product": True} if skip_bought_product else {}),
     }
     pacing = None
     if mode_params.get("mode") == MODE_AI:
@@ -1625,6 +1663,7 @@ async def start_order_job(
                 use_address_phone=use_address_phone,
                 exclude_ordered_days=exclude_ordered_days,
                 smart_selection=smart_selection,
+                skip_bought_product=skip_bought_product,
                 ref_code=chosen_ref_code,
                 execution_version=chosen_version,
                 use_supercoins=use_supercoins,
@@ -1710,6 +1749,7 @@ async def start_order_job(
             use_address_phone=use_address_phone,
             exclude_ordered_days=exclude_ordered_days,
             smart_selection=smart_selection,
+            skip_bought_product=skip_bought_product,
             ref_code=chosen_ref_code,
             execution_version=chosen_version,
                 use_supercoins=use_supercoins,

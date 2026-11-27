@@ -21,6 +21,11 @@ const PANEL = "flex flex-col gap-4 rounded-card border border-line bg-page p-4";
 export const MIN_MAX_UNITS = 1;
 export const MIN_WINDOW_DAYS = 1;
 
+/** A Flipkart product id, the pid in a product link: what a variant limit's
+ *  value must be (the server refuses a blank or malformed one). */
+export const PRODUCT_ID = /^[A-Za-z0-9]{6,40}$/;
+const VARIANT_HINT = "The product's Flipkart id: the part after pid= in its link, for example MOBHNDTD57UJUK9Q.";
+
 interface LimitDraft {
   scope: LimitScope;
   value: string;
@@ -47,6 +52,17 @@ function limitDraft(limit: UnitLimit | null): LimitDraft {
 
 function validateLimit(draft: LimitDraft): LimitErrors {
   const errors: LimitErrors = {};
+
+  // A blank variant would count every order of the account, so a variant
+  // limit always names one product id.
+  if (draft.scope === "variant") {
+    const value = draft.value.trim();
+    if (value === "") {
+      errors.value = "A variant limit needs the product's Flipkart id (the pid in its link).";
+    } else if (!PRODUCT_ID.test(value)) {
+      errors.value = "That is not a Flipkart product id: 6 to 40 letters and digits, like MOBHNDTD57UJUK9Q.";
+    }
+  }
 
   const maxUnits = Number(draft.maxUnits);
   if (draft.maxUnits.trim() === "") {
@@ -101,7 +117,10 @@ export function LimitForm({ limit, onSaved, onCancel, className = "" }: LimitFor
     if (key === "scope" || key === "value") setDuplicate(null);
   };
 
-  const wildcard = draft.value.trim() === "";
+  const variant = draft.scope === "variant";
+  /* A blank value caps every value in its scope, except for a variant: that
+     one always names a product id. */
+  const wildcard = draft.value.trim() === "" && !variant;
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -113,7 +132,8 @@ export function LimitForm({ limit, onSaved, onCancel, className = "" }: LimitFor
 
     const payload: UnitLimitInput = {
       scope: draft.scope,
-      value: draft.value.trim(),
+      // A product id is kept upper-case, as the run reads it off the link.
+      value: variant ? draft.value.trim().toUpperCase() : draft.value.trim(),
       max_units: Number(draft.maxUnits),
       window_days: Number(draft.windowDays),
       enabled: draft.enabled,
@@ -170,11 +190,14 @@ export function LimitForm({ limit, onSaved, onCancel, className = "" }: LimitFor
 
         <Field
           label="Value"
-          error={duplicate ?? undefined}
+          required={variant}
+          error={duplicate ?? shown.value}
           help={
-            wildcard
-              ? `Blank on purpose: this caps every ${scopeWord(draft.scope)}, which is the “20 handsets a month” kind of rule.`
-              : `Matched against the order's ${scopeWord(draft.scope)}, ignoring case.`
+            variant
+              ? VARIANT_HINT
+              : wildcard
+                ? `Blank on purpose: this caps every ${scopeWord(draft.scope)}, which is the “20 handsets a month” kind of rule.`
+                : `Matched against the order's ${scopeWord(draft.scope)}, ignoring case.`
           }
         >
           <TextInput
@@ -183,7 +206,7 @@ export function LimitForm({ limit, onSaved, onCancel, className = "" }: LimitFor
             autoComplete="off"
             spellCheck={false}
             maxLength={128}
-            placeholder={`Any ${scopeWord(draft.scope)}`}
+            placeholder={variant ? "MOBHNDTD57UJUK9Q" : `Any ${scopeWord(draft.scope)}`}
             onChange={(event) => set("value", event.target.value)}
           />
         </Field>

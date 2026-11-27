@@ -29,7 +29,7 @@ router = APIRouter(
 
 @router.get("", response_model=SettingsOut)
 def read_settings(db: DbSession = Depends(get_db)) -> dict:
-    return _with_extra_inboxes(app_settings.public_view(app_settings.get_effective(db)))
+    return _with_server_values(app_settings.public_view(app_settings.get_effective(db)))
 
 
 @router.put("", response_model=SettingsOut, dependencies=[Depends(require_admin)])
@@ -39,6 +39,11 @@ def update_settings(
     # exclude_unset: only what the client actually sent is touched.
     # exclude_none: an explicit null is "no change" rather than an error.
     values = payload.model_dump(exclude_unset=True, exclude_none=True)
+    # A Settings page from before 24 Nov 2026 still sends its browser switch.
+    # Hidden or shown is each machine's own .env now, so the switch is set
+    # aside rather than refusing the rest of that page's save.
+    if values.pop("browser_headless", None) is not None:
+        log.info("settings save: browser_headless set aside — each machine's .env decides it")
     _refuse_moving_the_inbox_without_its_password(db, values)
     try:
         app_settings.set_overrides(db, values)
@@ -49,7 +54,7 @@ def update_settings(
             status_code=422,
             detail=[{"loc": ["body", exc.key], "msg": exc.message}],
         ) from exc
-    return _with_extra_inboxes(app_settings.public_view(app_settings.get_effective(db)))
+    return _with_server_values(app_settings.public_view(app_settings.get_effective(db)))
 
 
 def _refuse_moving_the_inbox_without_its_password(db: DbSession, values: dict) -> None:
@@ -88,11 +93,15 @@ def _refuse_moving_the_inbox_without_its_password(db: DbSession, values: dict) -
         )
 
 
-def _with_extra_inboxes(view: dict) -> dict:
-    """The numbered inboxes from the server's settings, read-only and without
-    their passwords, beside the editable first inbox; and any it names but
-    cannot use, with the reason, so a skipped inbox is not a mystery."""
-    view["otp_extra_inboxes"], view["otp_unused_inboxes"] = settings_page_inboxes(get_settings())
+def _with_server_values(view: dict) -> dict:
+    """What the page shows read-only from this server's own .env: whether its
+    browser is hidden (``ORDERING_BROWSER_HEADLESS``, nothing saved here beats
+    it); and the numbered inboxes, without their passwords, beside the
+    editable first inbox, with any it names but cannot use and the reason, so
+    a skipped inbox is not a mystery."""
+    settings = get_settings()
+    view["browser_headless"] = bool(settings.browser_headless)
+    view["otp_extra_inboxes"], view["otp_unused_inboxes"] = settings_page_inboxes(settings)
     return view
 
 

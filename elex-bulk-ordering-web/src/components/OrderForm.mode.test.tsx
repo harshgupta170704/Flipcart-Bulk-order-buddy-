@@ -12,18 +12,29 @@ import type { Job, ProductPreview } from "../lib/types";
 const mocks = vi.hoisted(() => ({
   startOrderJob: vi.fn(),
   previewProduct: vi.fn(),
+  pickerFilterStatus: vi.fn(),
 }));
 
 vi.mock("../lib/api", () => ({
   ...mocks,
   listCardFailureCodes: () => Promise.resolve([]),
+  // Where Smart ID Selection starts (on, the server's default), and its room check.
+  getSettings: () => Promise.resolve({ smart_id_default_on: true }),
+  checkRun: () => new Promise(() => undefined),
   errorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
 }));
 
 vi.mock("./RunAccounts", async () => {
   const { useEffect } = await import("react");
   return {
-    RunAccountPicker: ({ onSelectionChange }: { onSelectionChange?: (next: unknown) => void }) => {
+    RunAccountPicker: ({
+      onSelectionChange,
+      filterStatus,
+    }: {
+      onSelectionChange?: (next: unknown) => void;
+      filterStatus?: string[];
+    }) => {
+      mocks.pickerFilterStatus(filterStatus);
       useEffect(() => onSelectionChange?.({ mode: "ids", ids: [7, 8] }), [onSelectionChange]);
       return null;
     },
@@ -180,9 +191,9 @@ describe("Order preview, GST mandatory, phones, reset (step A3)", () => {
     expect(panel.textContent).toContain("Mock");
   });
 
-  it("sends GST mandatory and the delivery phones", async () => {
+  it("GST mandatory is on by default and is sent with the delivery phones", async () => {
     await renderForm();
-    fireEvent.click(screen.getByLabelText(/GST mandatory/));
+    expect((screen.getByLabelText(/GST mandatory/) as HTMLInputElement).checked).toBe(true);
     fireEvent.change(screen.getByLabelText(/Delivery phone numbers/), {
       target: { value: "9000000001, 9000000002 9000000003" },
     });
@@ -191,6 +202,14 @@ describe("Order preview, GST mandatory, phones, reset (step A3)", () => {
     const sent = mocks.startOrderJob.mock.calls[0][0];
     expect(sent.gst_mandatory).toBe(true);
     expect(sent.address_phones).toEqual(["9000000001", "9000000002", "9000000003"]);
+  });
+
+  it("sends GST mandatory off when it is turned off", async () => {
+    await renderForm();
+    fireEvent.click(screen.getByLabelText(/GST mandatory/));
+    start(/Submit Order/);
+    await waitFor(() => expect(mocks.startOrderJob).toHaveBeenCalledTimes(1));
+    expect(mocks.startOrderJob.mock.calls[0][0].gst_mandatory).toBe(false);
   });
 
   it("refuses a phone that is not 10 digits and sends nothing", async () => {
@@ -208,22 +227,26 @@ describe("Order preview, GST mandatory, phones, reset (step A3)", () => {
     fireEvent.click(screen.getByLabelText(/GST mandatory/));
     fireEvent.click(screen.getByRole("button", { name: "Reset to defaults" }));
     expect((screen.getByLabelText(/Product URL/) as HTMLInputElement).value).toBe("");
-    expect((screen.getByLabelText(/GST mandatory/) as HTMLInputElement).checked).toBe(false);
+    // Back on: GST mandatory is the default.
+    expect((screen.getByLabelText(/GST mandatory/) as HTMLInputElement).checked).toBe(true);
     expect(screen.getByRole("radio", { name: "Real" }).getAttribute("aria-checked")).toBe("true");
   });
 });
 
 describe("Account selection (step B)", () => {
-  it("sends the exclusion window and smart selection", async () => {
+  it("sends the exclusion window and spread orders (smart_selection)", async () => {
     await renderForm();
     fireEvent.click(screen.getByLabelText(/^Exclude IDs$/));
     fireEvent.change(screen.getByLabelText(/Exclude IDs ordered/), { target: { value: "14" } });
-    fireEvent.click(screen.getByLabelText(/Smart ID Selection/));
+    // The old "Smart ID Selection" box, renamed: still sent as smart_selection.
+    fireEvent.click(screen.getByLabelText("Spread orders across accounts"));
     start(/Submit Order/);
     await waitFor(() => expect(mocks.startOrderJob).toHaveBeenCalledTimes(1));
     const sent = mocks.startOrderJob.mock.calls[0][0];
     expect(sent.exclude_ordered_days).toBe(14);
     expect(sent.smart_selection).toBe(true);
+    // Smart ID Selection is a switch of its own, untouched here.
+    expect(sent.smart_id).toBe(true);
   });
 
   it("leaves both off by default", async () => {
@@ -233,6 +256,15 @@ describe("Account selection (step B)", () => {
     const sent = mocks.startOrderJob.mock.calls[0][0];
     expect(sent.exclude_ordered_days).toBeNull();
     expect(sent.smart_selection).toBe(false);
+    expect(sent.skip_bought_product).toBe(false);
+  });
+
+  it("sends Skip IDs that already bought this product", async () => {
+    await renderForm();
+    fireEvent.click(screen.getByLabelText(/Skip IDs that already bought this product/));
+    start(/Submit Order/);
+    await waitFor(() => expect(mocks.startOrderJob).toHaveBeenCalledTimes(1));
+    expect(mocks.startOrderJob.mock.calls[0][0].skip_bought_product).toBe(true);
   });
 
   it("refuses a window outside 1–365 days", async () => {
@@ -243,6 +275,15 @@ describe("Account selection (step B)", () => {
     start(/Submit Order/);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mocks.startOrderJob).not.toHaveBeenCalled();
+  });
+
+  it("widens eligible statuses to include unsigned-in accounts (auto-login via OTP) when ticked", async () => {
+    await renderForm();
+    expect(mocks.pickerFilterStatus).toHaveBeenLastCalledWith(["session_valid"]);
+    fireEvent.click(screen.getByLabelText(/Include accounts without a saved session/));
+    await waitFor(() => {
+      expect(mocks.pickerFilterStatus).toHaveBeenLastCalledWith(["session_valid", "new", "session_invalid"]);
+    });
   });
 });
 

@@ -96,6 +96,10 @@ def place_order_run(db: DbSession, *, isolated: bool) -> Placement:
             if isolated
             else "Every online order agent is isolated for tests. Turn off \"Test on isolated agents\" only after un-isolating one.",
         )
+    local_name = agent_name("api")
+    for agent in matching:
+        if agent.name == local_name:
+            return Placement(agent)
     return Placement(matching[0])
 
 
