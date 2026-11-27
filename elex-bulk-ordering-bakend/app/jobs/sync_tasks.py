@@ -43,7 +43,7 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -110,8 +110,14 @@ async def run_sync_job(
     import_unknown: bool = False,
     order_ids: Sequence[str] | None = None,
     follow_open: bool = False,
+    invoices_only: bool = False,
 ) -> None:
     """Read each account's recent orders back off Flipkart and reconcile them.
+
+    With ``invoices_only`` (the ledger's "Fetch invoices", with ``order_ids``)
+    no page is read: each listed order's invoices are downloaded from
+    Flipkart's invoice API under its account's session, stored and parsed —
+    see :func:`_fetch_invoices_for`.
 
     Accounts run concurrently at ``settings.max_concurrency``, the same shape as
     every other job body: a ``JobTracker`` per run, ``run_bounded`` over the
@@ -177,6 +183,11 @@ async def run_sync_job(
             if ordering is not None:
                 gave_way.append(ordering)
             return ordering is not None
+
+        if invoices_only:
+            return await _fetch_invoices_for(
+                account_id, wanted, cookies=cookies, settings=settings, pool=pool, give_way=give_way, gave_way=gave_way
+            )
 
         reading_since = time.monotonic()
         try:
@@ -275,6 +286,82 @@ async def run_sync_job(
     # Off the event loop: a pass waits on the engine's lock when "Evaluate now"
     # is running on a request thread, and the loop must not wait with it.
     await asyncio.to_thread(alert_rules.evaluate_in_own_session)
+
+
+#: Orders asked per batch by "Fetch invoices": between batches the run asks
+#: whether an order run wants the account, as a read-back does between pages.
+INVOICE_BATCH = 10
+#: Answers that mean Flipkart would not serve this session.
+_REFUSED = ("Flipkart answered 401", "Flipkart answered 403", "a web page (the account may be signed out)")
+
+
+@dataclass
+class _InvoiceAsk:
+    """One order to ask the invoice API for — the shape fetch_missing reads."""
+
+    order_id: str
+    invoice_url: str
+
+
+async def _fetch_invoices_for(
+    account_id: int,
+    order_ids: Sequence[str],
+    *,
+    cookies: list[dict],
+    settings,
+    pool,
+    give_way: Callable[[], bool],
+    gave_way: list[int],
+) -> _Outcome:
+    """Download, store and parse the invoices of ``order_ids`` (all this
+    account's) from Flipkart's invoice API — what "Download Invoice" on each
+    order's page does, without opening the pages. An order whose invoices are
+    already complete is left alone; one with none yet is said so."""
+    asks = [_InvoiceAsk(order_id=o, invoice_url=invoices.invoice_api_url(o)) for o in order_ids]
+    fetched: dict[str, list[bytes]] = {}
+    problems: dict[str, str] = {}
+    asked = 0
+    try:
+        async with browser_page(
+            headless=settings.browser_headless,
+            proxy=settings.proxy_server or None,
+            cookies=cookies,
+            pool=pool,
+        ) as (context, _page):
+            for start in range(0, len(asks), INVOICE_BATCH):
+                if gave_way or give_way():
+                    break
+                batch = asks[start : start + INVOICE_BATCH]
+                fetched.update(
+                    await invoices.fetch_missing(context, account_id, batch, force=True, problems=problems)
+                )
+                asked += len(batch)
+    except Exception as exc:  # noqa: BLE001 - one account's failure is data
+        log.exception("invoice fetch failed for account %s", account_id)
+        return _Outcome(False, f"invoice fetch failed: {_redact(str(exc) or exc.__class__.__name__)}")
+
+    saved = invoices.record(account_id, fetched)
+    complete = max(0, asked - len(fetched) - len(problems))
+    parts = [f"invoices downloaded for {len(fetched)} of {len(order_ids)} order(s), {saved} new invoice(s) put on file"]
+    if complete:
+        parts.append(f"{complete} already complete")
+    if problems:
+        reason = next(iter(problems.values()))
+        parts.append(f"{len(problems)} with none ({reason})")
+    summary = ", ".join(parts)
+    refused = [why for why in problems.values() if any(word in why for word in _REFUSED)]
+    if problems and not fetched and len(refused) == len(problems):
+        return _Outcome(False, f"{summary} — Flipkart refused this session; run a login for this account")
+    if gave_way:
+        left = len(order_ids) - asked
+        return _Outcome(
+            False,
+            f"{summary} — stopped early so order run #{gave_way[0]} could use this account; "
+            f"{left} order(s) not asked — fetch again once that run ends",
+            skipped=True,
+        )
+    log.info("account %s invoices: %s", account_id, summary)
+    return _Outcome(True, summary)
 
 
 def _with_invoice_links(scraped: Sequence[object]) -> list[list[object]]:
@@ -652,6 +739,17 @@ def _apply(row: Order, observation: object, *, cancelled: bool | None = None) ->
     if cancelled and row.status != OrderStatus.failed:
         row.status = OrderStatus.failed
         changed = True
+    elif row.status == OrderStatus.unconfirmed and row.order_id:
+        from app.core import order_status
+
+        status_text = _observed(observation, "platform_status") or row.platform_status
+        if (
+            status_text
+            and not order_status.payment_unconfirmed(status_text)
+            and order_status.classify(status_text) in (order_status.IN_TRANSIT, order_status.DELIVERED)
+        ):
+            row.status = OrderStatus.placed
+            changed = True
 
     # Stamped whether anything moved or not: "nothing changed" and "never
     # looked" are different answers, and this column is the only thing that can
@@ -709,10 +807,18 @@ def _adopt_unconfirmed(
             account_id,
         )
         return None
+    from app.core import order_status
+
     row.order_id = _key(_observed(observation, "order_id"))
     if cancelled is None:
         cancelled = _is_cancelled(observation)
-    row.status = OrderStatus.failed if cancelled else OrderStatus.placed
+    status_text = _observed(observation, "platform_status")
+    if cancelled:
+        row.status = OrderStatus.failed
+    elif order_status.payment_unconfirmed(status_text):
+        row.status = OrderStatus.unconfirmed
+    else:
+        row.status = OrderStatus.placed
     # The session does not autoflush: without this the next observation's
     # query would still see this row as id-less and could adopt it again.
     db.flush()

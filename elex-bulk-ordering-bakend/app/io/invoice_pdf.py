@@ -67,7 +67,11 @@ _clock = time.monotonic
 #: them.
 #: 3 (11 Nov 2026): a second IMEI inside one bracket (a dual-SIM handset) is
 #: kept beside the first.
-PARSER_VERSION = 3
+#: 4 (27 Nov 2026): the owner's reference names — "Protect Promise" (not
+#: "… Fee"), "GT Charges" for Flipkart India's delivery/transport invoice,
+#: "<what it reverses> Credit Note" — and the seller of a "Billed From" block
+#: printed on a line of its own (Flipkart's layout of Nov 2026).
+PARSER_VERSION = 4
 
 KIND_PRODUCT = "product"
 KIND_FEE = "fee"
@@ -178,6 +182,22 @@ _BARE_CODE = re.compile(r"^\d{4,8}$")
 #: "Billed From <tab> Billed To" — the transport invoice names the seller and
 #: the buyer side by side under this header instead of "Sold By" / "Bill To".
 _BILLED_FROM_TO = re.compile(r"^\s*Billed\s+From\s*\t\s*Billed\s+To\s*$", re.IGNORECASE)
+#: The Nov 2026 layout prints "Billed From" on a line of its own, the seller
+#: on the next, and "Billed To" further down beside the shipping blocks.
+_BILLED_FROM_ALONE = re.compile(r"^\s*Billed\s+From\s*:?\s*$", re.IGNORECASE)
+#: Line titles named the way the owner's reference file names them (27 Nov
+#: 2026): Flipkart prints "Protect Promise Fee" and "Delivery Charges" (the
+#: goods-transport invoice from Flipkart India); the reference says "Protect
+#: Promise" and "GT Charges".
+_REFERENCE_NAMES = (
+    (re.compile(r"^\s*protect\s+promise(?:\s+fee)?\s*$", re.IGNORECASE), "Protect Promise"),
+    (
+        re.compile(r"delivery\s+charges?|shipping\s+charges?|transport|\bGTA\b|^\s*GT\s+charges?\s*$", re.IGNORECASE),
+        "GT Charges",
+    ),
+)
+#: A handset's HSN chapter: a credit-note line carrying it reverses a product.
+_PRODUCT_HSN = re.compile(r"^8517")
 
 _FSN_LABEL = re.compile(r"^\s*FSN\s*:\s*(?:([A-Z0-9]{13,20})\b)?\s*", re.IGNORECASE)
 _FSN_BARE = re.compile(r"^\s*([A-Z0-9]{16})\b\s*")
@@ -397,8 +417,43 @@ def _fee_label(parsed_lines: list[ParsedLine]) -> str:
     """The fee invoice's type: its one line's title, or every distinct title
     joined in a fixed order when it carries several ("Credit Card Fee + Offer
     Handling Fee"), so the same document never shows up under two names."""
-    titles = sorted({line.title for line in parsed_lines if line.title})
+    titles = sorted({reference_name(line.title) for line in parsed_lines if line.title})
     return " + ".join(titles) if titles else TYPE_FEE
+
+
+def reference_name(title: str | None) -> str | None:
+    """A fee line's title as the owner's reference file names it."""
+    if not title:
+        return title
+    for pattern, name in _REFERENCE_NAMES:
+        if pattern.search(title):
+            return name
+    return title.strip()
+
+
+def _credit_note_label(parsed_lines: list[ParsedLine]) -> str:
+    """"<what it reverses> Credit Note", as the reference file names them:
+    "Product Credit Note" for a handset line (an FSN, or a handset HSN), else
+    the fee's own name ("Protect Promise Credit Note"). A note with no
+    readable line stays a plain "Credit Note"."""
+    if any(line.fsn or _PRODUCT_HSN.match(line.hsn_sac or "") for line in parsed_lines):
+        return f"{TYPE_PRODUCT} {TYPE_CREDIT_NOTE}"
+    names = sorted({reference_name(line.title) for line in parsed_lines if line.title})
+    return f"{' + '.join(names)} {TYPE_CREDIT_NOTE}" if names else TYPE_CREDIT_NOTE
+
+
+def _billed_from_name(lines: list[str]) -> str | None:
+    """The seller of a "Billed From" block printed on a line of its own: the
+    first cell of the next line with words on it."""
+    for index, raw in enumerate(lines):
+        if not _BILLED_FROM_ALONE.match(_collapse(raw)):
+            continue
+        for candidate in lines[index + 1 : index + 3]:
+            cells = [c.strip() for c in _collapse(candidate).split("\t") if c.strip()]
+            if cells:
+                return cells[0]
+        return None
+    return None
 
 
 def _buyer_name(lines: list[str]) -> str | None:
@@ -459,6 +514,8 @@ def parse_invoice_text(text: str) -> ParsedInvoice:
         billed_from, billed_to = _from_to_names(lines)
         out.seller_name = out.seller_name or billed_from
         out.buyer_name = out.buyer_name or billed_to
+    if out.seller_name is None:
+        out.seller_name = _billed_from_name(lines)
 
     head = "\n".join(flat.splitlines()[:6])
     is_credit_note = bool(_CREDIT_NOTE.search(head))
@@ -479,7 +536,9 @@ def parse_invoice_text(text: str) -> ParsedInvoice:
         out.lines, total_row_last = _parse_lines(lines, header_at, columns)
         if out.grand_total is None:
             out.grand_total = total_row_last
-        if not is_credit_note:
+        if is_credit_note:
+            out.invoice_type = _credit_note_label(out.lines)
+        else:
             if _PRODUCT_HEADER.search(header_text):
                 out.kind, out.invoice_type = KIND_PRODUCT, TYPE_PRODUCT
             else:

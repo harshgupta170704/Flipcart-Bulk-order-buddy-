@@ -105,8 +105,10 @@ def ledger(db):
 
 
 def _rows(response) -> list[list[str]]:
-    assert response.text.startswith(BOM)
-    return list(csv.reader(io.StringIO(response.text[len(BOM):])))
+    # The owner's reference layout (27 Nov 2026): no BOM, CRLF line ends.
+    assert not response.text.startswith(BOM)
+    assert response.text.endswith("\r\n")
+    return list(csv.reader(io.StringIO(response.text)))
 
 
 # --- the parse on the row ------------------------------------------------------------------
@@ -363,8 +365,8 @@ def test_the_csv_has_the_spec_columns_and_one_row_per_line_of_the_ticked_types(a
     assert (response.headers["x-invoice-rows"], response.headers["x-units-left-out"]) == ("3", "1")
     rows = _rows(response)
     assert rows[0] == invoice_data_csv.HEADERS == [
-        "Invoice Type", "Invoice Number", "Order ID", "Invoice Date", "Order Date", "Original Invoice Number", "Reason",
-        "IMEI", "Invoice Product", "Ledger Product", "Qty", "FSN", "HSN", "Taxable Amount",
+        "Invoice Type", "Invoice Number", "Order ID", "Invoice Date", "Order Date", "Original Invoice Number",
+        "Reason Of Issuance", "IMEI", "Invoice Product Name", "BoB Product Name", "Qty", "FSN", "HSN", "Taxable Amount",
         "IGST", "SGST", "CGST", "Total Amount", "Buyer Name", "Buyer GST", "Seller Name", "Seller GST",
     ]
     assert len(rows) == 4
@@ -375,32 +377,35 @@ def test_the_csv_has_the_spec_columns_and_one_row_per_line_of_the_ticked_types(a
         "Invoice Type": "Product",
         "Invoice Number": "FASUUT2500113513",
         "Order ID": ORDER_ID,
-        "Invoice Date": "21-10-2024",
-        "Order Date": "20-10-2024",
+        "Invoice Date": "2024-10-21",
+        "Order Date": "2024-10-20",
         "Original Invoice Number": "",
-        "Reason": "",
-        "IMEI": '="358107262645105"',
-        "Invoice Product": "Apple iPhone 15 (Blue, 128 GB)",
-        "Ledger Product": "Apple iPhone 15 (Blue, 128 GB)",
-        "Qty": "1",
+        "Reason Of Issuance": "",
+        "IMEI": "\t358107262645105",
+        "Invoice Product Name": "Apple iPhone 15 (Blue, 128 GB)",
+        "BoB Product Name": "Apple iPhone 15 (Blue, 128 GB)",
+        "Qty": "1.00",
         "FSN": "MOBGTAGPAQNVFZZY",
-        "HSN": '="85171300"',
+        "HSN": "85171300",
         "Taxable Amount": "43219.50",
-        "IGST": "",
+        # The reference's IGST column is the whole GST: SGST + CGST here.
+        "IGST": "7779.50",
         "SGST": "3889.75",
         "CGST": "3889.75",
         "Total Amount": "50999.00",
-        "Buyer Name": "Transparent Deals",
+        "Buyer Name": "TRANSPARENT DEALS",
         "Buyer GST": "09AAUFT2204P1ZI",
         "Seller Name": "Konde Products & Services Private Limited",
         "Seller GST": "09AAGCK4304E1ZT",
     }
     shipping = dict(zip(rows[0], rows[2]))
-    assert (shipping["Invoice Product"], shipping["IMEI"], shipping["HSN"]) == ("Shipping And Packaging Charges", "", "")
-    assert (shipping["Taxable Amount"], shipping["Total Amount"], shipping["Qty"]) == ("0.00", "0.00", "1")
+    assert (shipping["Invoice Product Name"], shipping["IMEI"], shipping["HSN"]) == ("Shipping And Packaging Charges", "", "")
+    assert (shipping["Taxable Amount"], shipping["Total Amount"], shipping["Qty"]) == ("0.00", "0.00", "1.00")
     fee = dict(zip(rows[0], rows[3]))
-    assert (fee["Invoice Number"], fee["HSN"], fee["Buyer GST"]) == ("BFF8825001967376", '="998599"', "")
-    assert (fee["Taxable Amount"], fee["CGST"], fee["SGST"], fee["IGST"], fee["Total Amount"]) == ("83.90", "7.55", "7.55", "", "99.00")
+    assert (fee["Invoice Number"], fee["HSN"], fee["Buyer GST"]) == ("BFF8825001967376", "998599", "")
+    assert (fee["Taxable Amount"], fee["CGST"], fee["SGST"], fee["IGST"], fee["Total Amount"]) == ("83.90", "7.55", "7.55", "15.10", "99.00")
+    # A fee row names the phone, as its product invoice prints it.
+    assert fee["Invoice Product Name"] == "Apple iPhone 15 (Blue, 128 GB)"
 
 
 def test_only_the_ticked_types_are_written(api, ledger):
@@ -410,7 +415,7 @@ def test_only_the_ticked_types_are_written(api, ledger):
     assert len(rows) == 2
     row = dict(zip(rows[0], rows[1]))
     assert (row["Invoice Type"], row["Seller Name"], row["Seller GST"]) == ("Offer Handling Fee", "Flipkart Internet Private Limited", "29AACCF0683K1ZD")
-    assert (row["IGST"], row["SGST"], row["CGST"], row["Total Amount"]) == ("7.47", "", "", "49.00")
+    assert (row["IGST"], row["SGST"], row["CGST"], row["Total Amount"]) == ("7.47", "0.00", "0.00", "49.00")
 
     everything = api.get(
         "/invoices/data.csv", params=[("type", "Product"), ("type", "Offer Handling Fee"), ("type", "Secure Packaging Fee")]
@@ -489,9 +494,11 @@ def test_an_invoice_with_no_readable_line_still_gets_one_row(db, ledger):
     rows = invoice_data_csv.rows_for(row, order)
     assert len(rows) == 1
     got = dict(zip(invoice_data_csv.HEADERS, rows[0]))
-    assert (got["Invoice Type"], got["Invoice Number"], got["Original Invoice Number"], got["Reason"]) == ("Credit Note", "CN1", "FASUUT2500113513", "Return")
-    assert (got["Invoice Date"], got["Order Date"], got["Total Amount"]) == ("25-10-2024", "20-10-2024", "50999.00")
-    assert (got["IMEI"], got["Invoice Product"], got["Ledger Product"], got["Qty"]) == ("", "", order.model, "")
+    assert (got["Invoice Type"], got["Invoice Number"], got["Original Invoice Number"], got["Reason Of Issuance"]) == ("Credit Note", "CN1", "FASUUT2500113513", "Return")
+    assert (got["Invoice Date"], got["Order Date"], got["Total Amount"]) == ("2024-10-25", "2024-10-20", "50999.00")
+    # No line: the order's product stands in, and no tax is claimed.
+    assert (got["IMEI"], got["Invoice Product Name"], got["BoB Product Name"], got["Qty"]) == ("", order.model, order.model, "")
+    assert (got["IGST"], got["SGST"], got["CGST"]) == ("", "", "")
     assert invoice_data_csv.row_count([(row, order)]) == 1
 
 
@@ -510,7 +517,8 @@ def test_the_order_date_fallback_is_indias_day_like_the_ledger_export(db, ledger
     def order_date() -> str:
         return dict(zip(invoice_data_csv.HEADERS, invoice_data_csv.rows_for(row, order)[0]))["Order Date"]
 
-    assert order_date() == "02-10-2026" == orders_csv.fmt_date(order.placed_at)
+    assert order_date() == "2026-10-02"
+    assert orders_csv.fmt_date(order.placed_at) == "02-10-2026"  # the same day, in the ledger's own layout
     # A day printed on the invoice is a calendar day: no clock to convert.
     row.order_date = datetime(2026, 10, 1)
-    assert order_date() == "01-10-2026"
+    assert order_date() == "2026-10-01"

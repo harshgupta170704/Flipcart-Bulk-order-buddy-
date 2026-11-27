@@ -21,7 +21,7 @@ def _read(name: str) -> bytes:
 
 
 def test_the_parser_has_a_version():
-    assert PARSER_VERSION == 3  # 2: the transport invoice and multi-line fee labels; 3: a second IMEI in one bracket
+    assert PARSER_VERSION == 4  # 2: the transport invoice and multi-line fee labels; 3: a second IMEI in one bracket; 4: reference names
 
 
 # --- the real invoices -----------------------------------------------------------------
@@ -257,7 +257,8 @@ def test_a_credit_note_is_read_on_its_labels():
     out = parse_invoice_text(CREDIT_NOTE)
 
     assert out.error is None
-    assert (out.kind, out.invoice_type) == ("credit_note", "Credit Note")
+    # Named for what it reverses, as the owner's reference file names it.
+    assert (out.kind, out.invoice_type) == ("credit_note", "Product Credit Note")
     assert out.invoice_number == "CN2500113513"  # not the original invoice's number
     assert out.original_invoice == "FASUUT2500113513"
     assert out.reason == "Return"

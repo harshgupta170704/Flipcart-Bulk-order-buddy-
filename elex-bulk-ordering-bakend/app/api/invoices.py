@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import io
 import logging
 import re
@@ -96,6 +97,8 @@ _FILTER_KEYS = (
     "status",
     "platform_status",
     "delivery_state",
+    "processing_stage",
+    "error_code",
     "order_id",
     "email",
     "tracking_id",
@@ -113,7 +116,9 @@ _FILTER_KEYS = (
     "platform",
     "bob",
 )
-_LIST_KEYS = frozenset({"status", "platform_status", "delivery_state", "order_id", "email", "tracking_id", "platform"})
+_LIST_KEYS = frozenset(
+    {"status", "platform_status", "delivery_state", "processing_stage", "error_code", "order_id", "email", "tracking_id", "platform"}
+)
 
 
 class InvoiceFileOut(BaseModel):
@@ -473,6 +478,85 @@ def invoice_data_csv_export(
         media_type="text/csv; charset=utf-8",
         headers=headers,
     )
+
+
+# --- Fetch invoices from Flipkart ------------------------------------------------------
+class FetchStartOut(BaseModel):
+    job: JobOut
+    #: Orders (with a Flipkart order id) whose invoices will be asked for.
+    orders: int
+    accounts: int
+
+
+def fetch_filter(flt: OrderFilter) -> OrderFilter:
+    """The filter a fetch walks: the ledger filter without its invoice filters.
+    Those match the invoices *on file*, so before the first fetch they match
+    no order at all — an "October invoices" filter would fetch nothing. The
+    CSV applies them afterwards, to what was fetched."""
+    return dataclasses.replace(flt, invoice_number=None, invoice_gstin=None, invoice_month=None)
+
+
+def _active_invoice_fetch(db: DbSession) -> Job | None:
+    """The "Fetch invoices" run still queued or running, if any (a read-back
+    job whose payload says ``invoices_only``)."""
+    for job in db.scalars(
+        select(Job).where(Job.type == JobType.sync, Job.status.in_((JobStatus.queued, JobStatus.running)))
+    ):
+        if (job.payload or {}).get("invoices_only"):
+            return job
+    return None
+
+
+@router.post("/fetch", response_model=FetchStartOut, status_code=201)
+async def start_invoice_fetch(
+    flt: OrderFilter = Depends(parse_filter),
+    db: DbSession = Depends(get_db),
+    who: str = Depends(require_user),
+) -> FetchStartOut:
+    """Download from Flipkart, store and parse every invoice of the orders
+    whose units match the ledger filter — one zip per order from Flipkart's
+    invoice API, under the account that placed it. Runs as a read-back job
+    (one at a time, and it gives an account up to an order run), watched on
+    ``GET /jobs/{id}``. Then Extract Invoices Data writes the CSV."""
+    from app.api.jobs import _create_job
+    from app.api.sync import _selection_from_orders
+    from app.jobs.sync_tasks import run_sync_job
+
+    # One fetch at a time — but not "no read-back at all": the timer starts
+    # one every few minutes, so the button would nearly always be refused. A
+    # fetch writes only invoice rows, and the same PDF twice for an order is
+    # one row (uq_invoices_order_sha256), so it may run beside a read-back.
+    active = _active_invoice_fetch(db)
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Invoice fetch #{active.id} is already running — wait for it to finish.",
+        )
+    matching = order_filter.matching_orders(fetch_filter(flt)).subquery()
+    order_ids = sorted(
+        {
+            str(order_id).strip().upper()
+            for order_id in db.scalars(
+                select(Order.order_id).where(Order.id.in_(select(matching.c.id)), Order.order_id.is_not(None))
+            ).all()
+            if order_id and str(order_id).strip()
+        }
+    )
+    if not order_ids:
+        raise HTTPException(status_code=422, detail="No order matching the current filter has a Flipkart order id.")
+    selection = _selection_from_orders(db, order_ids)
+    job = _create_job(
+        db,
+        JobType.sync,
+        selection,
+        {"invoices_only": True, "orders": len(order_ids), "order_ids": order_ids},
+        started_by=who,
+    )
+    out = JobOut.model_validate(job)
+    log.info("starting invoice fetch job %s: %s order(s) over %s account(s)", out.id, len(order_ids), len(selection.ids))
+    account_ids = list(selection.ids)
+    _spawn(lambda: run_sync_job(out.id, account_ids, order_ids=order_ids, invoices_only=True), out.id)
+    return FetchStartOut(job=out, orders=len(order_ids), accounts=len(account_ids))
 
 
 # --- Compile Invoices ------------------------------------------------------------------

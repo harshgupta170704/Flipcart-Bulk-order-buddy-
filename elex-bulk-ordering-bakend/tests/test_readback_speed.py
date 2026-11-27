@@ -11,70 +11,24 @@ import asyncio
 import pytest
 
 from app.automation import sync
+from app.core.invoices import invoice_api_url
 from tests.fakes import FakePage
 
 
-class _NoInvoiceLink:
-    """An order page with no invoice link; records how long each read may wait."""
-
-    url = "https://www.flipkart.com/order_details?order_id=OD1"
-
-    def __init__(self):
-        self.timeouts: list = []
-
-    def locator(self, _selector):
-        return self
-
-    @property
-    def first(self):
-        return self
-
-    async def get_attribute(self, _name, timeout=None):
-        self.timeouts.append(timeout)
-        raise TimeoutError("no such element")
-
-
-# --- the invoice link's wait ---------------------------------------------------------
-def test_an_invoice_link_is_never_waited_for_on_the_browsers_30_second_default():
-    page = _NoInvoiceLink()
-
-    assert asyncio.run(sync._invoice_url(page)) is None
-    assert asyncio.run(sync._invoice_url(page, expected=False)) is None
-    assert None not in page.timeouts
-    assert max(page.timeouts) <= sync._FIELD_TIMEOUT_MS
-
-
-def test_an_order_on_its_way_gets_only_a_short_look_for_an_invoice():
-    page = _NoInvoiceLink()
-    asyncio.run(sync._invoice_url(page, expected=False))
-
-    assert page.timeouts == [sync._INVOICE_WAIT_MS]
-    assert sync._INVOICE_WAIT_MS <= 2_000
-
-
+# --- the invoice ---------------------------------------------------------------------
+# Since 27 Nov 2026 the page is not searched for an invoice link at all (it has
+# none: "Download Invoice" is a div calling Flipkart's API), so no page read
+# waits on one. Every order is pointed at the API: one still "Arriving" already
+# holds its product and fee invoices (seen live), a cancelled one credit notes.
 @pytest.mark.parametrize(
-    "status, expected",
-    [
-        ("Delivery expected by Nov 01", False),  # the live row wording
-        ("Shipped", False),
-        ("Out For Delivery", False),
-        ("Cancelled", False),
-        ("Delivered on Oct 31", True),
-        (None, True),  # unread: the whole budget
-        ("Partially delivered", True),  # unfamiliar: the whole budget
-    ],
+    "status",
+    ["Delivery expected by Nov 01", "Shipped", "Out For Delivery", "Cancelled", "Delivered on Oct 31", None],
 )
-def test_the_look_for_an_invoice_follows_the_orders_state(monkeypatch, status, expected):
-    asked: list[bool] = []
+def test_every_order_is_pointed_at_the_invoice_api(status):
+    order = sync.ScrapedOrder(order_id="OD1", platform_status=status)
+    asyncio.run(sync._read_detail(FakePage(), order))
 
-    async def invoice_url(page, *, expected=True):
-        asked.append(expected)
-        return None
-
-    monkeypatch.setattr(sync, "_invoice_url", invoice_url)
-    asyncio.run(sync._read_detail(FakePage(), sync.ScrapedOrder(order_id="OD1", platform_status=status)))
-
-    assert asked == [expected]
+    assert order.invoice_url == invoice_api_url("OD1")
 
 
 # --- why it was cancelled ----------------------------------------------------------------
