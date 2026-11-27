@@ -73,6 +73,10 @@ def otp_from_text(text: str | None, *, require_context: bool = False) -> str | N
 
 
 class OtpReader(ABC):
+    def can_read(self, address: str) -> bool:
+        """Whether this reader is configured to fetch an OTP for ``address``."""
+        return bool((address or "").strip())
+
     @abstractmethod
     async def get_otp(
         self,
@@ -89,9 +93,22 @@ class OtpReader(ABC):
         """
         raise NotImplementedError
 
+    async def probe(self, address: str) -> str | None:
+        """Why a code for ``address`` could NOT be read, or None when it can.
+
+        Asked before an action that cannot be redone on a missing code (the
+        email swap: Flipkart mails both addresses and a code nobody can read
+        wastes the attempt). The base check is only "configured"; a reader
+        that can cheaply reach its inbox (Microsoft Graph) tries it for real.
+        """
+        return None if self.can_read(address) else "no OTP inbox is set up for this address"
+
 
 class NullOtpReader(OtpReader):
     """Used when no inbox is configured. Signals the caller to skip auto-OTP."""
+
+    def can_read(self, address: str) -> bool:
+        return False
 
     async def get_otp(
         self,
@@ -712,6 +729,10 @@ class RoutedOtpReader(OtpReader):
                     return reader, who
         return self.default, "the main inbox"
 
+    def can_read(self, address: str) -> bool:
+        reader, _ = self.reader_for(address)
+        return reader.can_read(address)
+
     async def get_otp(
         self,
         address: str,
@@ -723,23 +744,43 @@ class RoutedOtpReader(OtpReader):
         log.info("the login code for %s is read from %s", _mask(address), label)
         return await reader.get_otp(address, timeout=timeout, not_before=not_before)
 
+    async def probe(self, address: str) -> str | None:
+        reader, label = self.reader_for(address)
+        problem = await reader.probe(address)
+        return f"{label}: {problem}" if problem else None
+
 
 _UNSET = object()
 
 
-def _saved_instaddr() -> tuple[dict | None, tuple[str, ...]]:
-    """Read the saved InstAddr browser state and domains from app_settings."""
+def _clean_domains(domains) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(d).strip().lower().lstrip("@") for d in (domains or ()) if str(d).strip()))
+
+
+def _clean_addresses(addresses) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(a).strip().lower() for a in (addresses or ()) if "@" in str(a) and str(a).strip()))
+
+
+def _saved_instaddr() -> list[tuple[str, dict, tuple[str, ...], tuple[str, ...]]]:
+    """Every saved InstAddr account as ``(name, browser state, domains,
+    exact addresses)``, the first account first
+    (app.automation.instaddr.load_accounts)."""
     try:
         from app.automation import instaddr
         from app.db.base import SessionLocal
 
         with SessionLocal() as db:
-            state = instaddr.load_state(db)
-            if not state:
-                return None, ()
-            return state, instaddr.load_domains(db)
+            return [
+                (
+                    account["name"],
+                    account["state"],
+                    _clean_domains(account["domains"]),
+                    _clean_addresses(account.get("addresses")),
+                )
+                for account in instaddr.load_accounts(db)
+            ]
     except Exception:  # noqa: BLE001 — unit tests without DB stay clean
-        return None, ()
+        return []
 
 
 def get_otp_reader(
@@ -748,6 +789,7 @@ def get_otp_reader(
     *,
     instaddr_state: dict | None = _UNSET,  # type: ignore[assignment]
     instaddr_domains: Sequence[str] | None = None,
+    instaddr_accounts: Sequence[tuple] | None = None,
 ) -> OtpReader:
     """Build an OTP reader from settings; Null when no inbox is configured.
 
@@ -798,32 +840,48 @@ def get_otp_reader(
         for spec in (list(extras) if extras is not None else extra_otp_inboxes(get_settings()))
     ]
 
-    if instaddr_state is _UNSET:
-        ia_state, ia_domains = _saved_instaddr()
+    # Every InstAddr account read for its own addresses and domains. An exact
+    # address wins over any domain (RoutedOtpReader.reader_for), so two
+    # accounts can share a domain — @catbar.net is on both since 24 Nov 2026
+    # — as long as the later one lists its addresses; a domain both claim is
+    # otherwise read from the first (the original account comes first).
+    accounts: list[tuple[str, dict, tuple[str, ...], tuple[str, ...]]]
+    if instaddr_state is not _UNSET:
+        # One account handed in directly (tests, tools): as before.
+        accounts = (
+            [("main", instaddr_state, _clean_domains(instaddr_domains or ("catbar.net",)), ())]
+            if instaddr_state
+            else []
+        )
     else:
-        ia_state = instaddr_state
-        ia_domains = tuple(
-            dict.fromkeys(str(d).strip().lower().lstrip("@") for d in (instaddr_domains or ("catbar.net",)) if str(d).strip())
+        accounts = (
+            [
+                (item[0], item[1], _clean_domains(item[2]), _clean_addresses(item[3] if len(item) > 3 else ()))
+                for item in instaddr_accounts
+            ]
+            if instaddr_accounts is not None
+            else _saved_instaddr()
         )
-    if instaddr_domains is not None and ia_state:
-        ia_domains = tuple(
-            dict.fromkeys(str(d).strip().lower().lstrip("@") for d in instaddr_domains if str(d).strip())
-        )
+        if instaddr_domains is not None and accounts:
+            name, state, _, addresses = accounts[0]
+            accounts[0] = (name, state, _clean_domains(instaddr_domains), addresses)
 
-    if ia_state and ia_domains:
+    for name, ia_state, ia_domains, ia_addresses in accounts:
+        if not (ia_state and ia_domains):
+            continue
         from app.automation.instaddr import InstAddrOtpReader
 
         routed.append(
             (
                 InboxSpec(
                     number=0,
-                    user="InstAddr (m.kuku.lu)",
+                    user="InstAddr (m.kuku.lu)" if name == "main" else f"InstAddr {name} (m.kuku.lu)",
                     password="",
                     host="m.kuku.lu",
                     port=443,
                     mailbox="Inbox",
                     use_ssl=True,
-                    serves=tuple(f"@{d}" for d in ia_domains),
+                    serves=ia_addresses + tuple(f"@{d}" for d in ia_domains),
                 ),
                 InstAddrOtpReader(
                     ia_state,
@@ -834,6 +892,50 @@ def get_otp_reader(
             )
         )
 
+    m365 = _m365_route(settings, shared)
+    if m365 is not None:
+        # Before InstAddr's entries is irrelevant (domains do not overlap), but
+        # after the numbered IMAP inboxes, so an exact address listed for one
+        # of those still wins over the Microsoft 365 domain.
+        routed.append(m365)
+
     if not routed:
         return primary
     return RoutedOtpReader(primary, routed)
+
+
+def _m365_route(settings, shared: dict) -> tuple[InboxSpec, OtpReader] | None:
+    """The Microsoft 365 (Graph) inbox and the domains it serves, when set up."""
+    client_id = (getattr(settings, "otp_m365_client_id", "") or "").strip()
+    secret = getattr(settings, "otp_m365_client_secret", "") or ""
+    tenant = (getattr(settings, "otp_m365_tenant_id", "") or "").strip()
+    mailbox = (getattr(settings, "otp_m365_mailbox", "") or "").strip()
+    domains = _clean_domains((getattr(settings, "otp_m365_domains", "") or "").split(","))
+    if not (client_id and secret and tenant and mailbox):
+        return None
+    if not domains:
+        # The mailbox's own domain is the obvious default.
+        domains = _clean_domains([mailbox.rpartition("@")[2]])
+    from app.automation.graph_mail import GraphOtpReader
+
+    return (
+        InboxSpec(
+            number=0,
+            user=f"Microsoft 365 {mailbox}",
+            password="",
+            host="graph.microsoft.com",
+            port=443,
+            mailbox="all folders",
+            use_ssl=True,
+            serves=tuple(f"@{d}" for d in domains),
+        ),
+        GraphOtpReader(
+            tenant_id=tenant,
+            client_id=client_id,
+            client_secret=secret,
+            mailbox=mailbox,
+            poll_interval=shared["poll_interval"],
+            senders=shared["senders"],
+            max_age_minutes=shared["max_age_minutes"],
+        ),
+    )

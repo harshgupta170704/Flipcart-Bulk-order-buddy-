@@ -402,10 +402,27 @@ def build_parser() -> argparse.ArgumentParser:
         "instaddr-connect",
         help="sign in to InstAddr (m.kuku.lu) in a browser window, once, so the app can read the accounts' mail",
     )
+    p_ia.add_argument(
+        "--name",
+        default=None,
+        help="keep it as a further InstAddr account under this name (e.g. vikramten) instead of replacing the first one",
+    )
+    p_ia.add_argument(
+        "--domain",
+        default=None,
+        help="the account's own domain (e.g. apmail.org): the window closes by itself once the sign-in shows it",
+    )
     p_ia.set_defaults(func=cmd_instaddr_connect)
+
+    p_iar = sub.add_parser(
+        "instaddr-refresh",
+        help="re-read the addresses each further InstAddr account holds (after creating new ones there); no sign-in",
+    )
+    p_iar.set_defaults(func=cmd_instaddr_refresh)
 
     p_iac = sub.add_parser("instaddr-check", help="read-only: show what the saved InstAddr session sees")
     p_iac.add_argument("--url", default=None, help="a page of m.kuku.lu to open (default: the mailbox home)")
+    p_iac.add_argument("--name", default=None, help="which saved InstAddr account (default: the first)")
     p_iac.set_defaults(func=cmd_instaddr_check)
 
     p_pw = sub.add_parser(
@@ -636,16 +653,50 @@ async def cmd_instaddr_connect(args) -> None:
             "When your inbox shows, come back here and press Enter... ",
         )
 
-    state = await instaddr.connect_interactively(wait_for_person)
+    if args.domain:
+        print(
+            f"\nSign in to InstAddr in the browser window (AccountID, password, the emailed code).\n"
+            f"It closes by itself once the account shows its @{args.domain.strip().lstrip('@')} addresses (15 minutes at most)."
+        )
+        state = await instaddr.connect_until_domain(args.domain)
+        if not state:
+            raise SystemExit(f"the window closed before the account showed any @{args.domain} address; nothing saved")
+    else:
+        state = await instaddr.connect_interactively(wait_for_person)
     if not state.get("cookies"):
         raise SystemExit("no InstAddr session was found in the window; nothing saved")
-    domains = await instaddr.fetch_domains(state)
+    addresses = await instaddr.fetch_addresses(state)
+    domains = instaddr.domains_of(addresses)
     with SessionLocal() as db:
-        instaddr.save_state(db, state)
-        if domains:
-            instaddr.save_domains(db, domains)
+        try:
+            domains = instaddr.save_account(db, args.name, state, domains, addresses)
+        except ValueError as exc:
+            raise SystemExit(f"{exc}; nothing saved") from None
+    who = f" as {args.name!r}" if args.name else ""
     extra = f" Domains: {', '.join(domains)}." if domains else ""
-    print(f"InstAddr session saved ({len(state.get('cookies', []))} cookies).{extra} The app can now read the mailbox.")
+    print(f"InstAddr session saved{who} ({len(state.get('cookies', []))} cookies).{extra} The app can now read the mailbox.")
+
+
+async def cmd_instaddr_refresh(args) -> None:
+    """Re-read, with each saved sign-in, the addresses every further InstAddr
+    account holds, so addresses created there since it was connected are
+    routed to it. The first account is matched by domain and needs nothing."""
+    from app.automation import instaddr
+
+    with SessionLocal() as db:
+        accounts = [a for a in instaddr.load_accounts(db) if a["name"] != instaddr.MAIN_ACCOUNT]
+    if not accounts:
+        raise SystemExit("no further InstAddr account saved: run  python -m app.cli instaddr-connect --name <name>  first")
+    for account in accounts:
+        addresses = await instaddr.fetch_addresses(account["state"])
+        if not addresses:
+            print(f"{account['name']}: could not read its addresses (signed out?); kept as it was")
+            continue
+        with SessionLocal() as db:
+            domains = instaddr.save_account(
+                db, account["name"], account["state"], instaddr.domains_of(addresses), addresses
+            )
+        print(f"{account['name']}: {len(addresses)} addresses on {', '.join(domains)}")
 
 
 async def cmd_instaddr_check(args) -> None:
@@ -655,7 +706,7 @@ async def cmd_instaddr_check(args) -> None:
     from app.automation import instaddr
 
     with SessionLocal() as db:
-        state = instaddr.load_state(db)
+        state = instaddr.account_state(db, args.name)
     if not state:
         raise SystemExit("no InstAddr session saved: run  python -m app.cli instaddr-connect  first")
     found = await instaddr.dump_inbox(state, args.url or instaddr.HOME_URL)
@@ -698,6 +749,45 @@ async def cmd_otp_check(args) -> None:
             print(f"  subject : {mail.subject[:80]}")
             print(f"  CODE    : {code or '(none found)'}")
             print()
+        return
+    from app.automation.graph_mail import GraphOtpReader, message_code_for
+
+    if isinstance(reader, GraphOtpReader):
+        from datetime import datetime, timedelta, timezone
+
+        print(f"inbox   : {label}")
+        print(f"looking : Graph messages (all folders, last {reader.max_age_minutes} min) for {address}")
+        problem = await reader.probe(address)
+        if problem:
+            print(f"\nCANNOT READ: {problem}")
+            return
+        messages = await reader._list_recent()
+        oldest = datetime.now(timezone.utc) - timedelta(minutes=reader.max_age_minutes)
+        print(f"\n[Microsoft Graph] {len(messages)} recent message(s) in the mailbox")
+        shown = 0
+        for message in messages:
+            code = message_code_for(message, address, senders=reader.senders, not_before=None, oldest=oldest)
+            # The raw To: header: Graph's toRecipients shows a group's own
+            # address for mail sent to one of the group's aliases.
+            to = ", ".join(
+                str(h.get("value") or "")
+                for h in message.get("internetMessageHeaders") or []
+                if str(h.get("name") or "").lower() == "to"
+            ) or ", ".join(
+                (r.get("emailAddress") or {}).get("address", "") for r in message.get("toRecipients") or []
+            )
+            if address.lower() not in to.lower() and not code:
+                continue
+            print(f"  received: {message.get('receivedDateTime')}")
+            print(f"  to      : {to}")
+            print(f"  subject : {(message.get('subject') or '')[:80]}")
+            print(f"  CODE    : {code or '(none found)'}")
+            print()
+            shown += 1
+            if shown >= args.limit:
+                break
+        if not shown:
+            print(f"  nothing addressed to {address} yet")
         return
     if not isinstance(reader, ImapOtpReader):
         log.error("OTP inbox is not configured — set ORDERING_OTP_IMAP_* in .env")

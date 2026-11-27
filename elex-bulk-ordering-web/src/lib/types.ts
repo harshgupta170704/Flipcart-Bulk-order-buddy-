@@ -445,22 +445,135 @@ export interface LimitCheckInput {
   model?: string;
   /** The seller the run buys from; matches seller-scoped limits. */
   seller?: string;
+  /** The order's variant: the product link's pid, upper-cased (see
+   *  `orderVariant`). Left out when the order names none. */
+  variant?: string | null;
+  /** This order's changes to the limits; left out when there are none. */
+  limit_overrides?: LimitOverride[];
+}
+
+/**
+ * One change to the unit limits for one order only (Smart ID Selection on,
+ * not an AI run), sent with the checks and as the order's `limit_overrides`.
+ * With a `limit_id` it changes that saved limit's units, days or on/off for
+ * this order (never its value); without one it adds a limit for this order:
+ * category, brand and seller take the product's value, model a name the
+ * product's title contains, variant the order's variant id. Saved limits are
+ * never edited by it.
+ */
+export interface LimitOverride {
+  limit_id: number | null;
+  /** Required when `limit_id` is null. */
+  scope?: LimitScope;
+  /** Required when `limit_id` is null. */
+  value?: string;
+  /** A whole number, 1 or more. */
+  max_units: number;
+  /** A whole number of days, 1 to 3650. */
+  window_days: number;
+  enabled: boolean;
+}
+
+/** A saved limit that applies to the product being checked, as saved. */
+export interface ApplicableLimit {
+  limit_id: number;
+  scope: LimitScope;
+  value: string;
+  max_units: number;
+  window_days: number;
 }
 
 /**
  * One limit that applies to what is being ordered, totalled over the accounts
- * that were checked: `used` and `remaining` are unit sums across them and
- * `blocked` is how many of those accounts have nothing left under this limit.
+ * that were checked: `used` and `remaining` are unit sums across them.
+ * `blocked` is a yes or no for the whole selection (no checked account has
+ * room left under this limit), never a count of accounts. With this order's
+ * changes, the row is the changed limit; `limit_id` is null for a limit added
+ * for this order only.
  */
 export interface LimitUsage {
-  limit_id: number;
+  limit_id: number | null;
   scope: LimitScope;
   value: string;
   max_units: number;
   window_days: number;
   used: number;
   remaining: number;
-  blocked: number;
+  blocked: boolean;
+}
+
+/**
+ * POST /unit-limits/run-check: the room check for one order. Same selection
+ * and product facts as POST /unit-limits/check, plus the order's size and the
+ * "Exclude IDs" window. Its numbers hold whether Smart ID Selection is on or
+ * not: on, the IDs it names are set aside before the run starts; off (and in
+ * an AI run), the same IDs are skipped when their turn comes.
+ */
+export interface RunCheckInput extends LimitCheckInput {
+  /** Units in each order. The server reads 1 when it is left out. */
+  qty: number;
+  qty_mode: QtyMode;
+  /** Units to order in total; null for one order per account. */
+  total_quantity: number | null;
+  /** The "Exclude IDs" window in days; null when it is off. */
+  exclude_ordered_days: number | null;
+  /** "Skip IDs that already bought this product", with the order's link: the
+   *  run takes those IDs out first, and so does the check. */
+  skip_bought_product?: boolean;
+  product_link?: string;
+}
+
+/** The run check without its selection: what decides who the run passes over
+ *  before it tries anyone. The card preview sends it as `leave_out`. */
+export type RunCheckLeaveOut = Omit<RunCheckInput, "account_ids" | "filter">;
+
+/**
+ * The card preview's `leave_out`: the order form's run check, plus the two
+ * switches that decide whether the unit limits set IDs aside before the run.
+ * A pool card sheet (no email column) gives the IDs the run passes over no
+ * card, so the cards go to the IDs it tries (run #960, 24 Nov 2026).
+ */
+export interface CardPreviewLeaveOut extends RunCheckLeaveOut {
+  smart_id: boolean;
+  ai_run: boolean;
+  /** The rest of what the run knows before it tries anyone: a mock run signs
+   *  nobody in; "Spread orders" and Total Attempts decide who comes within
+   *  the attempt limit; the SuperCoins minimum. Left out when off. */
+  mock?: boolean;
+  smart_selection?: boolean;
+  total_attempts?: number | null;
+  use_supercoins?: boolean;
+  min_supercoins?: number | null;
+}
+
+/** What POST /unit-limits/run-check answers. */
+export interface RunCheckResult {
+  /** Accounts checked. */
+  accounts: number;
+  /** With "Skip IDs that already bought this product": the IDs that already
+   *  bought it, taken out first and counted nowhere else. Missing from an
+   *  older server. */
+  already_bought?: number;
+  /** IDs a Smart ID run sets aside before it starts, so they use up no
+   *  attempt: set_aside_at_limit + set_aside_short + set_aside_ordered_recently. */
+  set_aside: number;
+  /** Of those, IDs with no room at all under a unit limit. */
+  set_aside_at_limit: number;
+  /** Of those, IDs with some room but less than one order (Minimum mode). */
+  set_aside_short: number;
+  /** Of those, IDs left out by "Exclude IDs" (ordered in the window). */
+  set_aside_ordered_recently: number;
+  /** Units the IDs that stay could take, one order each. With no unit limit,
+   *  each staying ID counts one full order. */
+  units_available: number;
+  /** false when no unit limit applies to this product. */
+  limits_apply: boolean;
+  /** Each limit that applies, as POST /unit-limits/check returns it, with
+   *  this order's changes. */
+  limits: LimitUsage[];
+  /** The SAVED limits that apply to this product, before any change: what
+   *  the order form's "Limits for this order" lists. */
+  applicable_limits: ApplicableLimit[];
 }
 
 /* --- settings ------------------------------------------------------------- */
@@ -483,7 +596,11 @@ export interface UnusedOtpInbox {
 }
 
 export interface AppSettings {
+  /** Read-only: the server's own ORDERING_MAX_CONCURRENCY, how many accounts a run works at
+   *  once. Each computer decides it in its .env; the Settings page shows it and never sends it. */
   max_concurrency: number;
+  /** Read-only: the server's own ORDERING_BROWSER_HEADLESS (true = hidden). Each computer
+   *  decides it in its .env; the Settings page shows it and never sends it. */
   browser_headless: boolean;
   proxy_server: string;
   /** Automatic read-backs every N hours; 0 = only when someone presses the button. */
@@ -506,24 +623,18 @@ export interface AppSettings {
   hdfc_sender_filter?: string;
   hdfc_since_days?: number;
   hdfc_auto_fetch_minutes?: number;
-  hdfc_batch_wait_minutes?: number;
-  hdfc_portal_url?: string;
-  hdfc_portal_user?: string;
-  hdfc_portal_password_set?: boolean;
-  hdfc_portal_otp_mobile?: string;
-  hdfc_portal_otp_email?: string;
-  hdfc_portal_otp_sender?: string;
-  hdfc_portal_step_seconds?: number;
   /** Inboxes 2, 3, … from the server's settings file; read-only here. */
   otp_extra_inboxes?: ExtraOtpInbox[];
   /** Numbered inboxes the server's settings file names but cannot use. */
   otp_unused_inboxes?: UnusedOtpInbox[];
+  /** Where the order form's Smart ID Selection switch starts (default on).
+   *  Left out by a server from before the switch: read it as on. */
+  smart_id_default_on?: boolean;
 }
 
 /** PUT /settings takes any subset of the fields, plus the write-only passwords. */
-export type SettingsUpdate = Partial<Omit<AppSettings, "otp_imap_password_set" | "hdfc_portal_password_set">> & {
+export type SettingsUpdate = Partial<Omit<AppSettings, "otp_imap_password_set" | "browser_headless" | "max_concurrency">> & {
   otp_imap_password?: string;
-  hdfc_portal_password?: string;
 };
 
 /* --- jobs ----------------------------------------------------------------- */
@@ -553,6 +664,17 @@ export interface Job {
   payload: Record<string, unknown> | null;
   started_at: string;
   finished_at: string | null;
+}
+
+/**
+ * The run-level notes an order run saved in its settings (`payload.notes`),
+ * such as how many IDs Smart ID Selection set aside before the run started.
+ * Empty for a run that saved none, and for one from before notes existed.
+ */
+export function jobNotes(payload: Record<string, unknown> | null | undefined): string[] {
+  const notes = payload?.notes;
+  if (!Array.isArray(notes)) return [];
+  return notes.filter((note): note is string => typeof note === "string" && note.trim() !== "");
 }
 
 /** The Orders page's filters (GET /jobs/bulk-orders). */
@@ -680,6 +802,15 @@ export interface OrderInvoice {
    start, and outcome ("completed" | "cancelled" | "failed"), error and
    archive_id once it has ended.
 -------------------------------------------------------------------------- */
+
+/** POST /invoices/fetch?<ledger filter>: download every invoice of the matching orders from Flipkart. */
+export interface InvoiceFetchStartResult {
+  /** A read-back job; watch it on GET /jobs/{id}. */
+  job: Job;
+  /** Orders whose invoices will be asked for. */
+  orders: number;
+  accounts: number;
+}
 
 export interface CompileStartResult {
   job: Job;
@@ -819,6 +950,13 @@ export interface CardPairing {
   /** null: no card in the sheet pays for this account, and the run skips it. */
   card_last4: string | null;
   has_password: boolean | null;
+  /** Why the run will not try this account at all (already bought this
+   *  product, ordered recently, set aside by Smart ID); null or missing for
+   *  one it tries. A pool sheet gives such an account no card. */
+  passed_over?: string | null;
+  /** An account the run would try, whose own card the card rules keep out
+   *  (e.g. already used): the run passes it over, and why. */
+  skip_reason?: string | null;
 }
 
 /** POST /jobs/order/card-preview: the pairing a card run would use. */
@@ -830,6 +968,83 @@ export interface CardPreview {
   paired_by: string;
   /** Rows of the sheet that could not be a card, by row number and reason. */
   rows_set_aside: { row: number; reason: string }[];
+  /** Pool cards (no email column) the card rules kept out: already used, used
+   *  inside the cooldown, or failed recently. */
+  cards_kept_out?: number;
+  /** Selected accounts the run will not try at all, listed last; counted
+   *  neither in `paired` nor in `without_card`. Missing from an older server. */
+  passed_over?: number;
+  /** Accounts the run would try with a card in the sheet that it passes over
+   *  because the card rules keep that card out (`skip_reason` per row). */
+  will_skip?: number;
+}
+
+/** One account "Retry failed" orders on, and how it ended in the run. */
+export interface RetryAccount {
+  account_id: number;
+  email: string | null;
+  /** "failed", or "skipped" when the run never really tried it. */
+  status: string;
+  message: string | null;
+}
+
+/** GET /jobs/{id}/retry: what "Retry failed" orders on, and what it leaves out. */
+export interface RetryPlan {
+  job_id: number;
+  product_link: string | null;
+  payment_mode: string | null;
+  accounts: RetryAccount[];
+  /** Left out: an order of this product is placed on the account. */
+  placed: number;
+  /** Left out: sent and never confirmed, so it may exist. */
+  waiting: number;
+  /** Left out: passed over on purpose (already bought, limits, target reached). */
+  passed_over: number;
+  since: string | null;
+  /** Card runs: cards that paid for an order in this many days are not used. */
+  card_cooldown_days: number | null;
+  units_wanted: number | null;
+  units_bought: number;
+  units_missing: number | null;
+}
+
+/** One row of the card file named by "Validate card file": its sheet row and,
+ *  where there is a card, the card's last four digits — never a value. */
+export interface CardCheckRow {
+  row: number;
+  card_last4?: string;
+  field?: string;
+  /** What was fixed, or what to check. */
+  note?: string;
+  /** Why the row is not a card (rows set aside). */
+  reason?: string;
+}
+
+/** A card in the sheet that already paid for an order in this tool. */
+export interface CardCheckUsed extends CardCheckRow {
+  /** Placed, or sent and never confirmed. */
+  orders: number;
+  /** Rupees those orders came to. */
+  amount: number;
+  /** When the latest of them was sent (UTC), if known. */
+  last_used: string | null;
+}
+
+/** POST /jobs/order/card-check: "Validate card file" on Smart Bulk Order. */
+export interface CardCheck {
+  /** Card rows the run can use, and how many carry a bank password. */
+  cards: number;
+  with_password: number;
+  /** Put right; the run uses the fixed card (a CVV given back its leading zeros). */
+  fixed: CardCheckRow[];
+  /** Not a card; the run does not use these rows. */
+  set_aside: CardCheckRow[];
+  /** Left as they are but likely to fail at Flipkart or the bank. */
+  warnings: CardCheckRow[];
+  /** Cards that already paid for an order in this tool (placed or not yet confirmed). */
+  used?: CardCheckUsed[];
+  /** Cards that have paid for no order in this tool yet. */
+  unused?: CardCheckRow[];
 }
 
 /** "real" places orders; "mock" runs everything up to the browser and makes
@@ -913,9 +1128,28 @@ export interface OrderJobInput {
   use_address_phone?: boolean;
   /** Pass over accounts with an order bought in the last N days (1–365). */
   exclude_ordered_days?: number | null;
-  /** Try never-ordered accounts first, then those that ordered longest ago. */
+  /** "Spread orders across accounts": try never-ordered accounts first, then
+   *  those that ordered longest ago. The field keeps its name from before
+   *  Smart ID Selection existed, so older runs replay as they were. */
   smart_selection?: boolean;
+  /** Smart ID Selection: use only the IDs that can still buy this product
+   *  under the unit limits; the rest are set aside before the run starts.
+   *  Always sent, as "true" or "false": the server reads a missing field as
+   *  off, so the form's switch (which starts from the setting) decides.
+   *  Left out here, "false" is sent. */
+  smart_id?: boolean;
+  /** This order's changes to the unit limits (Smart ID on, not an AI run),
+   *  sent as JSON text; left out when there are none. */
+  limit_overrides?: LimitOverride[] | null;
+  /** Pass over accounts that already bought this product (placed or unconfirmed, any time). */
+  skip_bought_product?: boolean;
+  /** "Retry failed": the run this one retries. The server then always skips
+   *  bought accounts and never uses a card used since that run began. */
+  retry_of?: number | null;
   /* Card pool rules — card runs only. */
+  /** Skip a card that paid for an order in this tool at any time (placed, or
+   *  sent and not confirmed). The form sends it ticked by default. */
+  card_exclude_used?: boolean;
   /** Skip a card that paid for an order in the last N days. */
   card_cooldown_days?: number | null;
   /** Try accounts whose card was used least in the last N days first. */
@@ -1324,6 +1558,9 @@ export interface Order {
   created_at: string | null;
   brand: string | null;
   category: string | null;
+  /** The exact variant's Flipkart id (the pid in its product link),
+   *  upper-case; null when the link named none. Absent from an older server. */
+  product_id?: string | null;
   /** The run that attempted it; null for rows a sync imported. */
   job_id: number | null;
   /** What the run said about this attempt, without its verdict ("Cash on
@@ -1419,6 +1656,8 @@ export interface OrderFilters {
   order_ids?: string[];
   emails?: string[];
   tracking_ids?: string[];
+  /** Flipkart product ids (the variant's pid), matched exactly, ignoring case. */
+  product_ids?: string[];
   /** Platforms the unit was bought on ("flipkart"). */
   platforms?: string[];
   /** "BoB Orders": true for only this tool's own orders, false for only the others, unset for both. */
@@ -1675,8 +1914,17 @@ export type JobStreamMessageType =
   | "job_started"
   | "item_started"
   | "item_finished"
+  | "items_set_aside"
+  | "run_notes"
   | "ai_tracker_update"
   | "job_finished";
+
+/** One reason IDs were set aside before an order run started, and which. */
+export interface SetAsideGroup {
+  /** Starts "set aside before the run started: ", then the reason. */
+  message: string;
+  account_ids: number[];
+}
 
 export interface JobStreamMessage {
   type: JobStreamMessageType;
@@ -1700,6 +1948,18 @@ export interface JobStreamMessage {
   status?: string;
   message?: string | null;
   progress?: number;
+  /** present on "items_set_aside": the IDs Smart ID Selection set aside
+   *  before the run started, one group per reason. Each one's line is
+   *  skipped with its group's message. Sent only when at least one ID was
+   *  set aside. */
+  groups?: SetAsideGroup[];
+  /** present on "items_set_aside": the run's counts after the setting aside. */
+  done_items?: number;
+  skipped_items?: number;
+  total_items?: number;
+  /** present on "items_set_aside" and "run_notes": the run's notes as now
+   *  saved (`payload.notes`), so a page that connected earlier shows them too. */
+  notes?: string[];
 }
 
 /** Result of probing the OTP inbox — see POST /settings/otp-inbox/test. */
@@ -1900,10 +2160,6 @@ export interface HdfcUserId {
   email: string;
   mobile: string | null;
   parent_card_last4: string | null;
-  /** The parent card's "Alternate A/c No." from HDFC's Card Relationship page, digits only. */
-  aan: string | null;
-  /** HDFC's own "Virtual Card User ID" (e.g. 4574). */
-  portal_user_id: string | null;
   active: boolean;
   last_fetched_at: string | null;
   last_error: string | null;
@@ -1922,18 +2178,29 @@ export interface HdfcFetchResult {
 
 export type HdfcCardStatus = "active" | "cancelled";
 
+/** Where a card is in being read from NetSafe (pending → completed or failed). */
+export type HdfcFetchStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
+
 /** A child card read from an HDFC email. Used is from this tool's own orders. */
 export interface HdfcChildCard {
   id: number;
   user_id: number;
   username: string;
   email: string;
-  card_number: string;
+  /** Null until the card is read from NetSafe. */
+  card_number: string | null;
+  card_last4: string | null;
   parent_card_last4: string | null;
   opening_amount: number | null;
   used: number;
   remaining: number | null;
   status: HdfcCardStatus;
+  fetch_status: HdfcFetchStatus;
+  fetch_attempts: number;
+  fetched_at: string | null;
+  valid_until: string | null;
+  /** Whether the encrypted expiry and CVV are kept (never the values). */
+  has_details: boolean;
   error: string | null;
   issued_at: string | null;
   created_at: string;
@@ -1942,65 +2209,19 @@ export interface HdfcChildCard {
 export interface HdfcCardFilters {
   user_id?: number | null;
   status?: HdfcCardStatus | "";
+  fetch_status?: HdfcFetchStatus | "";
   min_remaining?: string;
   created_from?: string;
   created_to?: string;
   search?: string;
 }
 
-export type HdfcBatchStatus = "sending" | "waiting" | "done" | "failed" | "cancelled";
-export type HdfcBatchSend = "portal" | "download";
-
-/** One user id's line in a card batch request. */
-export interface HdfcBatchRowInput {
-  user_id: number;
-  amount: number;
-  count: number;
-  valid_days: number;
-}
-
-export interface HdfcBatchRow extends HdfcBatchRowInput {
-  username: string;
-}
-
-/** A request for new HDFC virtual cards (GET /hdfc/batches). */
-export interface HdfcBatch {
-  id: number;
-  status: HdfcBatchStatus;
-  send: HdfcBatchSend;
-  rows: HdfcBatchRow[];
-  card_count: number;
-  cards_received: number;
-  error: string | null;
-  portal_report: string | null;
-  started_by: string | null;
-  created_at: string;
-  submitted_at: string | null;
-  finished_at: string | null;
-}
-
-/** The HDFC CorpAssist portal sign-in, as the API sees it (GET /hdfc/portal). */
-export interface HdfcPortalStatus {
-  configured: boolean;
-  url: string;
-  user_hint: string | null;
-  otp_via: "sms" | "email" | null;
-  otp_ready: boolean;
-  otp_detail: string | null;
-  auto_fetch_minutes: number;
+/** Whether cards can be read from NetSafe (GET /hdfc/netsafe). */
+export interface HdfcNetSafeStatus {
+  key_set: boolean;
   busy: boolean;
-  last_error: string | null;
-}
-
-export interface HdfcPortalTestResult {
-  ok: boolean;
-  detail: string;
-}
-
-export interface HdfcPortalSyncResult {
-  seen: number;
-  added: number;
-  updated: number;
+  pending: number;
+  failed: number;
 }
 
 /** A phone running an SMS forwarder app (GET /otp-phones). */
@@ -2119,6 +2340,57 @@ export interface ScreenerItem {
   updated_at: string;
 }
 
+export interface EmailSwapRow {
+  id: number;
+  batch: string | null;
+  old_email: string;
+  new_email: string;
+  status: "pending" | "running" | "done" | "failed";
+  stage: string | null;
+  message: string | null;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailSwapSummary {
+  total: number;
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+  worker_running: boolean;
+}
+
+/** One address in GET /email-swap/check: which inbox reads its codes, and
+ * whether that inbox could really be opened just now. */
+export interface EmailSwapAddressCheck {
+  email: string;
+  inbox: string | null;
+  readable: boolean;
+  problem: string | null;
+}
+
+/** GET /email-swap/check — everything that must hold before one swap. */
+export interface EmailSwapCheck {
+  account_id: number | null;
+  account_status: string | null;
+  has_session: boolean;
+  old: EmailSwapAddressCheck;
+  new: EmailSwapAddressCheck | null;
+  new_in_use: boolean;
+  already_queued: boolean;
+  ok: boolean;
+  reasons: string[];
+}
+
+export interface EmailSwapUploadResult {
+  batch: string;
+  created: number;
+  skipped: number;
+  errors: string[];
+}
+
 export interface InventoryStockRow {
   platform: string;
   product_name: string;
@@ -2188,3 +2460,54 @@ export interface JobTaskPage {
   size: number;
 }
 
+/* --- captchas a person answers (GET /captchas) ---------------------------- */
+
+export type CaptchaSite = "flipkart" | "hdfc";
+/** "text": type the characters of a picture. "click": solve it on the live view. */
+export type CaptchaKind = "text" | "click";
+export type CaptchaStatus = "pending" | "answered" | "skipped" | "expired" | "blocked";
+
+/** A captcha whose browser window is paused, waiting for a person. */
+export interface OpenCaptcha {
+  id: number;
+  site: CaptchaSite;
+  kind: CaptchaKind;
+  /** Where the flow met it, e.g. "login" or "checkout". */
+  step: string;
+  job_id: number | null;
+  account_id: number | null;
+  account_email: string | null;
+  /** Naive UTC. */
+  created_at: string;
+  /** Seconds left before the account is skipped, as of the answer. */
+  seconds_left: number;
+}
+
+export interface CaptchaList {
+  open: OpenCaptcha[];
+  /** The last hour's captchas by outcome. */
+  last_hour: Record<CaptchaStatus, number>;
+  /** False: a captcha skips the account without asking anyone. */
+  ask: boolean;
+  wait_seconds: number;
+  stop_count: number;
+  stop_minutes: number;
+}
+
+/** One captcha and what happened to it (GET /captchas/history). */
+export interface CaptchaHistoryRow {
+  id: number;
+  site: CaptchaSite | string;
+  kind: CaptchaKind | string;
+  step: string;
+  job_id: number | null;
+  account_id: number | null;
+  status: CaptchaStatus | string;
+  detail: string | null;
+  answered_by: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+/** A special key for POST /captchas/{id}/keys. */
+export type CaptchaKey = "Enter" | "Backspace" | "Tab" | "Escape";

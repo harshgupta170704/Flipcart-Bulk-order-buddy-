@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from playwright.async_api import Page
 
+from app.automation import challenges
 from app.automation.otp import NullOtpReader, OtpNotConfigured, OtpReader
 from app.core.step_timer import mark as step_mark
 from app.config import get_settings
@@ -37,6 +38,7 @@ async def run_login(
 
     await page.goto(S.LOGIN_URL)
     step_mark("open login page")
+    await challenges.guard(page, site=challenges.FLIPKART, step="sign-in page")
 
     # Flipkart opens on PHONE login; the email field does not exist until this
     # link is clicked. Confirmed live 2026-10-23 — without it we were typing an
@@ -59,6 +61,9 @@ async def run_login(
     requested_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     await page.locator(f"xpath={S.SEND_OTP_BTN}").click()
     step_mark("request OTP")
+    # Flipkart puts a captcha here when it doubts the sign-in; a person
+    # answers it on the Captchas page and the OTP is sent after it.
+    await challenges.guard(page, site=challenges.FLIPKART, step="request OTP")
 
     # Flipkart answers an email it has no account for with "Looks like you're
     # new here! Sign up with your number" and sends no code (seen live on
@@ -119,6 +124,7 @@ async def run_login(
     # healthy green count while every later coupon/order run quietly failed
     # against a logged-out browser.
     step_mark("enter OTP")
+    await challenges.guard(page, site=challenges.FLIPKART, step="after the OTP")
     if not await verify_logged_in(page):
         refusal = await login_refusal(page)
         if refusal is not None:

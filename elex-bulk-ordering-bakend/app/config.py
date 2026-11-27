@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     content_wait: int = 5
 
     # --- Browser (Playwright) ------------------------------------------------
+    # Hidden (true) or shown (false) browser on THIS machine, decided by its
+    # own .env (ORDERING_BROWSER_HEADLESS) and nothing else: a server with no
+    # screen keeps true, a laptop where someone watches the runs may say
+    # false. Not on the Settings page: until 24 Nov 2026 a switch there was
+    # saved in the database, shared by every machine, and beat this line.
     browser_headless: bool = True
     proxy_server: str = ""  # e.g. "http://user:pass@host:port"; blank = no proxy
     # A run opens one Chromium and gives each account an isolated window in
@@ -93,6 +98,17 @@ class Settings(BaseSettings):
     otp_since_days: int = 1
     # Ignore anything older than this many minutes, even if it matches.
     otp_max_age_minutes: int = 15
+    # --- OTP inbox on Microsoft 365 (app.automation.graph_mail) -------------
+    # Exchange Online refuses IMAP password logins, so a Microsoft 365 inbox
+    # is read through Microsoft Graph with an app registration (Mail.Read,
+    # application permission, admin-consented). Every account whose email is
+    # on one of ``otp_m365_domains`` gets its code from ``otp_m365_mailbox``.
+    # Blank client id or secret: not used.
+    otp_m365_tenant_id: str = ""
+    otp_m365_client_id: str = ""
+    otp_m365_client_secret: str = ""
+    otp_m365_mailbox: str = ""
+    otp_m365_domains: str = ""
     # --- HDFC CorpAssist child-card emails (app.core.corpassist) -------------
     # Read from the first OTP inbox above (one shared mailbox). Only mail from
     # these senders (comma-separated, matched as IMAP FROM) is read.
@@ -120,6 +136,18 @@ class Settings(BaseSettings):
     hdfc_portal_step_seconds: int = 60
     # When true, treat all active Employee Phones as online on the UI and portal check.
     employee_phones_assume_online: bool = False
+
+    # --- Captchas (app.automation.challenges) ------------------------------
+    #: Ask a person on the Captchas page when a flow meets a captcha; false
+    #: fails that account at once with "captcha" as the reason.
+    captcha_ask: bool = True
+    #: How long a browser waits for someone to answer before the account is
+    #: skipped (its card goes back to the pool).
+    captcha_wait_seconds: int = 120
+    #: A run stops starting new accounts once it has met this many captchas
+    #: within ``captcha_stop_minutes`` (0 = never stop for captchas).
+    captcha_stop_count: int = 5
+    captcha_stop_minutes: int = 5
 
     # --- Concurrency / queue -------------------------------------------------
     max_concurrency: int = 4  # accounts processed in parallel per job
